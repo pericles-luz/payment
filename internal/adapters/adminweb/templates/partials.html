@@ -1,0 +1,52 @@
+{{define "status_badge"}}
+{{- if .Active -}}
+<span class="badge badge--success"><span class="dot" aria-hidden="true"></span>Ativo</span>
+{{- else -}}
+<span class="badge badge--warning"><span class="dot" aria-hidden="true"></span>Suspenso</span>
+{{- end -}}
+{{end}}
+
+{{define "tenant_row"}}
+<tr id="tenant-{{.ID}}">
+  <td><a class="row-link" href="/console/tenants/{{.ID}}" hx-get="/console/tenants/{{.ID}}" hx-target="#main" hx-push-url="true">{{.Name}}</a></td>
+  <td>{{template "status_badge" .}}</td>
+  <td>{{.CreatedAtBR}}</td>
+</tr>
+{{end}}
+
+{{define "tenant_rows"}}
+{{- if .Tenants -}}
+{{- range .Tenants}}{{template "tenant_row" .}}{{end -}}
+{{- else -}}
+<tr class="empty-row"><td colspan="3">
+  {{- if .Search -}}
+  <div class="empty"><h2>Nada encontrado para «{{.Search}}»</h2><p><a class="btn btn--ghost" href="/console/tenants" hx-get="/console/tenants" hx-target="#main" hx-push-url="true">Limpar filtro</a></p></div>
+  {{- else -}}
+  <div class="empty"><h2>Nenhum tenant ainda</h2><p class="muted">Cadastre a primeira empresa-cliente para começar a operar.</p><p><a class="btn btn--primary" href="/console/tenants/new" hx-get="/console/tenants/new" hx-target="#main" hx-push-url="true">+ Novo tenant</a></p></div>
+  {{- end -}}
+</td></tr>
+{{- end -}}
+{{end}}
+
+{{define "toast_oob"}}
+<div id="toasts" hx-swap-oob="afterbegin">
+  <div class="toast toast--{{.Kind}}" role="status">{{.Message}}</div>
+</div>
+{{end}}
+
+{{define "status_header_oob"}}
+<span id="tenant-status" hx-swap-oob="true">{{template "status_badge" .}}</span>
+<span id="tenant-status-action" hx-swap-oob="true">{{template "status_action" .}}</span>
+{{end}}
+
+{{define "status_action"}}
+{{- if .Active -}}
+<button class="btn btn--secondary" type="button"
+  hx-post="/console/tenants/{{.ID}}/suspend" hx-target="#main" hx-swap="none"
+  hx-confirm="Suspender {{.Name}}? Todas as chamadas de API do tenant passam a retornar 403 imediatamente.">Suspender</button>
+{{- else -}}
+<button class="btn btn--primary" type="button"
+  hx-post="/console/tenants/{{.ID}}/activate" hx-target="#main" hx-swap="none"
+  hx-confirm="Reativar {{.Name}}? As chamadas de API do tenant voltam a ser aceitas.">Reativar</button>
+{{- end -}}
+{{end}}

@@ -1,0 +1,66 @@
+/* tokens.css — design-system seed for the Pagamentos admin console.
+ * Source of truth: SIN-64707 §2.1. All screens inherit from here; never use
+ * raw values off-scale. Custom properties are declared on :root so every
+ * component references a semantic role, not a literal. */
+:root {
+  /* Color — semantic roles (contrast ratios verified in the spec). */
+  --color-bg: #f7f8fa;
+  --color-surface: #ffffff;
+  --color-border: #e2e5ea;
+  --color-text: #1a1d23;
+  --color-text-muted: #5b6370;
+  --color-primary: #1f5fcc;
+  --color-primary-hover: #1a52b0;
+  --color-success: #1e7e45;
+  --color-warning: #9a6700;
+  --color-danger: #c0392b;
+  --color-danger-bg: #fcedea;
+  --color-focus: #2d7ff9;
+
+  /* Spacing — 4px scale. No off-scale values. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-8: 48px;
+
+  /* Type — system-ui, two weights, four sizes. */
+  --font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 15px;
+  --text-lg: 18px;
+  --text-xl: 24px;
+  --line-xs: 16px;
+  --line-sm: 20px;
+  --line-base: 22px;
+  --line-lg: 26px;
+  --line-xl: 32px;
+  --weight-body: 400;
+  --weight-bold: 600;
+
+  /* Radius & shadow. */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-pill: 999px;
+  --shadow-card: 0 1px 2px rgba(20, 29, 53, 0.06);
+  --shadow-pop: 0 8px 24px rgba(20, 29, 53, 0.12);
+
+  /* Motion — 120–160ms ease-out. */
+  --motion-fast: 120ms;
+  --motion-base: 160ms;
+  --ease: ease-out;
+
+  /* Layout. */
+  --sidebar-width: 240px;
+  --tap-min: 44px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+  }
+}

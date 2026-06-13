@@ -1,0 +1,82 @@
+package config_test
+
+import (
+	"testing"
+
+	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
+)
+
+func TestFromEnvDefaults(t *testing.T) {
+	// Not parallel: mutates process environment.
+	for _, k := range []string{"PAYMENT_HTTP_ADDR", "PAYMENT_DB_PATH", "PAYMENT_TENANT_TOKENS", "PAYMENT_ADMIN_TOKENS", "PAYMENT_WEBHOOK_SECRET", "PAYMENT_BANK_CREDS", "PAYMENT_RABBIT_URL"} {
+		t.Setenv(k, "")
+	}
+	cfg := config.FromEnv()
+	if cfg.HTTPAddr != ":8080" {
+		t.Fatalf("default addr: %s", cfg.HTTPAddr)
+	}
+	if cfg.DBPath != "payment.db" {
+		t.Fatalf("default db: %s", cfg.DBPath)
+	}
+	if len(cfg.TenantTokens) != 0 || len(cfg.AdminTokens) != 0 || len(cfg.BankCreds) != 0 {
+		t.Fatal("expected empty maps")
+	}
+}
+
+func TestFromEnvSecureCookies(t *testing.T) {
+	cases := []struct {
+		name string
+		val  string
+		want bool
+	}{
+		{"explicit true", "true", true},
+		{"explicit false", "false", false},
+		{"numeric false", "0", false},
+		{"numeric true", "1", true},
+		{"unparseable falls back to secure default", "maybe", true},
+		{"empty falls back to secure default", "", true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PAYMENT_SECURE_COOKIES", tc.val)
+			if got := config.FromEnv().SecureCookies; got != tc.want {
+				t.Fatalf("SecureCookies(%q) = %v, want %v", tc.val, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFromEnvParsing(t *testing.T) {
+	t.Setenv("PAYMENT_HTTP_ADDR", ":9090")
+	t.Setenv("PAYMENT_DB_PATH", "/tmp/x.db")
+	t.Setenv("PAYMENT_TENANT_TOKENS", "tokA:tenantA, tokB:tenantB ,bad")
+	t.Setenv("PAYMENT_ADMIN_TOKENS", "admin1, admin2")
+	t.Setenv("PAYMENT_WEBHOOK_SECRET", "whsec")
+	t.Setenv("PAYMENT_BANK_CREDS", "tenantA:cidA:secA, malformed:only2, ")
+	t.Setenv("PAYMENT_RABBIT_URL", "amqp://localhost")
+
+	cfg := config.FromEnv()
+	if cfg.HTTPAddr != ":9090" || cfg.DBPath != "/tmp/x.db" {
+		t.Fatal("addr/db mismatch")
+	}
+	if cfg.TenantTokens["tokA"] != "tenantA" || cfg.TenantTokens["tokB"] != "tenantB" {
+		t.Fatalf("tenant tokens: %+v", cfg.TenantTokens)
+	}
+	if len(cfg.TenantTokens) != 2 {
+		t.Fatalf("expected 2 tenant tokens (bad skipped), got %d", len(cfg.TenantTokens))
+	}
+	if len(cfg.AdminTokens) != 2 {
+		t.Fatalf("admin tokens: %+v", cfg.AdminTokens)
+	}
+	if cfg.WebhookSecret != "whsec" || cfg.RabbitURL != "amqp://localhost" {
+		t.Fatal("secret/rabbit mismatch")
+	}
+	cred, ok := cfg.BankCreds["tenantA"]
+	if !ok || cred.ClientID != "cidA" || cred.Secret != "secA" {
+		t.Fatalf("bank creds: %+v", cfg.BankCreds)
+	}
+	if len(cfg.BankCreds) != 1 {
+		t.Fatalf("expected 1 bank cred (malformed skipped), got %d", len(cfg.BankCreds))
+	}
+}

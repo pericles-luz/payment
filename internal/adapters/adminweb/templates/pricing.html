@@ -1,0 +1,52 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">‹ {{.Tenant.Name}}</a> / Tarifação</p>
+<div class="topbar"><h1>Tarifação por endpoint</h1></div>
+
+<nav class="tabs" aria-label="Seções do tenant">
+  <a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">Visão geral</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/credentials" hx-get="/console/tenants/{{.Tenant.ID}}/credentials" hx-target="#main" hx-push-url="true">Credenciais</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/pricing" aria-current="page">Tarifação</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/consumption" hx-get="/console/tenants/{{.Tenant.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo</a>
+</nav>
+
+<div class="table-wrap">
+  <table class="data">
+    <caption class="sr-only">Preços por endpoint para {{.Tenant.Name}}</caption>
+    <thead><tr><th scope="col">Endpoint</th><th scope="col">Preço por chamada</th></tr></thead>
+    <tbody id="price-rows">{{template "price_rows" .}}</tbody>
+  </table>
+</div>
+
+<form class="form card" method="post" action="/console/tenants/{{.Tenant.ID}}/pricing"
+      hx-post="/console/tenants/{{.Tenant.ID}}/pricing" hx-target="#main" hx-swap="innerHTML">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <h2>Definir preço</h2>
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+
+  <div class="field{{if .Errors.endpoint}} has-error{{end}}">
+    <label for="f-endpoint">Endpoint *</label>
+    <input id="f-endpoint" name="endpoint" value="{{.Form.endpoint}}" required maxlength="200" placeholder="POST /v1/charges"
+           {{if .Errors.endpoint}}aria-invalid="true" aria-describedby="e-endpoint"{{end}}>
+    {{if .Errors.endpoint}}<span class="error" id="e-endpoint" role="alert">{{.Errors.endpoint}}</span>{{end}}
+  </div>
+
+  <div class="field{{if .Errors.price_cents}} has-error{{end}}">
+    <label for="f-price">Preço (centavos) *</label>
+    <input id="f-price" name="price_cents" type="number" min="0" step="1" value="{{.Form.price_cents}}" required inputmode="numeric"
+           {{if .Errors.price_cents}}aria-invalid="true" aria-describedby="e-price"{{else}}aria-describedby="h-price"{{end}}>
+    {{if .Errors.price_cents}}<span class="error" id="e-price" role="alert">{{.Errors.price_cents}}</span>{{else}}<span class="help" id="h-price">Valor inteiro em centavos. 0 = endpoint gratuito.</span>{{end}}
+  </div>
+
+  <div class="form-actions">
+    <button class="btn btn--primary" type="submit">Salvar preço</button>
+  </div>
+</form>
+{{end}}
+
+{{define "price_rows"}}
+{{- if .Prices -}}
+{{- range .Prices}}<tr><td><code>{{.Endpoint}}</code></td><td>{{.PriceReais}}</td></tr>{{end -}}
+{{- else -}}
+<tr class="empty-row"><td colspan="2"><div class="empty"><p class="muted">Nenhum preço definido. Tenant será cobrado conforme o padrão até um preço específico ser configurado.</p></div></td></tr>
+{{- end -}}
+{{end}}

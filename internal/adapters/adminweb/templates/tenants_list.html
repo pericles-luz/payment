@@ -1,0 +1,40 @@
+{{define "body"}}
+<div class="topbar">
+  <h1>Tenants</h1>
+  <a class="btn btn--primary" href="/console/tenants/new"
+     hx-get="/console/tenants/new" hx-target="#main" hx-push-url="true">+ Novo tenant</a>
+</div>
+
+<form class="toolbar" method="get" action="/console/tenants" role="search">
+  <label class="sr-only" for="q">Buscar empresa</label>
+  <input id="q" type="search" name="q" value="{{.Search}}" placeholder="Buscar por nome…"
+         hx-get="/console/tenants/rows" hx-trigger="input changed delay:300ms, search"
+         hx-target="#tenant-rows" hx-include="closest form" hx-indicator="#rows-indicator">
+  <label class="sr-only" for="status">Status</label>
+  <select id="status" name="status"
+          hx-get="/console/tenants/rows" hx-trigger="change"
+          hx-target="#tenant-rows" hx-include="closest form" hx-indicator="#rows-indicator">
+    <option value=""{{if eq .Status ""}} selected{{end}}>Todos os status</option>
+    <option value="active"{{if eq .Status "active"}} selected{{end}}>Ativos</option>
+    <option value="suspended"{{if eq .Status "suspended"}} selected{{end}}>Suspensos</option>
+  </select>
+  <noscript><button class="btn btn--secondary" type="submit">Filtrar</button></noscript>
+  <span id="rows-indicator" class="htmx-indicator muted" role="status">Carregando…</span>
+</form>
+
+<div class="table-wrap">
+  <table class="data">
+    <caption class="sr-only">Lista de tenants (empresas-clientes)</caption>
+    <thead>
+      <tr>
+        <th scope="col">Empresa</th>
+        <th scope="col">Status</th>
+        <th scope="col">Criado em</th>
+      </tr>
+    </thead>
+    <tbody id="tenant-rows">
+      {{template "tenant_rows" .}}
+    </tbody>
+  </table>
+</div>
+{{end}}

@@ -1,0 +1,28 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">‹ {{.Tenant.Name}}</a> / Consumo</p>
+<div class="topbar"><h1>Consumo &amp; auditoria</h1></div>
+
+<nav class="tabs" aria-label="Seções do tenant">
+  <a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">Visão geral</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/credentials" hx-get="/console/tenants/{{.Tenant.ID}}/credentials" hx-target="#main" hx-push-url="true">Credenciais</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/pricing" hx-get="/console/tenants/{{.Tenant.ID}}/pricing" hx-target="#main" hx-push-url="true">Tarifação</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/consumption" aria-current="page">Consumo</a>
+</nav>
+
+<p class="muted">Agregação do ledger append-only (autoritativo para faturamento). Somente leitura.</p>
+
+<div class="table-wrap">
+  <table class="data">
+    <caption class="sr-only">Consumo por endpoint para {{.Tenant.Name}}</caption>
+    <thead><tr><th scope="col">Endpoint</th><th scope="col">Chamadas</th><th scope="col">Total</th></tr></thead>
+    <tbody>
+    {{- if .Rows -}}
+    {{range .Rows}}<tr><td><code>{{.Endpoint}}</code></td><td>{{.Calls}}</td><td>{{.TotalReais}}</td></tr>{{end}}
+    {{- else -}}
+    <tr class="empty-row"><td colspan="3"><div class="empty"><p class="muted">Sem consumo registrado para este tenant.</p></div></td></tr>
+    {{- end -}}
+    </tbody>
+    {{if .Rows}}<tfoot><tr><th scope="row">Total</th><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td></tr></tfoot>{{end}}
+  </table>
+</div>
+{{end}}

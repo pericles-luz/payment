@@ -1,0 +1,31 @@
+{{define "layout"}}<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · Pagamentos Admin</title>
+<link rel="stylesheet" href="/console/static/tokens.css">
+<link rel="stylesheet" href="/console/static/app.css">
+<meta name="csrf-token" content="{{.CSRF}}">
+<meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"422","swap":true,"error":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":false,"error":true}],"includeIndicatorStyles":false}'>
+<script src="/console/static/htmx.min.js" defer></script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+<a class="sr-only" href="#main">Pular para o conteúdo</a>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">◆ Pagamentos · Admin</div>
+    <nav aria-label="Seções">
+      <ul>
+        <li><a href="/console/tenants"{{if eq .Nav "tenants"}} aria-current="page"{{end}}>Tenants</a></li>
+      </ul>
+    </nav>
+    <div class="account">{{.Role}}</div>
+  </aside>
+  <main class="content" id="main">
+    {{template "body" .}}
+  </main>
+</div>
+<div id="toasts" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>{{end}}

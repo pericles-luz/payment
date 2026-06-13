@@ -1,0 +1,43 @@
+{{define "body"}}
+{{with .Tenant}}
+<p class="breadcrumb"><a href="/console/tenants" hx-get="/console/tenants" hx-target="#main" hx-push-url="true">‹ Tenants</a> / {{.Name}}</p>
+<div class="topbar">
+  <div>
+    <h1>{{.Name}} <span id="tenant-status">{{template "status_badge" .}}</span></h1>
+    <p class="muted">criado {{.CreatedAtBR}}</p>
+  </div>
+  <span id="tenant-status-action">{{template "status_action" .}}</span>
+</div>
+
+<nav class="tabs" aria-label="Seções do tenant">
+  <a href="/console/tenants/{{.ID}}" aria-current="page">Visão geral</a>
+  <a href="/console/tenants/{{.ID}}/credentials"
+     hx-get="/console/tenants/{{.ID}}/credentials" hx-target="#main" hx-push-url="true">Credenciais</a>
+  <a href="/console/tenants/{{.ID}}/pricing"
+     hx-get="/console/tenants/{{.ID}}/pricing" hx-target="#main" hx-push-url="true">Tarifação</a>
+  <a href="/console/tenants/{{.ID}}/consumption"
+     hx-get="/console/tenants/{{.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo</a>
+</nav>
+
+<div class="card-grid">
+  <div class="card">
+    <h2>Dados</h2>
+    <dl class="dl">
+      <dt>Razão social</dt><dd>{{.Name}}</dd>
+      <dt>Identificador</dt><dd><code>{{.ID}}</code></dd>
+      <dt>Status</dt><dd>{{template "status_badge" .}}</dd>
+      <dt>Criado em</dt><dd>{{.CreatedAtBR}}</dd>
+    </dl>
+  </div>
+  <div class="card">
+    <h2>Atalhos</h2>
+    <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/credentials"
+          hx-get="/console/tenants/{{.ID}}/credentials" hx-target="#main" hx-push-url="true">Credenciais bancárias ›</a></p>
+    <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/pricing"
+          hx-get="/console/tenants/{{.ID}}/pricing" hx-target="#main" hx-push-url="true">Tarifação ›</a></p>
+    <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/consumption"
+          hx-get="/console/tenants/{{.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo ›</a></p>
+  </div>
+</div>
+{{end}}
+{{end}}

@@ -1,0 +1,23 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/tenants" hx-get="/console/tenants" hx-target="#main" hx-push-url="true">‹ Tenants</a> / Novo tenant</p>
+<div class="topbar"><h1>Novo tenant</h1></div>
+
+<form class="form card" method="post" action="/console/tenants"
+      hx-post="/console/tenants" hx-target="#main" hx-swap="innerHTML">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+
+  <div class="field{{if .Errors.name}} has-error{{end}}">
+    <label for="f-name">Razão social *</label>
+    <input id="f-name" name="name" value="{{.Form.name}}" required maxlength="200" autocomplete="organization" autofocus
+           {{if .Errors.name}}aria-invalid="true" aria-describedby="e-name"{{end}}>
+    {{if .Errors.name}}<span class="error" id="e-name" role="alert">{{.Errors.name}}</span>{{end}}
+  </div>
+
+  <p class="muted">Após criar, configure credenciais e tarifação no detalhe do tenant.</p>
+  <div class="form-actions">
+    <a class="btn btn--secondary" href="/console/tenants" hx-get="/console/tenants" hx-target="#main" hx-push-url="true">Cancelar</a>
+    <button class="btn btn--primary" type="submit">Criar tenant</button>
+  </div>
+</form>
+{{end}}
