@@ -21,7 +21,7 @@ type Server struct {
 	ui          *adminweb.Renderer
 	webhooks    *app.WebhookService
 	tenantAuth  TenantAuthenticator
-	adminAuth   AdminAuthenticator
+	adminAuth   AdminPrincipalAuthenticator
 	webhookAuth WebhookAuthenticator
 	csrf        CSRFGuard
 }
@@ -36,7 +36,7 @@ type Config struct {
 	UI          *adminweb.Renderer
 	Webhooks    *app.WebhookService
 	TenantAuth  TenantAuthenticator
-	AdminAuth   AdminAuthenticator
+	AdminAuth   AdminPrincipalAuthenticator
 	WebhookAuth WebhookAuthenticator
 	// SecureCookies sets the Secure attribute on cookies this adapter issues
 	// (CSRF token; the admin-UI session cookie via Server.CSRF). Driven by config
@@ -155,10 +155,19 @@ func (s *Server) Router() http.Handler {
 		})
 	})
 
-	// Bank webhook (TB1→TB5) — failure-closed auth in the handler, rate-limited.
+	// C6 bank webhook (TB1→TB5) — authenticity is the opaque per-tenant callback
+	// ref in the path (the C6 webhook is unsigned; ADR-0002/F4). The tenant is
+	// derived from that authenticated channel in the handler, never from the body.
+	// Rate-limited per client IP (defense-in-depth with the body size cap): a
+	// flood of guesses against the unguessable URL is throttled regardless of the
+	// uniform 401. The ref is a capability secret — see the ingress note below.
+	//
+	// Ingress: the proxy (SIN-64731) MUST NOT log the full request path for
+	// /webhooks/c6/* (the path carries the secret). Mask or drop the path segment
+	// in the access log; this app logs only the resolved tenant id, never the ref.
 	r.Group(func(r chi.Router) {
 		r.Use(webhookLimiter.middleware(func(req *http.Request) string { return "ip:" + clientIP(req) }))
-		r.Post("/webhooks/bank", s.handleWebhook)
+		r.Post("/webhooks/c6/{tenantRef}", s.handleC6Webhook)
 	})
 
 	return r

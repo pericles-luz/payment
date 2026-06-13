@@ -134,8 +134,106 @@ Todos os itens abaixo verdadeiros antes de liberar o console em produção:
       três pontos: browser, proxy, app + observabilidade).
 - [ ] **C** — Sessão do operador autenticada no edge **antes** da injeção do bearer;
       sem sessão de edge → negado no proxy.
+- [ ] **D** — Path `/webhooks/c6/*` mascarado em todo log (proxy, CDN, WAF, APM,
+      mirroring); no máximo `/webhooks/c6/***`. Rotação/revogação de ref ensaiada (§7).
 - [ ] ADR-0001 referenciado e premissa de deploy revisada pelo responsável de infra
       e pelo CTO.
+
+## 6. Premissa D — Caminho do webhook C6 mascarado no log (segredo de capacidade)
+
+> **Escopo distinto.** As premissas A–C cobrem o plano admin/console. A premissa D
+> cobre o **ingress do webhook C6** (`/webhooks/c6/{tenantRef}`). Origem: gate de
+> go-live levantado na review de segurança de [SIN-64753](/SIN/issues/SIN-64753)
+> (PR #14, C6-D webhook), rastreado em [SIN-64773](/SIN/issues/SIN-64773) /
+> [SIN-64774](/SIN/issues/SIN-64774).
+
+O webhook C6 é **não-assinado**; a autenticidade por-tenant é um `tenantRef`
+opaco de 256 bits carregado **no path da URL** (`/webhooks/c6/{tenantRef}`). Esse
+ref É a credencial (ADR-0002/F4). A aplicação já está correta — resolve o ref para
+o tenant id e loga apenas o tenant id resolvido, nunca o ref (ver a nota de ingress
+em `internal/adapters/http/server.go` e o parsing de `config.WebhookRefs` em
+`internal/platform/config/config.go`). Mas
+**qualquer intermediário que registre o path completo** (access log de
+nginx/Envoy/ALB, CDN, WAF, tracing/APM, request mirroring) persiste o segredo em
+texto claro → disclosure de credencial → impersonação total do webhook daquele
+tenant (OWASP A02/A09).
+
+**Por quê é premissa dura:** assim como o admin-token (Premissa B), o blast radius
+de um vazamento é comprometimento por-tenant. O path NUNCA pode aparecer em log.
+Logar no máximo `/webhooks/c6/***`.
+
+**Como garantir (mascarar/dropar o segmento de path para `/webhooks/c6/*`):**
+
+- **nginx** — não logar `$request`/`$request_uri` crus nesse path; substituir por
+  um literal mascarado:
+  ```nginx
+  map $uri $webhook_safe_uri {
+      default          $request_uri;
+      ~^/webhooks/c6/  "/webhooks/c6/***";
+  }
+  log_format masked '$remote_addr [$time_local] "$request_method $webhook_safe_uri $server_protocol" '
+                    '$status $body_bytes_sent "$http_user_agent"';
+  access_log /var/log/nginx/access.log masked;
+  ```
+  Atenção: `$request` contém o path cru — não usá-lo no formato. Validar que
+  nenhum `log_format` ativo nesse path emite `$request` ou `$request_uri`.
+
+- **Envoy** — `%REQ(:PATH)%` (e `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%`) loga o path
+  cru. Para a rota do webhook: usar um access log dedicado que **omite** o path ou
+  emite literal (`text_format` sem `%REQ(:PATH)%`), ou um filtro Lua/Wasm que
+  reescreve o path logado para `/webhooks/c6/***`. Não herdar o formato default.
+
+- **AWS ALB / CloudFront / AWS WAF** — access logs do ALB (`request`), logs padrão
+  do CloudFront (`cs-uri-stem`) e logs do WAF (`uri`) gravam o path completo e
+  **não permitem mascaramento seletivo por path**. Mitigações (escolher uma):
+  (a) terminar o webhook num proxy próprio (nginx/Envoy) que mascara **antes** de
+  qualquer hop logado; (b) desabilitar access logging para a rota/distribuição do
+  webhook (listener/behavior dedicado); (c) se o log for inevitável, tratar esses
+  logs como **portadores de segredo** (cripto em repouso, acesso restrito,
+  retenção curta) **e** adotar rotação periódica de ref (§7). Para WAF, excluir o
+  path do logging ou redigir via transform do Kinesis Firehose.
+
+- **APM / tracing (OpenTelemetry, Datadog, New Relic)** — atributos `url.path` /
+  `http.target` / `http.url` capturam o path. Configurar span processor / regra de
+  obfuscação de URL que redige o path para `/webhooks/c6/***` nesse endpoint.
+
+- **Request mirroring / traffic shadowing** (Envoy mirror, nginx `mirror`, service
+  mesh) — duplica o path cru para o destino espelho e seus logs. **Desabilitar**
+  mirroring para `/webhooks/c6/*`.
+
+**Verificação de go-live:**
+- [ ] Access log de um `POST /webhooks/c6/<ref>` real mostra `/webhooks/c6/***`,
+      nunca o ref cru.
+- [ ] Nenhum `log_format`/formatter ativo nesse path emite `$request`/`%REQ(:PATH)%`.
+- [ ] Nenhum CDN/WAF/ALB captura o path cru (ou o webhook os contorna / logging
+      desabilitado / logs tratados como portadores de segredo).
+- [ ] APM/tracing redige `url.path` para o webhook.
+- [ ] Nenhum request mirroring duplica o path.
+- [ ] `grep -E '/webhooks/c6/[A-Za-z0-9_-]{43}' <access logs>` retorna **vazio**.
+- [ ] Procedimento de rotação + revogação (§7) ensaiado uma vez em staging.
+
+## 7. Rotação e revogação de tenantRef
+
+O mapa `PAYMENT_WEBHOOK_REFS` (`ref -> tenantID`, parseado em
+`config.WebhookRefs`) admite **múltiplos refs apontando para o mesmo tenant** —
+isso habilita rotação sem downtime.
+
+**Rotação (higiene periódica / suspeita leve):**
+1. Cunhar um ref novo com `httpadapter.GenerateTenantRef()` (32 bytes CSPRNG,
+   base64url, 43 chars).
+2. Adicionar a entrada nova **ao lado** da antiga em `PAYMENT_WEBHOOK_REFS`
+   (ex.: `refAntigo:tenantA,refNovo:tenantA`) e recarregar/redeployar config.
+3. Atualizar a URL de callback no portal C6 para o ref novo.
+4. Confirmar tráfego de entrada chegando pelo ref novo (tenant id resolvido no
+   log da app).
+5. Remover a entrada antiga de `PAYMENT_WEBHOOK_REFS` e redeployar. A URL antiga
+   passa a 401 (failure-closed). Janela de overlap = zero downtime.
+
+**Revogação (comprometimento / descomissionamento):**
+- Remover a entrada do ref de `PAYMENT_WEBHOOK_REFS` e redeployar. O ref deixa de
+  resolver → 401 uniforme; a capacidade de impersonação é revogada imediatamente.
+- Se o tenant continua ativo, cunhar+registrar um ref novo e atualizar o C6
+  (rotação acima). O ref nunca é logado em nenhuma etapa.
 
 ## Referências
 
@@ -143,3 +241,8 @@ Todos os itens abaixo verdadeiros antes de liberar o console em produção:
 - Baseline de segurança — [`../security/secure-baseline.md`](../security/secure-baseline.md)
   (segredos, "no secrets in URLs", logging)
 - Cookie `Secure` proxy-aware / TLS termina no proxy — [SIN-64731](/SIN/issues/SIN-64731)
+- Webhook C6 / `tenantRef` como credencial (ADR-0002/F4) — nota de ingress em
+  `internal/adapters/http/server.go`, parsing em `internal/platform/config/config.go`
+  (`WebhookRefs`), geração em `internal/adapters/http/auth.go` (`GenerateTenantRef`).
+- Premissa D — origem em [SIN-64753](/SIN/issues/SIN-64753) (PR #14, C6-D webhook),
+  gate em [SIN-64773](/SIN/issues/SIN-64773) / [SIN-64774](/SIN/issues/SIN-64774).

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank"
@@ -24,13 +25,27 @@ const (
 	// secondAdminToken is a distinct admin identity sharing the test client IP, used
 	// to prove per-token (not per-IP) rate-limit bucketing on the console plane.
 	secondAdminToken = "atok2admin"
-	webhookSec       = "whsec"
+	// tenantClientID is the seeded tenant's C6 client_id (in its bank credential).
+	// It is what a legitimate webhook body's client_id must match.
+	tenantClientID = "c6-acme"
+)
+
+// Opaque per-tenant webhook callback refs (tenantRef): a valid one is exactly 43
+// base64url chars (httpadapter.GenerateTenantRef). webhookRef is registered to the
+// seeded tenant; webhookRefUnknown is well-formed but unregistered (no-oracle
+// test). Built with Repeat so the length is exactly right.
+var (
+	webhookRef        = strings.Repeat("A", 43)
+	webhookRefUnknown = strings.Repeat("Z", 43)
 )
 
 type fixture struct {
-	handler  http.Handler
-	tenantID string
-	bank     *bank.StubProvider
+	handler    http.Handler
+	tenantID   string
+	bank       *bank.StubProvider
+	bus        *inmemory.Bus
+	webhookRef string
+	clientID   string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -46,13 +61,14 @@ func newFixtureAuth(t *testing.T, adminTokens []string) *fixture {
 	store := persistence.NewStore()
 	creds := secret.NewStore(nil)
 	stub := bank.NewStubProvider(creds)
+	bus := inmemory.NewBus()
 	deps := app.Deps{
 		Payments:    store,
 		Tenants:     store,
 		Pricing:     store,
 		Ledger:      store,
 		Processed:   store,
-		Bus:         inmemory.NewBus(),
+		Bus:         bus,
 		Bank:        stub,
 		Credentials: creds,
 		Clock:       system.Clock{},
@@ -63,12 +79,17 @@ func newFixtureAuth(t *testing.T, adminTokens []string) *fixture {
 	if err != nil {
 		t.Fatalf("seed tenant: %v", err)
 	}
-	creds.Set(tn.ID(), ports.BankCredential{ClientID: "c", Secret: "s"})
+	creds.Set(tn.ID(), ports.BankCredential{ClientID: tenantClientID, Secret: "s"})
 	if _, err := admin.SetEndpointPrice(context.Background(), tn.ID(), "pix.create", 50); err != nil {
 		t.Fatalf("seed price: %v", err)
 	}
 
-	auth := httpadapter.NewStaticTokenAuth(map[string]string{tenantToken: tn.ID()}, adminTokens, webhookSec)
+	// Bind the seeded tenant's opaque callback ref to its tenant id + C6 client_id
+	// (the C6 webhook is unsigned; the ref IS the credential, ADR-0002/F4).
+	webhookRefs := map[string]httpadapter.WebhookIdentity{
+		webhookRef: {TenantID: tn.ID(), ClientID: tenantClientID},
+	}
+	auth := httpadapter.NewStaticTokenAuth(map[string]string{tenantToken: tn.ID()}, adminTokens, webhookRefs)
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:     app.NewChargeService(deps),
 		Admin:       admin,
@@ -77,7 +98,7 @@ func newFixtureAuth(t *testing.T, adminTokens []string) *fixture {
 		AdminAuth:   auth,
 		WebhookAuth: auth,
 	})
-	return &fixture{handler: srv.Router(), tenantID: tn.ID(), bank: stub}
+	return &fixture{handler: srv.Router(), tenantID: tn.ID(), bank: stub, bus: bus, webhookRef: webhookRef, clientID: tenantClientID}
 }
 
 func do(t *testing.T, h http.Handler, method, path, token string, headers map[string]string, body any) *httptest.ResponseRecorder {
@@ -206,37 +227,254 @@ func TestAdminEndpoints(t *testing.T) {
 	}
 }
 
-func TestWebhookFlow(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	// First create a charge to settle.
+// c6Body builds a C6 WebhookNotification body for the given charge/status. The
+// client_id matches the seeded tenant unless overridden by the caller.
+func c6Body(extID, clientID, status string) map[string]any {
+	return map[string]any{"external_id": extID, "client_id": clientID, "service": "pix", "status": status}
+}
+
+// seedCharge creates a charge via the tenant API and returns its id + tx id.
+func seedCharge(t *testing.T, f *fixture) (id, txID string) {
+	t.Helper()
 	rec := do(t, f.handler, http.MethodPost, "/v1/charges", tenantToken, map[string]string{"Idempotency-Key": "k1"}, map[string]any{"endpoint": "pix.create", "amount_cents": 2500, "currency": "BRL"})
 	var pv struct {
 		ID   string `json:"id"`
 		TxID string `json:"tx_id"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &pv)
+	if pv.ID == "" || pv.TxID == "" {
+		t.Fatalf("seed charge: empty ids (code %d body %s)", rec.Code, rec.Body.String())
+	}
+	return pv.ID, pv.TxID
+}
 
-	// Webhook without secret → 401 (failure-closed).
-	if rec := do(t, f.handler, http.MethodPost, "/webhooks/bank", "", nil, map[string]any{"tenant_id": f.tenantID, "tx_id": pv.TxID, "event_key": "e1"}); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("want 401 webhook, got %d", rec.Code)
+func TestWebhookFlow(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	id, txID := seedCharge(t, f)
+	whURL := "/webhooks/c6/" + f.webhookRef
+
+	// A well-formed but UNREGISTERED ref → 401, identical to a forged URL: the
+	// capability URL is the only authenticator and reveals nothing (no oracle).
+	if rec := do(t, f.handler, http.MethodPost, "/webhooks/c6/"+webhookRefUnknown, "", nil, c6Body(txID, f.clientID, "pending")); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401 unknown ref, got %d", rec.Code)
 	}
-	// Webhook with secret, bank not yet settled → 202 but still pending.
-	if rec := do(t, f.handler, http.MethodPost, "/webhooks/bank", "", map[string]string{"X-Webhook-Secret": webhookSec}, map[string]any{"tenant_id": f.tenantID, "tx_id": pv.TxID, "event_key": "e1"}); rec.Code != http.StatusAccepted {
-		t.Fatalf("want 202, got %d", rec.Code)
+	// Valid ref, bank not yet settled → 202 (accepted) but charge stays pending:
+	// the raw webhook is never trusted; settlement requires reconciliation.
+	if rec := do(t, f.handler, http.MethodPost, whURL, "", nil, c6Body(txID, f.clientID, "pending")); rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202 pending, got %d", rec.Code)
 	}
-	// Settle at bank, then webhook → 202 and payment becomes paid.
-	f.bank.MarkSettled(f.tenantID, pv.TxID)
-	if rec := do(t, f.handler, http.MethodPost, "/webhooks/bank", "", map[string]string{"X-Webhook-Secret": webhookSec}, map[string]any{"tenant_id": f.tenantID, "tx_id": pv.TxID, "event_key": "e2"}); rec.Code != http.StatusAccepted {
+	// Settle at the bank, then deliver a paid notification (distinct status →
+	// distinct event_key) → 202 and the charge reconciles to paid.
+	f.bank.MarkSettled(f.tenantID, txID)
+	if rec := do(t, f.handler, http.MethodPost, whURL, "", nil, c6Body(txID, f.clientID, "paid")); rec.Code != http.StatusAccepted {
 		t.Fatalf("want 202 settle, got %d", rec.Code)
 	}
-	rec = do(t, f.handler, http.MethodGet, "/v1/charges/"+pv.ID, tenantToken, nil, nil)
+	rec := do(t, f.handler, http.MethodGet, "/v1/charges/"+id, tenantToken, nil, nil)
 	var got struct {
 		Status string `json:"status"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &got)
 	if got.Status != "paid" {
 		t.Fatalf("expected paid, got %s", got.Status)
+	}
+}
+
+// TestWebhookMalformedRefSame401 asserts a malformed ref (wrong length / illegal
+// chars) is rejected with the SAME 401 as an unknown ref — uniform deny, no
+// existence oracle, and path-traversal-shaped input never reaches the lookup.
+func TestWebhookMalformedRefSame401(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	_, txID := seedCharge(t, f)
+	for _, ref := range []string{"short", strings.Repeat("A", 42), strings.Repeat("A", 44), strings.Repeat("*", 43)} {
+		if rec := do(t, f.handler, http.MethodPost, "/webhooks/c6/"+ref, "", nil, c6Body(txID, f.clientID, "paid")); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("ref %q: want 401, got %d", ref, rec.Code)
+		}
+	}
+}
+
+// TestWebhookBodyTenantMismatchRejected asserts the body cannot override the
+// channel: a valid ref but a body whose client_id belongs to a different tenant is
+// rejected (401), never silently accepted under the channel tenant.
+func TestWebhookBodyTenantMismatchRejected(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	_, txID := seedCharge(t, f)
+	f.bank.MarkSettled(f.tenantID, txID)
+	if rec := do(t, f.handler, http.MethodPost, "/webhooks/c6/"+f.webhookRef, "", nil, c6Body(txID, "someone-elses-client", "paid")); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401 on client_id mismatch, got %d", rec.Code)
+	}
+}
+
+// TestWebhookOversizeBody asserts the pre-auth body cap: a body over the limit is
+// rejected with 413 (distinct from a malformed body's 400).
+func TestWebhookOversizeBody(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	_, txID := seedCharge(t, f)
+	big := strings.Repeat("x", (64<<10)+1)
+	body := map[string]any{"external_id": txID, "client_id": f.clientID, "service": "pix", "status": "paid", "information": big}
+	if rec := do(t, f.handler, http.MethodPost, "/webhooks/c6/"+f.webhookRef, "", nil, body); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("want 413 oversize, got %d", rec.Code)
+	}
+}
+
+// TestWebhookReplayDedup asserts double-delivery of the SAME notification produces
+// a single dispatch effect: the second delivery is acked (202) but deduped, so
+// exactly one payment.paid message is published.
+func TestWebhookReplayDedup(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	id, txID := seedCharge(t, f)
+	var published int
+	_ = f.bus.Subscribe(context.Background(), app.TopicPaymentPaid, func(_ context.Context, _ ports.Message) error {
+		published++
+		return nil
+	})
+	f.bank.MarkSettled(f.tenantID, txID)
+	for i := 0; i < 2; i++ {
+		if rec := do(t, f.handler, http.MethodPost, "/webhooks/c6/"+f.webhookRef, "", nil, c6Body(txID, f.clientID, "paid")); rec.Code != http.StatusAccepted {
+			t.Fatalf("delivery %d: want 202, got %d", i, rec.Code)
+		}
+	}
+	if published != 1 {
+		t.Fatalf("want exactly 1 dispatch after double-delivery, got %d", published)
+	}
+	rec := do(t, f.handler, http.MethodGet, "/v1/charges/"+id, tenantToken, nil, nil)
+	var got struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Status != "paid" {
+		t.Fatalf("expected paid, got %s", got.Status)
+	}
+}
+
+// TestWebhookTenantIsolation asserts a ref minted for tenant A only ever acts as A:
+// a webhook on B's ref settles B's charge and leaves A's untouched, and vice versa.
+// There is no path by which A's credential authenticates as B.
+func TestWebhookTenantIsolation(t *testing.T) {
+	t.Parallel()
+	store := persistence.NewStore()
+	creds := secret.NewStore(nil)
+	stub := bank.NewStubProvider(creds)
+	deps := app.Deps{
+		Payments: store, Tenants: store, Pricing: store, Ledger: store, Processed: store,
+		Bus: inmemory.NewBus(), Bank: stub, Credentials: creds,
+		Clock: system.Clock{}, IDs: system.IDProvider{},
+	}
+	admin := app.NewAdminService(deps)
+	mk := func(name, token, clientID string) (tenantID string) {
+		tn, err := admin.CreateTenant(context.Background(), name)
+		if err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+		creds.Set(tn.ID(), ports.BankCredential{ClientID: clientID, Secret: "s"})
+		if _, err := admin.SetEndpointPrice(context.Background(), tn.ID(), "pix.create", 50); err != nil {
+			t.Fatalf("price %s: %v", name, err)
+		}
+		return tn.ID()
+	}
+	tenantA := mk("A", "tokA", "client-a")
+	tenantB := mk("B", "tokB", "client-b")
+	refA, refB := strings.Repeat("A", 43), strings.Repeat("B", 43)
+	auth := httpadapter.NewStaticTokenAuth(
+		map[string]string{"tokA": tenantA, "tokB": tenantB},
+		[]string{adminToken},
+		map[string]httpadapter.WebhookIdentity{
+			refA: {TenantID: tenantA, ClientID: "client-a"},
+			refB: {TenantID: tenantB, ClientID: "client-b"},
+		},
+	)
+	h := httpadapter.NewServer(httpadapter.Config{
+		Charges: app.NewChargeService(deps), Admin: admin, Webhooks: app.NewWebhookService(deps),
+		TenantAuth: auth, AdminAuth: auth, WebhookAuth: auth,
+	}).Router()
+
+	charge := func(token string) (id, txID string) {
+		rec := do(t, h, http.MethodPost, "/v1/charges", token, map[string]string{"Idempotency-Key": "k"}, map[string]any{"endpoint": "pix.create", "amount_cents": 100, "currency": "BRL"})
+		var pv struct {
+			ID   string `json:"id"`
+			TxID string `json:"tx_id"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &pv)
+		return pv.ID, pv.TxID
+	}
+	idA, txA := charge("tokA")
+
+	// Settle A's charge at the bank. Deliver A's settled notification on B's ref:
+	// it reconciles under tenant B (B has no such charge → not-found, no effect),
+	// and must NOT settle A's charge.
+	stub.MarkSettled(tenantA, txA)
+	if rec := do(t, h, http.MethodPost, "/webhooks/c6/"+refB, "", nil, c6Body(txA, "client-b", "paid")); rec.Code == http.StatusAccepted {
+		// Accepted is fine (reconcile found nothing for B); the invariant is A stays pending.
+	} else if rec.Code != http.StatusNotFound {
+		t.Fatalf("B-ref on A tx: unexpected %d", rec.Code)
+	}
+	rec := do(t, h, http.MethodGet, "/v1/charges/"+idA, "tokA", nil, nil)
+	var got struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Status == "paid" {
+		t.Fatal("tenant isolation breach: A settled via B's ref")
+	}
+	// Sanity: A's own ref settles A.
+	if rec := do(t, h, http.MethodPost, "/webhooks/c6/"+refA, "", nil, c6Body(txA, "client-a", "paid")); rec.Code != http.StatusAccepted {
+		t.Fatalf("A-ref on A tx: want 202, got %d", rec.Code)
+	}
+	rec = do(t, h, http.MethodGet, "/v1/charges/"+idA, "tokA", nil, nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Status != "paid" {
+		t.Fatalf("A's own ref failed to settle A: %s", got.Status)
+	}
+}
+
+// TestWebhookMalformedAndEmptyBody covers the body-validation branches: a body
+// that is not valid JSON → 400, and a body missing the external_id (the reconcile
+// key) → 400. Both are distinct from the auth (401) and oversize (413) paths.
+func TestWebhookMalformedAndEmptyBody(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	url := "/webhooks/c6/" + f.webhookRef
+	// Raw non-JSON body → 400.
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewBufferString("{not-json"))
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed body: want 400, got %d", rec.Code)
+	}
+	// Well-formed body but no external_id → 400 (cannot reconcile).
+	if rec := do(t, f.handler, http.MethodPost, url, "", nil, c6Body("", f.clientID, "paid")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty external_id: want 400, got %d", rec.Code)
+	}
+}
+
+// TestGenerateTenantRef asserts a minted ref is well-formed (passes the handler's
+// format gate) and unique, and that it can be registered and resolved end-to-end.
+func TestGenerateTenantRef(t *testing.T) {
+	t.Parallel()
+	a, err := httpadapter.GenerateTenantRef()
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	b, _ := httpadapter.GenerateTenantRef()
+	if a == b {
+		t.Fatal("minted refs are not unique")
+	}
+	if len(a) != 43 {
+		t.Fatalf("ref length = %d, want 43", len(a))
+	}
+	// A minted ref registers and authenticates; a different minted ref does not.
+	auth := httpadapter.NewStaticTokenAuth(nil, nil, map[string]httpadapter.WebhookIdentity{
+		a: {TenantID: "tenant-x", ClientID: "cx"},
+	})
+	if id, ok := auth.AuthenticateWebhook(a); !ok || id.TenantID != "tenant-x" {
+		t.Fatalf("minted ref did not authenticate: ok=%v id=%+v", ok, id)
+	}
+	if _, ok := auth.AuthenticateWebhook(b); ok {
+		t.Fatal("unregistered minted ref authenticated (oracle)")
 	}
 }
 

@@ -18,29 +18,54 @@ import (
 type StubProvider struct {
 	creds ports.CredentialStore
 
-	mu      sync.Mutex
-	charges map[string]ports.ChargeResult // keyed by tenantID+"\x00"+txID
+	mu       sync.Mutex
+	charges  map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+txID
+	byIdem   map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+idempotencyKey
+	consents map[string]ports.ConsentResult // keyed by tenantID+"\x00"+consentID (C6-C)
 }
 
 // NewStubProvider builds a StubProvider. creds is used to demonstrate per-tenant
 // credential isolation at charge time (the secret is never logged).
 func NewStubProvider(creds ports.CredentialStore) *StubProvider {
-	return &StubProvider{creds: creds, charges: make(map[string]ports.ChargeResult)}
+	return &StubProvider{
+		creds:    creds,
+		charges:  make(map[string]ports.ChargeResult),
+		byIdem:   make(map[string]ports.ChargeResult),
+		consents: make(map[string]ports.ConsentResult),
+	}
 }
 
 func key(tenantID, txID string) string { return tenantID + "\x00" + txID }
 
 // CreateCharge resolves the tenant's credential (proving isolation) and returns
 // a pending charge with a deterministic txid derived from the payment id.
+//
+// It models PSP-side idempotency (F3b): when the request carries an idempotency
+// key, a repeat call with the same (tenant, key) returns the original charge
+// without creating a new one — even if the PaymentID differs. This is the
+// defense-in-depth the real C6 adapter must inherit by forwarding the key to the
+// bank, so a retry that races the local reservation cannot double-charge. The key
+// is tenant-scoped, so one tenant's key can never collide with another's.
 func (s *StubProvider) CreateCharge(ctx context.Context, tenantID string, req ports.ChargeRequest) (ports.ChargeResult, error) {
 	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
 		return ports.ChargeResult{}, err
 	}
-	txID := "tx_" + req.PaymentID
-	res := ports.ChargeResult{TxID: txID, Status: "pending"}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if req.IdempotencyKey != "" {
+		if prev, ok := s.byIdem[key(tenantID, req.IdempotencyKey)]; ok {
+			return prev, nil // PSP dedupe: same key => same charge, no new effect
+		}
+	}
+	txID := "tx_" + req.PaymentID
+	// Record the expected amount so reconciliation (GetCharge) can prove the money
+	// adds up, not only the status (threat W3). Received stays zero until the charge
+	// settles (MarkSettled / MarkSettledWithReceived).
+	res := ports.ChargeResult{TxID: txID, Status: "pending", ExpectedAmountCents: req.AmountCents}
 	s.charges[key(tenantID, txID)] = res
-	s.mu.Unlock()
+	if req.IdempotencyKey != "" {
+		s.byIdem[key(tenantID, req.IdempotencyKey)] = res
+	}
 	return res, nil
 }
 
@@ -65,12 +90,29 @@ func (s *StubProvider) ChargeCount() int {
 	return len(s.charges)
 }
 
-// MarkSettled flips a charge to paid (test/dev hook simulating the bank settling).
+// MarkSettled flips a charge to paid and reconciles the full expected amount
+// (test/dev hook simulating the bank settling a correctly-paid charge): the
+// received amount equals the expected amount, so AmountReconciled holds.
 func (s *StubProvider) MarkSettled(tenantID, txID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if res, ok := s.charges[key(tenantID, txID)]; ok {
 		res.Status = "paid"
+		res.ReceivedAmountCents = res.ExpectedAmountCents
+		s.charges[key(tenantID, txID)] = res
+	}
+}
+
+// MarkSettledWithReceived flips a charge to paid with a specific received amount
+// (test/dev hook simulating a divergent settlement: partial payment, an
+// adjustable charge paid to a different value, or overpayment). When received !=
+// expected, AmountReconciled is false and settlement must be refused.
+func (s *StubProvider) MarkSettledWithReceived(tenantID, txID string, receivedCents int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if res, ok := s.charges[key(tenantID, txID)]; ok {
+		res.Status = "paid"
+		res.ReceivedAmountCents = receivedCents
 		s.charges[key(tenantID, txID)] = res
 	}
 }

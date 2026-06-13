@@ -235,8 +235,12 @@ func TestWebhookErrorPropagation(t *testing.T) {
 	t.Run("find payment error after settle", func(t *testing.T) {
 		t.Parallel()
 		h := newHarnessFor()
-		// Seed a settled charge in the stub bank for tenant t1.
-		_, _ = h.bank.CreateCharge(ctx, "t1", ports.ChargeRequest{TenantID: "t1", PaymentID: "p1"})
+		// Seed a settled charge in the stub bank for tenant t1. AmountCents is set so
+		// the charge reconciles (received==expected via MarkSettled) and reaches the
+		// FindPaymentByTxID path under test; the new amount-gate (SIN-64777) would
+		// otherwise refuse a zero-expected charge before that path. CTO-authorized
+		// setup-data fix (Quality-bar rule 3) — the assertion is unchanged.
+		_, _ = h.bank.CreateCharge(ctx, "t1", ports.ChargeRequest{TenantID: "t1", PaymentID: "p1", AmountCents: 100})
 		h.bank.MarkSettled("t1", "tx_p1")
 		f := &faultRepo{findByTx: errInjected}
 		deps := app.Deps{

@@ -26,12 +26,17 @@ type Deps struct {
 	// Kept separate from Credentials (the reader) so each service depends only on
 	// the capability it needs.
 	CredWriter ports.CredentialWriter
-	Clock      ports.Clock
-	IDs        ports.IDProvider
 	// UoW is the transactional boundary used by multi-write use-cases. Production
 	// wiring MUST supply one (the SQLite adapter implements it) so charge creation
 	// and settlement are atomic. When nil, services fall back to an autocommit
 	// unit of work (each write commits on its own) — acceptable only for unit
 	// tests that inject per-port fakes, never for storage-backed production use.
 	UoW ports.UnitOfWork
+	// Audit is the append-only audit trail for privileged admin-plane actions.
+	// When nil, AdminService falls back to a no-op log (foundation default) — a
+	// footgun: production MUST wire a real audit log so privileged actions are
+	// recorded for forensics/compliance.
+	Audit ports.AuditLog
+	Clock ports.Clock
+	IDs   ports.IDProvider
 }

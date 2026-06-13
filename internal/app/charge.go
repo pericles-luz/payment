@@ -98,6 +98,9 @@ func (s *ChargeService) CreateCharge(ctx context.Context, in CreateChargeInput) 
 		PaymentID:   p.ID(),
 		AmountCents: p.Amount().Cents(),
 		Currency:    p.Amount().Currency(),
+		// F3b: forward the idempotency key so the bank/PSP deduplicates the charge
+		// on retry/concurrency, even if the local reservation could not collapse it.
+		IdempotencyKey: in.IdempotencyKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("bank create charge: %w", err)

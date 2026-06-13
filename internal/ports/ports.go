@@ -6,8 +6,11 @@ package ports
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/ia-dev-sindireceita/payment/internal/domain/audit"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/billing"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/payment"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
@@ -88,6 +91,16 @@ type UnitOfWork interface {
 	WithinTx(ctx context.Context, fn func(r Repository) error) error
 }
 
+// AuditLog is the append-only output port for the privileged admin-plane audit
+// trail. Implementations MUST treat entries as immutable (append-only) and MUST
+// NOT persist or log any secret value — an audit.Entry carries only who/what/
+// tenant/when by construction. When backed by a persisted store, the append
+// should share the triggering operation's transaction so the action and its
+// audit record commit atomically (threat: forensic gaps).
+type AuditLog interface {
+	Append(ctx context.Context, e audit.Entry) error
+}
+
 // ProcessedEventStore records which external events (webhooks) have already been
 // handled, providing webhook idempotency / anti-replay (threat W2).
 type ProcessedEventStore interface {
@@ -126,6 +139,22 @@ type BankCredential struct {
 	Secret string
 }
 
+// String implements fmt.Stringer so a credential can never leak its secret
+// through %v/%s/%+v formatting in logs or errors (defense-in-depth, threat C1).
+func (c BankCredential) String() string {
+	return fmt.Sprintf("BankCredential{TenantID:%s ClientID:%s Secret:[REDACTED]}", c.TenantID, c.ClientID)
+}
+
+// LogValue implements slog.LogValuer so structured logging emits the credential
+// without its secret, even when logged as an attribute value (threat C1/C4).
+func (c BankCredential) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("tenant_id", c.TenantID),
+		slog.String("client_id", c.ClientID),
+		slog.String("secret", "[REDACTED]"),
+	)
+}
+
 // CredentialStore isolates bank credentials per tenant behind a secret store.
 // No secret ever lives in code; the adapter reads from config/vault (threat C1/C4).
 type CredentialStore interface {
@@ -146,12 +175,59 @@ type ChargeRequest struct {
 	PaymentID   string
 	AmountCents int64
 	Currency    string
+	// IdempotencyKey is the tenant's idempotency key for this charge. The real C6
+	// adapter MUST forward it to the PSP (e.g. as the provider's Idempotency-Key)
+	// so the bank itself deduplicates retried/concurrent CreateCharge calls. This
+	// is defense-in-depth for double-charge (F3b): it complements the local
+	// reservation done before the bank call (F3a, SIN-64719) so a crash window
+	// between charging the bank and persisting the key cannot bill twice — the PSP
+	// collapses the duplicate even when the caller cannot. Empty means the caller
+	// did not supply one; adapters MUST then fall back to a deterministic key
+	// (e.g. PaymentID) and never silently drop idempotency.
+	IdempotencyKey string
 }
 
-// ChargeResult is the bank's response to a charge creation.
+// ChargeResult is the bank's response to a generic charge (the non-PIX charge
+// surface, e.g. C6 GET /charges/{txid}). It carries the reconciled lifecycle
+// status plus the money needed to reconcile a settlement.
+//
+//   - Status is the PSP's charge status verbatim ("paid", "pending", ...).
+//     Settlement reads this from GetCharge, never from a raw webhook
+//     (reconcile-before-settle, threat W3).
+//   - ExpectedAmountCents is the charge's original amount (valor.original) in
+//     cents — what the payer was asked to pay.
+//   - ReceivedAmountCents is the amount actually received in cents (the sum of
+//     the reconciled receipts). It is zero while the charge is unpaid and equals
+//     the expected amount on a correctly paid charge.
+//
+// Reconciling only Status proves the charge is marked paid; it does NOT prove the
+// payer paid the right amount. Settlement MUST also assert the money adds up
+// (AmountReconciled) before liquidating — a partial payment, an adjustable charge
+// paid to a different value, or manipulation would otherwise settle for the wrong
+// amount (reconcile-before-settle, threat W3).
+//
+// It is intentionally kept distinct from PixChargeResult (ISP): a PIX charge
+// carries QR lifecycle data a generic charge does not, so the two result types are
+// not collapsed even though both now carry expected/received cents.
 type ChargeResult struct {
-	TxID   string
-	Status string
+	TxID                string
+	Status              string
+	ExpectedAmountCents int64
+	ReceivedAmountCents int64
+}
+
+// AmountReconciled reports whether the amount received on this charge exactly
+// matches the amount that was expected (original). It mirrors
+// PixChargeResult.AmountReconciled: a non-positive expected amount is never
+// reconciled (a degenerate charge would otherwise fail open), and overpayment
+// (received > expected) is a divergence too, so the check is strict equality.
+//
+// The generic webhook settlement path asserts this inside its transactional
+// boundary, in addition to a paid status, before liquidating; a false result is a
+// divergence (shared.ErrAmountMismatch territory) that blocks settlement and
+// raises an audit event.
+func (r ChargeResult) AmountReconciled() bool {
+	return r.ExpectedAmountCents > 0 && r.ReceivedAmountCents == r.ExpectedAmountCents
 }
 
 // BankProvider is the output port for the bank/PSP (C6 first). A stub
@@ -162,4 +238,178 @@ type BankProvider interface {
 	// GetCharge reconciles the authoritative state of a charge (never trust a raw
 	// webhook — threat W3).
 	GetCharge(ctx context.Context, tenantID, txID string) (ChargeResult, error)
+}
+
+// PixChargeResult is the bank's representation of an immediate PIX charge
+// (cobrança imediata): its reconciled lifecycle status plus the QR-code material
+// and the instant the QR expires.
+//
+//   - Status is the PSP's charge status verbatim (e.g. "ATIVA", "CONCLUIDA",
+//     "REMOVIDA_PELO_PSP"). Settlement decisions read this from GetImmediateCharge,
+//     never from a raw webhook (reconcile-before-settle, threat W3).
+//   - QRCodePayload is the BACEN "PIX copia e cola" (EMV) string the payer pastes
+//     into their bank app.
+//   - QRCodeLocation is the URL from which the QR-code image can be rendered.
+//   - ExpiresAt is the instant the QR/charge expires; the zero value means the PSP
+//     did not return an expiry. Callers treat now > ExpiresAt as an expired QR.
+//   - ExpectedAmountCents is the charge's original amount (valor.original) in
+//     cents — what the payer was asked to pay.
+//   - ReceivedAmountCents is the sum of the reconciled PIX receipts (the pix[]
+//     array, each pix.valor) in cents — what was actually received. It is zero
+//     while the charge is unpaid (ATIVA) and equals the expected amount on a
+//     correctly paid CONCLUIDA charge.
+//
+// Reconciling only Status proves the charge is marked paid; it does NOT prove the
+// payer paid the right amount. Settlement MUST also assert the money adds up
+// (AmountReconciled) before liquidating, otherwise a charge paid to a lesser value
+// (partial payment, adjustable cob, manipulation) would settle for the wrong
+// amount (reconcile-before-settle, threat W3).
+//
+// It is intentionally distinct from ChargeResult: a PIX charge carries QR
+// lifecycle data a plain charge does not, and keeping it separate avoids widening
+// the generic charge result with PIX-only fields.
+type PixChargeResult struct {
+	TxID                string
+	Status              string
+	QRCodePayload       string
+	QRCodeLocation      string
+	ExpiresAt           time.Time
+	ExpectedAmountCents int64
+	ReceivedAmountCents int64
+}
+
+// AmountReconciled reports whether the amount received on this charge exactly
+// matches the amount that was expected (original). It is the money half of
+// reconcile-before-settle: a settlement use-case asserts this — inside its
+// transactional boundary (WithinTx) and in addition to a CONCLUIDA, non-expired
+// status — before liquidating, treating a false result as a divergence
+// (shared.ErrAmountMismatch) that blocks settlement and raises an audit event.
+//
+// A non-positive expected amount is never reconciled: it is a degenerate charge,
+// and settling against it would fail open. Overpayment (received > expected) is a
+// divergence too, so the check is strict equality rather than ">=".
+func (r PixChargeResult) AmountReconciled() bool {
+	return r.ExpectedAmountCents > 0 && r.ReceivedAmountCents == r.ExpectedAmountCents
+}
+
+// PixProvider is the output port for immediate PIX charges at the bank/PSP,
+// satisfied by the C6 adapter. It is kept separate from BankProvider (ISP) so a
+// use-case that only needs generic charges does not depend on PIX QR semantics.
+type PixProvider interface {
+	// CreateImmediateCharge idempotently creates an immediate PIX charge and
+	// returns its QR code and expiry. req.IdempotencyKey (falling back to the
+	// PaymentID) anchors idempotency: a re-submit with the same key resolves to the
+	// same charge and never creates a duplicate. expiresIn is the QR lifetime; a
+	// non-positive value lets the adapter apply its default.
+	CreateImmediateCharge(ctx context.Context, tenantID string, req ChargeRequest, expiresIn time.Duration) (PixChargeResult, error)
+	// GetImmediateCharge reconciles the authoritative state of a PIX charge — the
+	// source of truth for settlement (never trust a raw webhook — threat W3).
+	GetImmediateCharge(ctx context.Context, tenantID, txID string) (PixChargeResult, error)
+}
+
+// The product-specific bank ports below (PIX Automático consent, BolePix boleto,
+// unified checkout) are deliberately kept SEPARATE from BankProvider rather than
+// widening it. Interface Segregation: a use-case that only creates boletos should
+// not be forced to depend on consent or checkout methods, and existing
+// BankProvider consumers/test-doubles are unaffected. The C6 adapter implements
+// all of them; a stub backs them for tests. Each carries tenantID explicitly so
+// the per-tenant credential/token isolation the C6 adapter enforces is never
+// bypassed (the tenant is derived from the authenticated caller, never client
+// input — threat H1/P1).
+
+// ConsentRequest is the input to register a recurring-debit (PIX Automático)
+// consent at the bank. Amount and window mirror the domain consent; the adapter
+// only transports them. IdempotencyKey, when present, is forwarded so the PSP
+// collapses retried/concurrent registrations into one consent.
+type ConsentRequest struct {
+	TenantID       string
+	ConsentID      string
+	DebtorTaxID    string
+	MaxAmountCents int64
+	Currency       string
+	Frequency      string
+	StartAt        time.Time
+	EndAt          time.Time // zero => open-ended
+	IdempotencyKey string
+}
+
+// ConsentResult is the bank's response to a consent operation.
+type ConsentResult struct {
+	ConsentID string
+	Status    string
+}
+
+// ConsentProvider is the output port for PIX Automático recurring-debit consents:
+// register, reconcile and cancel. Cancellation must be supported because a payer
+// can revoke authorization at any time.
+type ConsentProvider interface {
+	CreateConsent(ctx context.Context, tenantID string, req ConsentRequest) (ConsentResult, error)
+	// GetConsent reconciles the authoritative consent state from the bank (never
+	// trust a raw webhook — threat W3).
+	GetConsent(ctx context.Context, tenantID, consentID string) (ConsentResult, error)
+	// CancelConsent revokes a consent so no further debits can be originated.
+	CancelConsent(ctx context.Context, tenantID, consentID string) (ConsentResult, error)
+}
+
+// BoletoRequest is the input to register a BolePix boleto at the bank. The fine
+// and interest RATES are transported so the bank registers them, but the amount
+// owed at any instant is computed by the boleto domain, never here (Hexagonal).
+type BoletoRequest struct {
+	TenantID           string
+	BoletoID           string
+	AmountCents        int64
+	Currency           string
+	DueDate            time.Time
+	FineBps            int64
+	MonthlyInterestBps int64
+	PayerTaxID         string
+	IdempotencyKey     string
+}
+
+// BoletoResult is the bank's response to a boleto registration. It carries the
+// scannable artifacts (the PIX EMV "copia e cola" payload and the boleto's
+// barcode/linha digitável) the caller renders for the payer.
+type BoletoResult struct {
+	BoletoID    string
+	TxID        string
+	Status      string
+	QRCode      string // PIX EMV copy-and-paste payload (BolePix)
+	Barcode     string // boleto linha digitável / barcode
+	AmountCents int64  // principal the bank registered
+}
+
+// BoletoProvider is the output port for BolePix boleto registration.
+type BoletoProvider interface {
+	CreateBoleto(ctx context.Context, tenantID string, req BoletoRequest) (BoletoResult, error)
+}
+
+// CheckoutItem is one line of a checkout request (transport mirror of the
+// checkout domain Item).
+type CheckoutItem struct {
+	Description string
+	AmountCents int64
+}
+
+// CheckoutRequest is the input to open a unified C6 hosted checkout session.
+type CheckoutRequest struct {
+	TenantID       string
+	SessionID      string
+	Currency       string
+	Items          []CheckoutItem
+	ExpiresAt      time.Time
+	IdempotencyKey string
+}
+
+// CheckoutResult is the bank's response to opening a checkout session. RedirectURL
+// is the hosted page the caller sends the payer to.
+type CheckoutResult struct {
+	SessionID   string
+	Status      string
+	RedirectURL string
+	AmountCents int64
+}
+
+// CheckoutProvider is the output port for the unified C6 checkout session.
+type CheckoutProvider interface {
+	CreateCheckoutSession(ctx context.Context, tenantID string, req CheckoutRequest) (CheckoutResult, error)
 }

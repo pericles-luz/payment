@@ -8,7 +8,7 @@ import (
 
 func TestFromEnvDefaults(t *testing.T) {
 	// Not parallel: mutates process environment.
-	for _, k := range []string{"PAYMENT_HTTP_ADDR", "PAYMENT_DB_PATH", "PAYMENT_TENANT_TOKENS", "PAYMENT_ADMIN_TOKENS", "PAYMENT_WEBHOOK_SECRET", "PAYMENT_BANK_CREDS", "PAYMENT_RABBIT_URL"} {
+	for _, k := range []string{"PAYMENT_HTTP_ADDR", "PAYMENT_DB_PATH", "PAYMENT_TENANT_TOKENS", "PAYMENT_ADMIN_TOKENS", "PAYMENT_WEBHOOK_REFS", "PAYMENT_BANK_CREDS", "PAYMENT_RABBIT_URL"} {
 		t.Setenv(k, "")
 	}
 	cfg := config.FromEnv()
@@ -52,7 +52,7 @@ func TestFromEnvParsing(t *testing.T) {
 	t.Setenv("PAYMENT_DB_PATH", "/tmp/x.db")
 	t.Setenv("PAYMENT_TENANT_TOKENS", "tokA:tenantA, tokB:tenantB ,bad")
 	t.Setenv("PAYMENT_ADMIN_TOKENS", "admin1, admin2")
-	t.Setenv("PAYMENT_WEBHOOK_SECRET", "whsec")
+	t.Setenv("PAYMENT_WEBHOOK_REFS", "refAAA:tenantA, refBBB:tenantB")
 	t.Setenv("PAYMENT_BANK_CREDS", "tenantA:cidA:secA, malformed:only2, ")
 	t.Setenv("PAYMENT_RABBIT_URL", "amqp://localhost")
 
@@ -69,8 +69,8 @@ func TestFromEnvParsing(t *testing.T) {
 	if len(cfg.AdminTokens) != 2 {
 		t.Fatalf("admin tokens: %+v", cfg.AdminTokens)
 	}
-	if cfg.WebhookSecret != "whsec" || cfg.RabbitURL != "amqp://localhost" {
-		t.Fatal("secret/rabbit mismatch")
+	if cfg.WebhookRefs["refAAA"] != "tenantA" || cfg.WebhookRefs["refBBB"] != "tenantB" || cfg.RabbitURL != "amqp://localhost" {
+		t.Fatalf("webhook refs/rabbit mismatch: %+v", cfg.WebhookRefs)
 	}
 	cred, ok := cfg.BankCreds["tenantA"]
 	if !ok || cred.ClientID != "cidA" || cred.Secret != "secA" {

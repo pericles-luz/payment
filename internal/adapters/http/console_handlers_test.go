@@ -49,7 +49,7 @@ func newConsoleFixture(t *testing.T) *consoleFixture {
 		adminToken:       httpadapter.RoleAdmin,
 		secondAdminToken: httpadapter.RoleAdmin,
 		operatorToken:    httpadapter.RoleOperator,
-	}, webhookSec)
+	}, nil)
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Console: console, UI: ui, AdminAuth: auth, TenantAuth: auth, WebhookAuth: auth,
 	})

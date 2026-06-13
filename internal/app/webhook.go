@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
+	"github.com/ia-dev-sindireceita/payment/internal/domain/audit"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/payment"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
@@ -13,6 +15,12 @@ import (
 
 // bankStatusPaid is the authoritative bank status that settles a payment.
 const bankStatusPaid = "paid"
+
+// systemOperatorWebhook is the reserved synthetic operator id recorded on
+// money-movement audit events raised by the PSP webhook path. A webhook has no
+// human operator; this names the system actor so the audit trail stays
+// attributable without inventing a fake user.
+const systemOperatorWebhook = "system:c6-webhook"
 
 // WebhookService processes bank webhook events. A webhook is only a trigger: the
 // service is idempotent (anti-replay) and reconciles the authoritative state
@@ -22,15 +30,26 @@ type WebhookService struct {
 	bus   ports.MessageBus
 	clock ports.Clock
 	uow   ports.UnitOfWork
+	audit ports.AuditLog
+	ids   ports.IDProvider
 }
 
-// NewWebhookService wires a WebhookService from the provided ports.
+// NewWebhookService wires a WebhookService from the provided ports. A nil
+// Deps.Audit degrades to a no-op log (foundation default), mirroring
+// AdminService; production MUST wire a real append-only audit log so refused
+// settlements are recorded for forensics/compliance.
 func NewWebhookService(d Deps) *WebhookService {
+	a := d.Audit
+	if a == nil {
+		a = noopAudit{}
+	}
 	return &WebhookService{
 		bank:  d.Bank,
 		bus:   d.Bus,
 		clock: d.Clock,
 		uow:   resolveUoW(d),
+		audit: a,
+		ids:   d.IDs,
 	}
 }
 
@@ -90,6 +109,35 @@ func (s *WebhookService) HandlePaymentEvent(ctx context.Context, ev PaymentEvent
 			return nil
 		}
 
+		// Reconcile the MONEY, not only the status (threat W3, SIN-64777). A charge
+		// the PSP marked paid may still have been paid to a lesser/greater value
+		// (partial payment, adjustable cob, manipulation); settling on status alone
+		// would liquidate for the wrong amount.
+		//
+		// Divergence is a TERMINAL, audited, COMMITTING outcome — deliberately NOT
+		// an error. Returning an error here would roll back WithinTx, undoing
+		// MarkProcessed, so C6 would redeliver the identical event forever (an
+		// infinite settle-retry on a mismatch that will never reconcile) and the
+		// audit record would be lost. Instead we keep MarkProcessed, do NOT MarkPaid,
+		// durably record the divergence, log a security event, and return nil so the
+		// tx commits and the handler returns 202 (notification accepted and recorded;
+		// settlement refused). A failure to record the divergence DOES propagate (and
+		// roll back) so a transient audit-store outage retries on redelivery rather
+		// than committing an unaudited refusal.
+		if !res.AmountReconciled() {
+			if err := s.recordSettlementMismatch(ctx, ev, res); err != nil {
+				return fmt.Errorf("record settlement divergence: %w", err)
+			}
+			slog.WarnContext(ctx, "settlement amount divergence: refusing to settle",
+				"event", "settlement.amount_mismatch",
+				"tenant_id", ev.TenantID,
+				"tx_id", ev.TxID,
+				"expected_cents", res.ExpectedAmountCents,
+				"received_cents", res.ReceivedAmountCents,
+			)
+			return nil
+		}
+
 		p, err := r.FindPaymentByTxID(ctx, ev.TenantID, ev.TxID)
 		if err != nil {
 			return fmt.Errorf("find payment by tx: %w", err)
@@ -112,7 +160,35 @@ func (s *WebhookService) HandlePaymentEvent(ctx context.Context, ev PaymentEvent
 	if settled == nil {
 		return nil
 	}
+	return s.publishSettled(ctx, settled, ev)
+}
 
+// recordSettlementMismatch appends the durable audit record for a refused
+// settlement (expected/received cents, txid, tenant, system actor — no secret).
+// It is called inside the webhook's transaction so the record commits together
+// with MarkProcessed; an append error is returned so the caller can roll back and
+// retry on redelivery rather than commit an unaudited refusal.
+func (s *WebhookService) recordSettlementMismatch(ctx context.Context, ev PaymentEvent, res ports.ChargeResult) error {
+	e, err := audit.NewSettlementMismatchEntry(
+		s.ids.NewID(),
+		systemOperatorWebhook,
+		ev.TenantID,
+		ev.TxID,
+		res.ExpectedAmountCents,
+		res.ReceivedAmountCents,
+		s.clock.Now(),
+	)
+	if err != nil {
+		return fmt.Errorf("build audit entry: %w", err)
+	}
+	if err := s.audit.Append(ctx, e); err != nil {
+		return fmt.Errorf("append audit entry: %w", err)
+	}
+	return nil
+}
+
+// publishSettled emits the payment-paid event after a successful settlement.
+func (s *WebhookService) publishSettled(ctx context.Context, settled *payment.Payment, ev PaymentEvent) error {
 	payload := []byte(fmt.Sprintf(`{"payment_id":%q,"tenant_id":%q,"tx_id":%q}`, settled.ID(), settled.TenantID(), settled.TxID()))
 	_ = s.bus.Publish(ctx, TopicPaymentPaid, ports.Message{
 		TenantID:       settled.TenantID(),

@@ -19,7 +19,6 @@ const (
 	rbacTenantToken   = "ten-tok"
 	rbacAdminToken    = "adm-tok"
 	rbacOperatorToken = "ops-tok"
-	rbacWebhookSecret = "wh-sec"
 )
 
 type rbacFixture struct {
@@ -61,7 +60,7 @@ func newRBACFixture(t *testing.T) *rbacFixture {
 			rbacAdminToken:    httpadapter.RoleAdmin,
 			rbacOperatorToken: httpadapter.RoleOperator,
 		},
-		rbacWebhookSecret,
+		nil, // webhook refs: not exercised by RBAC tests
 	)
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:     app.NewChargeService(deps),
@@ -174,7 +173,7 @@ func TestAuthenticateAdminRoles(t *testing.T) {
 		"ops1":    httpadapter.RoleOperator,
 		"":        httpadapter.RoleAdmin,   // dropped: empty token
 		"bogustk": httpadapter.Role("god"), // dropped: unknown role
-	}, "")
+	}, nil)
 
 	cases := []struct {
 		token    string

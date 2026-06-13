@@ -2,6 +2,8 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -176,28 +178,95 @@ func (s *Server) handleSetBankCredential(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, bankCredentialView{TenantID: tenantID, ClientID: req.ClientID, Status: "ok"})
 }
 
-// --- Bank webhook ---
+// --- C6 bank webhook ---
 
-type webhookRequest struct {
-	TenantID string `json:"tenant_id"`
-	TxID     string `json:"tx_id"`
-	EventKey string `json:"event_key"`
+// maxWebhookBytes caps the inbound webhook body. The webhook is pre-authenticated
+// only by the opaque URL, so the body is parsed from an unauthenticated network
+// peer; an unbounded read is a resource-consumption DoS (OWASP API4). A C6
+// notification is a few hundred bytes — 64 KiB is generous. Oversize → 413.
+const maxWebhookBytes = 64 << 10
+
+// c6WebhookNotification is the inbound C6 callback body (notificações.yaml,
+// WebhookNotification). It is UNTRUSTED: the tenant comes from the authenticated
+// channel (never client_id), and settlement reconciles the authoritative state
+// via GetCharge rather than trusting status. Only the fields the adapter needs are
+// decoded; unknown fields are rejected (anti mass-assignment).
+type c6WebhookNotification struct {
+	ExternalID string `json:"external_id"` // C6 charge id → reconcile key (txID)
+	ClientID   string `json:"client_id"`   // C6 merchant id → cross-checked, not trusted
+	Service    string `json:"service"`     // e.g. pix — part of the idempotency key
+	Status     string `json:"status"`      // advisory only; never the settle decision
 }
 
-func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
-	// Failure-closed authentication of the inbound webhook (threat W1).
-	if !s.webhookAuth.AuthenticateWebhook(r.Header.Get("X-Webhook-Secret")) {
+// handleC6Webhook receives a C6 payment notification on a tenant's opaque callback
+// URL (/webhooks/c6/{tenantRef}). Security posture (ADR-0002 / F4):
+//   - the tenant is derived from the authenticated channel (the unguessable ref),
+//     never from the body — closing cross-tenant anti-replay poisoning at the source;
+//   - the body is size-capped before it is read (pre-auth DoS);
+//   - the body's client_id is cross-checked against the channel tenant and a
+//     divergence is rejected and logged as a security event (never trusted);
+//   - the event is deduplicated and reconciled in the app layer's unit of work
+//     (anti-replay + reconcile-before-settle), which is the financial backstop.
+func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
+	// 1. Authenticate the channel. The opaque ref in the path IS the credential
+	//    (the C6 webhook is unsigned). Unknown and malformed refs both yield the
+	//    SAME generic 401 — no tenant-existence oracle. The ref is a capability
+	//    secret: it is never written to logs (only the resolved tenant id is).
+	id, ok := s.webhookAuth.AuthenticateWebhook(chi.URLParam(r, "tenantRef"))
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	var req webhookRequest
-	if !decodeJSON(w, r, &req) {
+
+	// 2. Cap and decode the untrusted body. Oversize → 413 (distinct from a
+	//    malformed body's 400) so the cap is observable.
+	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBytes)
+	var note c6WebhookNotification
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&note); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if dec.More() {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// 3. Defense-in-depth cross-check: the body may not claim a different tenant
+	//    than the channel. The channel is authoritative regardless; a divergence is
+	//    an attack indicator. Log it as a security event WITHOUT the ref/secret or
+	//    raw body — only the resolved tenant id and the (untrusted) claimed id,
+	//    which slog escapes. An absent client_id is allowed (channel is the truth).
+	if note.ClientID != "" && id.ClientID != "" && note.ClientID != id.ClientID {
+		slog.Warn("c6 webhook tenant mismatch: body client_id diverges from channel",
+			slog.String("channel_tenant", id.TenantID),
+			slog.String("claimed_client_id", note.ClientID))
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if strings.TrimSpace(note.ExternalID) == "" {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// 4. Dispatch with the CHANNEL tenant. EventKey distinguishes state transitions
+	//    of the same charge (e.g. pending→paid) while collapsing exact redeliveries,
+	//    so anti-replay dedup (processed_events) suppresses duplicates without
+	//    dropping a genuine settle. Retention of processed_events is INDEFINITE: the
+	//    C6 contract signs nothing (no timestamp), so dedup is the only replay
+	//    barrier and pruning a key would reopen a replay window. A bounded
+	//    signed-timestamp window is deferred to SIN-64762 (if C6 ever signs).
 	err := s.webhooks.HandlePaymentEvent(r.Context(), app.PaymentEvent{
-		TenantID: req.TenantID,
-		TxID:     req.TxID,
-		EventKey: req.EventKey,
+		TenantID: id.TenantID,
+		TxID:     note.ExternalID,
+		EventKey: note.ExternalID + "|" + note.Service + "|" + note.Status,
 	})
 	if err != nil {
 		writeDomainError(w, err)
