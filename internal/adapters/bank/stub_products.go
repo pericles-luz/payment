@@ -97,9 +97,11 @@ func (s *StubProvider) CreateCheckoutSession(ctx context.Context, tenantID strin
 		sum += it.AmountCents
 	}
 	return ports.CheckoutResult{
-		SessionID:   req.SessionID,
-		Status:      "OPEN",
-		RedirectURL: "https://checkout.c6.example/" + req.SessionID,
-		AmountCents: sum,
+		SessionID:             req.SessionID,
+		Status:                "OPEN",
+		RedirectURL:           "https://checkout.c6.example/" + req.SessionID,
+		AmountCents:           sum,
+		CardType:              req.CardType,
+		RequireAuthentication: req.RequireAuthentication,
 	}, nil
 }

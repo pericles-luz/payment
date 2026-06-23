@@ -14,18 +14,33 @@ const (
 // Deps bundles the output ports the application services depend on. Each service
 // takes only the narrow set it needs; Deps is a convenience for wiring in cmd.
 type Deps struct {
-	Payments    ports.PaymentRepository
-	Tenants     ports.TenantRepository
-	Pricing     ports.PricingRepository
-	Ledger      ports.LedgerRepository
-	Processed   ports.ProcessedEventStore
-	Bus         ports.MessageBus
-	Bank        ports.BankProvider
+	Payments  ports.PaymentRepository
+	Tenants   ports.TenantRepository
+	Pricing   ports.PricingRepository
+	Ledger    ports.LedgerRepository
+	Processed ports.ProcessedEventStore
+	Bus       ports.MessageBus
+	Bank      ports.BankProvider
+	// Pix is the immediate-PIX-charge port (cobrança imediata). It is segregated
+	// from Bank (ISP): PixService depends only on it. In production it is the C6
+	// provider itself (the raw PixProvider, NOT the settlement wrapper); in stub mode
+	// it is the in-memory StubProvider. When nil, PixService is simply not wired.
+	Pix ports.PixProvider
+	// Checkout is the unified C6 hosted-checkout port (roteiro 9). Segregated from
+	// Bank/Pix (ISP): CheckoutService depends only on it. In production it is the C6
+	// provider; in stub mode the in-memory StubProvider. When nil, CheckoutService is
+	// simply not wired.
+	Checkout    ports.CheckoutProvider
 	Credentials ports.CredentialStore
 	// CredWriter is the admin-plane write path for per-tenant bank credentials.
 	// Kept separate from Credentials (the reader) so each service depends only on
 	// the capability it needs.
 	CredWriter ports.CredentialWriter
+	// CredInvalidator evicts cached state keyed on a tenant's credential (the C6
+	// OAuth2 token cache) right after a credential write, closing the
+	// token-revocation lag (ADR-0003). Optional: when nil the admin services use a
+	// no-op (e.g. the in-memory bank stub has no token cache to evict).
+	CredInvalidator ports.CredentialInvalidator
 	// UoW is the transactional boundary used by multi-write use-cases. Production
 	// wiring MUST supply one (the SQLite adapter implements it) so charge creation
 	// and settlement are atomic. When nil, services fall back to an autocommit

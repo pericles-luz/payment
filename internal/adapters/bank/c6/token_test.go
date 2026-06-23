@@ -207,6 +207,98 @@ func TestTokenCredentialError(t *testing.T) {
 	}
 }
 
+// TestTokenInvalidateForcesRefetch is the token-revocation-lag fix (ADR-0003):
+// after a credential rotation the cached bearer would otherwise survive until
+// expiry. invalidate() drops it so the next call mints a fresh token under the
+// new credential.
+func TestTokenInvalidateForcesRefetch(t *testing.T) {
+	t.Parallel()
+	ts := newTestServer(t)
+	creds := oneTenant("t1", "c1", "s1")
+	p := ts.provider(t, creds)
+
+	first, err := p.tokens.token(context.Background(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != "tok-c1" || ts.tokenHits != 1 {
+		t.Fatalf("first fetch: tok=%q hits=%d", first, ts.tokenHits)
+	}
+
+	// Rotate the credential. Without eviction the cache still serves the old token
+	// (the lag this fix closes).
+	creds.creds["t1"] = ports.BankCredential{TenantID: "t1", ClientID: "c2", Secret: "s2"}
+	stale, err := p.tokens.token(context.Background(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale != "tok-c1" || ts.tokenHits != 1 {
+		t.Fatalf("pre-evict should still be cached under old cred: tok=%q hits=%d", stale, ts.tokenHits)
+	}
+
+	// Evict, then the next call mints a token under the rotated credential.
+	p.tokens.invalidate("t1")
+	fresh, err := p.tokens.token(context.Background(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh != "tok-c2" || ts.tokenHits != 2 {
+		t.Fatalf("post-evict should refetch under new cred: tok=%q hits=%d", fresh, ts.tokenHits)
+	}
+}
+
+// TestTokenInvalidateIsPerTenant asserts evicting one tenant never disturbs
+// another tenant's cached token.
+func TestTokenInvalidateIsPerTenant(t *testing.T) {
+	t.Parallel()
+	ts := newTestServer(t)
+	creds := &fakeCreds{creds: map[string]ports.BankCredential{
+		"t1": {TenantID: "t1", ClientID: "c1", Secret: "s1"},
+		"t2": {TenantID: "t2", ClientID: "c2", Secret: "s2"},
+	}}
+	p := ts.provider(t, creds)
+
+	if _, err := p.tokens.token(context.Background(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.tokens.token(context.Background(), "t2"); err != nil {
+		t.Fatal(err)
+	}
+	if ts.tokenHits != 2 {
+		t.Fatalf("expected one fetch per tenant, hits=%d", ts.tokenHits)
+	}
+
+	p.tokens.invalidate("t1")
+	// t2 stays cached (no extra fetch); t1 refetches.
+	if _, err := p.tokens.token(context.Background(), "t2"); err != nil {
+		t.Fatal(err)
+	}
+	if ts.tokenHits != 2 {
+		t.Fatalf("evicting t1 must not touch t2's cache, hits=%d", ts.tokenHits)
+	}
+	if _, err := p.tokens.token(context.Background(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if ts.tokenHits != 3 {
+		t.Fatalf("t1 should have refetched after eviction, hits=%d", ts.tokenHits)
+	}
+}
+
+// TestTokenInvalidateUnknownTenant is a no-op (and must not panic) when the
+// tenant has no cache slot — the admin plane may evict before any token was ever
+// minted for that tenant.
+func TestTokenInvalidateUnknownTenant(t *testing.T) {
+	t.Parallel()
+	ts := newTestServer(t)
+	p := ts.provider(t, oneTenant("t1", "c1", "s1"))
+	p.tokens.invalidate("never-seen")
+	if ts.tokenHits != 0 {
+		t.Fatalf("invalidate must not trigger a fetch, hits=%d", ts.tokenHits)
+	}
+	// The provider-level entrypoint is the wiring the admin plane uses.
+	p.InvalidateToken("never-seen")
+}
+
 // TestTokenConcurrentSameTenant exercises the per-tenant lock: many concurrent
 // callers for one tenant must all succeed (race detector guards correctness).
 func TestTokenConcurrentSameTenant(t *testing.T) {

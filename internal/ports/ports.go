@@ -169,6 +169,25 @@ type CredentialWriter interface {
 	SetBankCredential(ctx context.Context, tenantID, clientID, secret string) error
 }
 
+// CredentialInvalidator is the optional hook the admin plane invokes right after
+// a tenant's bank credential is (re)written, so an adapter that caches state
+// keyed on that credential — notably the C6 OAuth2 client_credentials token
+// cache — can evict the tenant's entry immediately instead of serving a bearer
+// minted under the old secret until it expires (token-revocation lag; ADR-0003 /
+// SIN-64764). It is intentionally separate from CredentialWriter: the writer
+// persists the secret, the invalidator only drops volatile caches, and a write
+// path that has no cache to evict (e.g. the in-memory bank stub) simply omits it.
+//
+// InvalidateToken MUST be safe to call for an unknown tenant (no-op). It is
+// best-effort and local, and so carries neither context nor error: dropping an
+// in-memory entry cannot fail and MUST never fail the credential write that
+// already succeeded. Eviction is per-process; in a multi-replica deployment each
+// replica evicts the cache on the write it serves and other replicas still
+// converge within the token TTL (see ADR-0003).
+type CredentialInvalidator interface {
+	InvalidateToken(tenantID string)
+}
+
 // ChargeRequest is the input to create a charge at the bank.
 type ChargeRequest struct {
 	TenantID    string
@@ -185,6 +204,15 @@ type ChargeRequest struct {
 	// did not supply one; adapters MUST then fall back to a deterministic key
 	// (e.g. PaymentID) and never silently drop idempotency.
 	IdempotencyKey string
+	// DebtorTaxID and DebtorName identify the payer (devedor) on an immediate PIX
+	// charge (homologação roteiro 7.2). Both are OPTIONAL — a PIX charge may omit
+	// the devedor entirely — and apply ONLY to the PIX immediate-charge port; the
+	// generic BankProvider charge path ignores them. DebtorTaxID, when present, is an
+	// all-digit CPF (11) or CNPJ (14); the use-case validates the format at its
+	// boundary before it reaches the adapter, so the adapter only maps it into the
+	// PSP's devedor block. DebtorName is the payer's name and is never logged.
+	DebtorTaxID string
+	DebtorName  string
 }
 
 // ChargeResult is the bank's response to a generic charge (the non-PIX charge
@@ -305,6 +333,32 @@ type PixProvider interface {
 	// GetImmediateCharge reconciles the authoritative state of a PIX charge — the
 	// source of truth for settlement (never trust a raw webhook — threat W3).
 	GetImmediateCharge(ctx context.Context, tenantID, txID string) (PixChargeResult, error)
+	// ListImmediateCharges returns the immediate PIX charges created within the
+	// filter's date window (BACEN GET /cob by interval, homologação roteiro 7.4),
+	// paginated. It is a pure read and never mutates a charge. The tenant is explicit
+	// so per-tenant credential isolation is never bypassed (threat H1/P1).
+	ListImmediateCharges(ctx context.Context, tenantID string, filter PixListFilter) (PixChargeList, error)
+}
+
+// PixListFilter is the date-window + pagination filter for listing immediate PIX
+// charges. Start and End are the BACEN inicio/fim bounds (required); Page and
+// PageSize map to paginacao.paginaAtual / paginacao.itensPorPagina (optional — a
+// zero value lets the adapter/PSP apply its default).
+type PixListFilter struct {
+	Start    time.Time
+	End      time.Time
+	Page     int
+	PageSize int
+}
+
+// PixChargeList is a page of immediate PIX charges plus the pagination echo from
+// the PSP so a caller can iterate the full window.
+type PixChargeList struct {
+	Charges    []PixChargeResult
+	Page       int
+	PageSize   int
+	TotalItems int
+	TotalPages int
 }
 
 // The product-specific bank ports below (PIX Automático consent, BolePix boleto,
@@ -392,12 +446,18 @@ type CheckoutItem struct {
 
 // CheckoutRequest is the input to open a unified C6 hosted checkout session.
 type CheckoutRequest struct {
-	TenantID       string
-	SessionID      string
-	Currency       string
-	Items          []CheckoutItem
-	ExpiresAt      time.Time
-	IdempotencyKey string
+	TenantID  string
+	SessionID string
+	Currency  string
+	Items     []CheckoutItem
+	ExpiresAt time.Time
+	// CardType is the permitted card payment method ("credit"|"debit"); the hosted
+	// page routes the payer accordingly (roteiro 9.a–9.c).
+	CardType string
+	// RequireAuthentication asks the hosted page to authenticate the payer (step-up
+	// / 3-DS) before capture (roteiro 9.c).
+	RequireAuthentication bool
+	IdempotencyKey        string
 }
 
 // CheckoutResult is the bank's response to opening a checkout session. RedirectURL
@@ -407,6 +467,11 @@ type CheckoutResult struct {
 	Status      string
 	RedirectURL string
 	AmountCents int64
+	// CardType / RequireAuthentication echo the permitted payment method back so the
+	// caller's response is self-describing (the C6 create response does not echo
+	// them; the adapter sets them from the request).
+	CardType              string
+	RequireAuthentication bool
 }
 
 // CheckoutProvider is the output port for the unified C6 checkout session.

@@ -105,6 +105,29 @@ func (m *tokenManager) token(ctx context.Context, tenantID string) (string, erro
 	return tok.accessToken, nil
 }
 
+// invalidate drops any cached token for tenantID so the next token() call mints a
+// fresh one under the tenant's current credential. It is the eviction half of the
+// token-revocation-lag fix (ADR-0003): a rotated/revoked credential takes effect
+// at once instead of after the cached bearer expires (≤ TTL; 60s fallback). Safe
+// for an unknown tenant (no-op) and concurrency-safe against an in-flight refresh:
+// it takes the outer lock only to find the slot, then the slot's own lock to zero
+// it — the same outer-then-slot order token() uses, never both at once, so no
+// lock-order inversion. A refresh already running for the old credential finishes
+// into its slot; because the new credential is persisted before invalidate runs,
+// any (re)fetch — that in-flight one or the next caller's — resolves the new
+// secret from the store.
+func (m *tokenManager) invalidate(tenantID string) {
+	m.mu.Lock()
+	st, ok := m.entries[tenantID]
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	st.mu.Lock()
+	st.tok = cachedToken{}
+	st.mu.Unlock()
+}
+
 // tokenResponse is the subset of the OAuth2 token response we consume.
 type tokenResponse struct {
 	AccessToken string `json:"access_token"`

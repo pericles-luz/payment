@@ -5,6 +5,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -62,7 +63,7 @@ func FromEnv() Config {
 		AdminTokens:    splitNonEmpty(os.Getenv("PAYMENT_ADMIN_TOKENS")),
 		OperatorTokens: splitNonEmpty(os.Getenv("PAYMENT_OPERATOR_TOKENS")),
 		WebhookRefs:    parseKV(os.Getenv("PAYMENT_WEBHOOK_REFS")),
-		BankCreds:      parseBankCreds(os.Getenv("PAYMENT_BANK_CREDS")),
+		BankCreds:      parseBankCreds(os.Getenv("PAYMENT_BANK_CREDS"), slog.Default()),
 		RabbitURL:      os.Getenv("PAYMENT_RABBIT_URL"),
 		SecureCookies:  getenvBool("PAYMENT_SECURE_COOKIES", true),
 		C6: C6Config{
@@ -125,21 +126,44 @@ func parseKV(s string) map[string]string {
 }
 
 // parseBankCreds parses "tenant:clientID:secret,..." into per-tenant credentials.
-func parseBankCreds(s string) map[string]ports.BankCredential {
+//
+// Each entry is split on the first two ':' only (strings.SplitN with n=3), so a
+// secret that itself contains ':' is preserved verbatim in the final field — it
+// is NOT truncated. Entries that are structurally malformed (wrong field count,
+// or an empty tenant/clientID/secret) are skipped and logged at warn level so an
+// operator can spot a misconfigured PAYMENT_BANK_CREDS instead of debugging an
+// opaque auth failure at the PSP. To avoid leaking material, neither the raw
+// entry nor the secret is ever logged; only the non-sensitive tenant_id and the
+// entry position are included to aid diagnosis.
+func parseBankCreds(s string, logger *slog.Logger) map[string]ports.BankCredential {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	m := make(map[string]ports.BankCredential)
-	for _, item := range splitNonEmpty(s) {
+	for i, item := range splitNonEmpty(s) {
 		parts := strings.SplitN(item, ":", 3)
 		if len(parts) != 3 {
+			logger.Warn("skipping malformed bank credential: expected tenant:clientID:secret",
+				slog.Int("entry_index", i), slog.Int("field_count", len(parts)))
 			continue
 		}
 		tenant := strings.TrimSpace(parts[0])
+		clientID := strings.TrimSpace(parts[1])
+		secret := strings.TrimSpace(parts[2])
 		if tenant == "" {
+			logger.Warn("skipping bank credential with empty tenant",
+				slog.Int("entry_index", i))
+			continue
+		}
+		if clientID == "" || secret == "" {
+			logger.Warn("skipping bank credential with empty client_id or secret",
+				slog.String("tenant_id", tenant))
 			continue
 		}
 		m[tenant] = ports.BankCredential{
 			TenantID: tenant,
-			ClientID: strings.TrimSpace(parts[1]),
-			Secret:   strings.TrimSpace(parts[2]),
+			ClientID: clientID,
+			Secret:   secret,
 		}
 	}
 	return m

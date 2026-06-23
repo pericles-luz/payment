@@ -65,24 +65,35 @@ func run() error {
 	// otherwise fall back to the in-memory stub (local dev / tests). The C6
 	// adapter rejects non-HTTPS endpoints, so a misconfigured URL fails startup
 	// rather than silently downgrading the transport.
-	bankProvider, err := newBankProvider(cfg, creds)
+	bankProvider, pixProvider, err := newBankProvider(cfg, creds)
 	if err != nil {
 		return err
 	}
+	// Credential-cache invalidator (ADR-0003): the C6 provider implements it and
+	// the settlement wrapper forwards it; the stub does not implement it, so this
+	// assertion yields nil and the admin services fall back to a no-op evictor.
+	credInvalidator, _ := bankProvider.(ports.CredentialInvalidator)
+	// The raw provider (c6p in production, the stub in stub mode) also satisfies the
+	// segregated checkout port; the settlement wrapper does not, so derive it from
+	// pixProvider (the raw provider) rather than bankProvider.
+	checkoutProvider, _ := pixProvider.(ports.CheckoutProvider)
 
 	deps := app.Deps{
-		Payments:    store,
-		Tenants:     store,
-		Pricing:     store,
-		Ledger:      store,
-		Processed:   store,
-		Bus:         inmemory.NewBus(),
-		Bank:        bankProvider,
-		Credentials: creds,
-		CredWriter:  creds,
-		Audit:       audit,
-		Clock:       system.Clock{},
-		IDs:         system.IDProvider{},
+		Payments:        store,
+		Tenants:         store,
+		Pricing:         store,
+		Ledger:          store,
+		Processed:       store,
+		Bus:             inmemory.NewBus(),
+		Bank:            bankProvider,
+		Pix:             pixProvider,
+		Checkout:        checkoutProvider,
+		Credentials:     creds,
+		CredWriter:      creds,
+		CredInvalidator: credInvalidator,
+		Audit:           audit,
+		Clock:           system.Clock{},
+		IDs:             system.IDProvider{},
 		// Transactional boundary for the multi-write use-cases (charge creation,
 		// webhook settlement) — required for financial integrity (SIN-64719).
 		UoW: store,
@@ -122,15 +133,18 @@ func run() error {
 		return err
 	}
 	console := app.NewConsoleService(app.ConsoleDeps{
-		Tenants:    store,
-		Pricing:    store,
-		Ledger:     store,
-		CredWriter: creds,
-		Clock:      system.Clock{},
-		IDs:        system.IDProvider{},
+		Tenants:         store,
+		Pricing:         store,
+		Ledger:          store,
+		CredWriter:      creds,
+		CredInvalidator: credInvalidator,
+		Clock:           system.Clock{},
+		IDs:             system.IDProvider{},
 	})
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:       app.NewChargeService(deps),
+		Pix:           app.NewPixService(deps),
+		Checkout:      app.NewCheckoutService(deps),
 		Admin:         app.NewAdminService(deps),
 		Console:       console,
 		UI:            ui,
@@ -170,15 +184,39 @@ func run() error {
 // newBankProvider selects the bank adapter. When the C6 base URL is configured it
 // builds the real C6 provider (OAuth2 + HTTPS transport + error mapping);
 // otherwise it returns the in-memory stub so local dev and tests still boot.
-func newBankProvider(cfg config.Config, creds ports.CredentialStore) (ports.BankProvider, error) {
+//
+// For C6 the settlement reconcile read is routed through the BACEN-verified PIX
+// immediate-charge read (GetImmediateCharge / GET …/v1/pix/{txid}), NOT the
+// speculative generic GET /charges/{txid} (SIN-64780 routing decision, CTO on
+// SIN-64791). The C6 provider satisfies both BankProvider and PixProvider, so it
+// is wrapped in PixSettlementProvider: charge creation stays on the generic port
+// while the settlement reconcile read resolves through the verified PIX shape.
+//
+// The C6 provider owns the per-tenant OAuth2 token cache and implements
+// ports.CredentialInvalidator; the PixSettlementProvider wrapper forwards that
+// capability, so run() recovers the invalidator with a single type assertion on
+// the returned provider (the stub holds no cache and does not implement it, which
+// degrades to a no-op in the admin services — ADR-0003).
+// It returns the generic BankProvider (charge creation + settlement reconcile via
+// the PIX-verified read) AND the raw PixProvider for the immediate-PIX-charge
+// use-case (PixService). In stub mode both are the same in-memory StubProvider; for
+// C6 the BankProvider is the settlement wrapper while the PixProvider is the raw C6
+// provider (PixService must speak the BACEN PIX shape directly, not through the
+// generic settlement translation).
+func newBankProvider(cfg config.Config, creds ports.CredentialStore) (ports.BankProvider, ports.PixProvider, error) {
 	if cfg.C6.BaseURL == "" {
 		log.Print("api: PAYMENT_C6_BASE_URL not set — using in-memory bank stub")
-		return bank.NewStubProvider(creds), nil
+		stub := bank.NewStubProvider(creds)
+		return stub, stub, nil
 	}
-	return c6.New(c6.Config{
+	c6p, err := c6.New(c6.Config{
 		BaseURL:  cfg.C6.BaseURL,
 		TokenURL: cfg.C6.TokenURL,
 		Scope:    cfg.C6.Scope,
 		Timeout:  cfg.C6.Timeout,
 	}, creds)
+	if err != nil {
+		return nil, nil, err
+	}
+	return bank.NewPixSettlementProvider(c6p, c6p), c6p, nil
 }

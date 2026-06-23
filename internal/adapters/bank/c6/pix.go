@@ -68,10 +68,41 @@ type pixLoc struct {
 	Location string `json:"location"`
 }
 
+// pixDevedor identifies the payer (devedor) on an immediate PIX charge. C6/BACEN
+// names the document field cpf OR cnpj by length; nome is the payer's name. The
+// fields are omitempty so a charge with no devedor sends no devedor block.
+type pixDevedor struct {
+	CPF  string `json:"cpf,omitempty"`
+	CNPJ string `json:"cnpj,omitempty"`
+	Nome string `json:"nome,omitempty"`
+}
+
 // pixChargeRequestBody is the JSON sent to C6 to create an immediate PIX charge.
+// Devedor is optional (a charge may omit the payer); it is omitted from the wire
+// when nil.
 type pixChargeRequestBody struct {
 	Calendario pixCalendario `json:"calendario"`
+	Devedor    *pixDevedor   `json:"devedor,omitempty"`
 	Valor      pixValor      `json:"valor"`
+}
+
+// buildDevedor maps the request's optional devedor fields into the PSP block, or
+// returns nil when no payer was supplied. The document is placed in cpf or cnpj by
+// length (14 ⇒ CNPJ, otherwise CPF): the use-case has already validated the id is
+// an 11- or 14-digit string before it reaches here, so no further check is needed.
+func buildDevedor(req ports.ChargeRequest) *pixDevedor {
+	taxID := strings.TrimSpace(req.DebtorTaxID)
+	name := strings.TrimSpace(req.DebtorName)
+	if taxID == "" && name == "" {
+		return nil
+	}
+	d := &pixDevedor{Nome: name}
+	if len(taxID) == 14 {
+		d.CNPJ = taxID
+	} else {
+		d.CPF = taxID
+	}
+	return d
 }
 
 // pixChargeResponseBody is the subset of C6's PIX charge representation we
@@ -124,6 +155,7 @@ func (p *Provider) CreateImmediateCharge(ctx context.Context, tenantID string, r
 
 	payload, err := json.Marshal(pixChargeRequestBody{
 		Calendario: pixCalendario{Expiracao: int64(expiresIn / time.Second)},
+		Devedor:    buildDevedor(req),
 		Valor:      pixValor{Original: formatAmount(req.AmountCents)},
 	})
 	if err != nil {
@@ -172,6 +204,76 @@ func (p *Provider) GetImmediateCharge(ctx context.Context, tenantID, txID string
 		return ports.PixChargeResult{}, err
 	}
 	return p.toPixResult(out, "get_pix")
+}
+
+// pixListResponseBody is the subset of C6's immediate-charge list (GET /v1/pix,
+// the BACEN /cob list) we consume: the pagination block and the cobs array. Each
+// cob reuses the single-charge wire shape so toPixResult maps it identically.
+type pixListResponseBody struct {
+	Parametros struct {
+		Paginacao struct {
+			PaginaAtual            int `json:"paginaAtual"`
+			ItensPorPagina         int `json:"itensPorPagina"`
+			QuantidadeDePaginas    int `json:"quantidadeDePaginas"`
+			QuantidadeTotalDeItens int `json:"quantidadeTotalDeItens"`
+		} `json:"paginacao"`
+	} `json:"parametros"`
+	Cobs []pixChargeResponseBody `json:"cobs"`
+}
+
+// ListImmediateCharges lists the immediate PIX charges created within [Start,End]
+// via GET /v1/pix?inicio=…&fim=… (BACEN cob list, roteiro 7.4). The window bounds
+// are mandatory and rendered as RFC3339 UTC instants; pagination is forwarded only
+// when supplied. Like the single-charge reads this is fail-secure on the money: a
+// malformed amount in any cob maps to ErrUnavailable rather than reconciling to
+// zero.
+func (p *Provider) ListImmediateCharges(ctx context.Context, tenantID string, filter ports.PixListFilter) (ports.PixChargeList, error) {
+	if filter.Start.IsZero() || filter.End.IsZero() {
+		return ports.PixChargeList{}, &Error{Op: "list_pix", sentinel: shared.ErrValidation}
+	}
+	token, err := p.tokens.token(ctx, tenantID)
+	if err != nil {
+		return ports.PixChargeList{}, err
+	}
+
+	q := url.Values{}
+	q.Set("inicio", filter.Start.UTC().Format(time.RFC3339))
+	q.Set("fim", filter.End.UTC().Format(time.RFC3339))
+	if filter.Page > 0 {
+		q.Set("paginacao.paginaAtual", strconv.Itoa(filter.Page))
+	}
+	if filter.PageSize > 0 {
+		q.Set("paginacao.itensPorPagina", strconv.Itoa(filter.PageSize))
+	}
+
+	endpoint := p.baseURL + "/v1/pix?" + q.Encode()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return ports.PixChargeList{}, transportError("list_pix")
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("Accept", "application/json")
+
+	var out pixListResponseBody
+	if err := p.do(httpReq, "list_pix", &out); err != nil {
+		return ports.PixChargeList{}, err
+	}
+
+	charges := make([]ports.PixChargeResult, 0, len(out.Cobs))
+	for _, cob := range out.Cobs {
+		r, err := p.toPixResult(cob, "list_pix")
+		if err != nil {
+			return ports.PixChargeList{}, err
+		}
+		charges = append(charges, r)
+	}
+	return ports.PixChargeList{
+		Charges:    charges,
+		Page:       out.Parametros.Paginacao.PaginaAtual,
+		PageSize:   out.Parametros.Paginacao.ItensPorPagina,
+		TotalItems: out.Parametros.Paginacao.QuantidadeTotalDeItens,
+		TotalPages: out.Parametros.Paginacao.QuantidadeDePaginas,
+	}, nil
 }
 
 // toPixResult maps the PSP wire shape into the port result, computing the QR

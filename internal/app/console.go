@@ -21,12 +21,13 @@ import (
 // the concrete sqlite/inmemory stores satisfy them, but the console declares
 // exactly the capabilities it uses and nothing more.
 type ConsoleService struct {
-	tenants    TenantStore
-	pricing    PricingStore
-	ledger     LedgerReader
-	credWriter ports.CredentialWriter
-	clock      ports.Clock
-	ids        ports.IDProvider
+	tenants     TenantStore
+	pricing     PricingStore
+	ledger      LedgerReader
+	credWriter  ports.CredentialWriter
+	credEvictor ports.CredentialInvalidator
+	clock       ports.Clock
+	ids         ports.IDProvider
 }
 
 // TenantStore is the tenant capability the console needs: the foundation's
@@ -56,19 +57,30 @@ type ConsoleDeps struct {
 	Pricing    PricingStore
 	Ledger     LedgerReader
 	CredWriter ports.CredentialWriter
-	Clock      ports.Clock
-	IDs        ports.IDProvider
+	// CredInvalidator evicts cached state keyed on a tenant's credential (the C6
+	// OAuth2 token cache) right after a credential write, closing the
+	// token-revocation lag (ADR-0003). Optional: nil degrades to a no-op.
+	CredInvalidator ports.CredentialInvalidator
+	Clock           ports.Clock
+	IDs             ports.IDProvider
 }
 
-// NewConsoleService wires a ConsoleService from its dependencies.
+// NewConsoleService wires a ConsoleService from its dependencies. A nil
+// CredInvalidator degrades to a no-op (the credential write still succeeds; only
+// the cache-eviction step is skipped).
 func NewConsoleService(d ConsoleDeps) *ConsoleService {
+	ci := d.CredInvalidator
+	if ci == nil {
+		ci = noopCredInvalidator{}
+	}
 	return &ConsoleService{
-		tenants:    d.Tenants,
-		pricing:    d.Pricing,
-		ledger:     d.Ledger,
-		credWriter: d.CredWriter,
-		clock:      d.Clock,
-		ids:        d.IDs,
+		tenants:     d.Tenants,
+		pricing:     d.Pricing,
+		ledger:      d.Ledger,
+		credWriter:  d.CredWriter,
+		credEvictor: ci,
+		clock:       d.Clock,
+		ids:         d.IDs,
 	}
 }
 
@@ -204,6 +216,10 @@ func (s *ConsoleService) SetBankCredential(ctx context.Context, tenantID, client
 		// Wrap with non-sensitive context only; never include the secret.
 		return fmt.Errorf("set bank credential: %w", err)
 	}
+	// Evict any cached OAuth2 token minted under the prior credential so the
+	// rotation/revocation takes effect immediately instead of after the cached
+	// bearer expires (token-revocation lag, ADR-0003). Best-effort and local.
+	s.credEvictor.InvalidateToken(strings.TrimSpace(tenantID))
 	return nil
 }
 

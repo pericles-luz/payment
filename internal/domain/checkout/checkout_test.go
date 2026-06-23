@@ -2,6 +2,7 @@ package checkout
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -119,6 +120,25 @@ func TestSessionTotalsAndAccessors(t *testing.T) {
 	got := s.Items()
 	if len(got) != 2 || got[0].Description() != "a" || got[0].AmountCents() != 1000 {
 		t.Fatalf("items: %+v", got)
+	}
+}
+
+// A set of individually-valid positive items whose running int64 sum wraps past
+// math.MaxInt64 must be rejected with ErrValidation, not silently reduced to a
+// small positive total. Three items (≤100) suffice: MaxInt64+MaxInt64 wraps to
+// -2 and +5 lands on 3 — a wrong but positive value that pre-fix slipped through
+// NewMoney's `<= 0` guard.
+func TestNewRejectsItemSumOverflow(t *testing.T) {
+	t.Parallel()
+	exp := ts(t, "2026-06-20T00:00:00Z")
+	items := []Item{
+		mustItem(t, "a", math.MaxInt64),
+		mustItem(t, "b", math.MaxInt64),
+		mustItem(t, "c", 5),
+	}
+	_, err := New("s1", "t1", "BRL", items, exp)
+	if !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("want ErrValidation for overflowing item sum, got %v", err)
 	}
 }
 

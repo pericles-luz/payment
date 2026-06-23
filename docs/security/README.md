@@ -11,6 +11,8 @@ Conjunto de documentos de segurança da plataforma de pagamentos multi-tenant
 | [`secure-baseline.md`](./secure-baseline.md) | Requisitos de segurança obrigatórios: segredos, auth/mTLS/OAuth C6, isolamento de tenant, idempotência/anti-replay de webhook, validação de entrada, cripto, logging, PIX/BCB + LGPD. |
 | [`pr-review-policy.md`](./pr-review-policy.md) | Critérios objetivos de "potencial de fragilidade" + checklist de revisão de segurança (gate de merge). |
 | [`adr-0001-console-browser-auth-transport.md`](./adr-0001-console-browser-auth-transport.md) | ADR (Aceito — Opção A) — transporte de auth do console HTML no browser: bearer injetado por proxy vs. futuro session cookie, e impacto no modelo CSRF. |
+| [`adr-0002-c6-settlement-reconcile-via-pix.md`](./adr-0002-c6-settlement-reconcile-via-pix.md) | ADR (Aceito) — reconciliação de liquidação do C6 via leitura PIX (`/v1/pix/{txid}`) em vez do `/charges` genérico inventado (reconcile-before-settle, ameaça W3). |
+| [`adr-0003-oauth2-token-revocation-lag.md`](./adr-0003-oauth2-token-revocation-lag.md) | ADR (Proposto) — lag de revogação do token OAuth2 do C6: evict imediato do cache de token por-tenant no update de credencial + runbook de rotação/revogação (residual ≤ TTL em multi-réplica). |
 | [`../ops/ingress-runbook.md`](../ops/ingress-runbook.md) | Runbook de ingress — premissa de deploy não-negociável da Opção A (ADR-0001) como pré-requisito de go-live: app só via proxy confiável, token não vaza, sessão autenticada no edge. |
 
 ## Postura

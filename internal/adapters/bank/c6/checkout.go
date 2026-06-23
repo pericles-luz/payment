@@ -22,10 +22,12 @@ type checkoutItemBody struct {
 
 // checkoutRequestBody is the JSON sent to C6 to open a hosted checkout session.
 type checkoutRequestBody struct {
-	SessionID string             `json:"session_id"`
-	Currency  string             `json:"currency"`
-	Items     []checkoutItemBody `json:"items"`
-	ExpiresAt time.Time          `json:"expires_at"`
+	SessionID             string             `json:"session_id"`
+	Currency              string             `json:"currency"`
+	Items                 []checkoutItemBody `json:"items"`
+	ExpiresAt             time.Time          `json:"expires_at"`
+	CardType              string             `json:"card_type"`
+	RequireAuthentication bool               `json:"require_authentication"`
 }
 
 // checkoutResponseBody is the subset of C6's checkout-session representation we
@@ -47,10 +49,12 @@ func (p *Provider) CreateCheckoutSession(ctx context.Context, tenantID string, r
 		items[i] = checkoutItemBody{Description: it.Description, AmountCents: it.AmountCents}
 	}
 	payload, err := json.Marshal(checkoutRequestBody{
-		SessionID: req.SessionID,
-		Currency:  req.Currency,
-		Items:     items,
-		ExpiresAt: req.ExpiresAt,
+		SessionID:             req.SessionID,
+		Currency:              req.Currency,
+		Items:                 items,
+		ExpiresAt:             req.ExpiresAt,
+		CardType:              req.CardType,
+		RequireAuthentication: req.RequireAuthentication,
 	})
 	if err != nil {
 		return ports.CheckoutResult{}, &Error{Op: "create_checkout", sentinel: shared.ErrValidation}
@@ -83,6 +87,10 @@ func (p *Provider) CreateCheckoutSession(ctx context.Context, tenantID string, r
 		Status:      out.Status,
 		RedirectURL: out.RedirectURL,
 		AmountCents: out.AmountCents,
+		// C6's create response does not echo the payment method; reflect what we sent
+		// so the result is self-describing for the caller's response/traceability.
+		CardType:              req.CardType,
+		RequireAuthentication: req.RequireAuthentication,
 	}, nil
 }
 

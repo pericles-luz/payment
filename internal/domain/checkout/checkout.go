@@ -11,6 +11,34 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 )
 
+// CardType is the card payment method a hosted checkout session permits. The C6
+// hosted page routes the payer through the credit or debit flow accordingly
+// (roteiro 9.a–9.c). It is a closed set: an unknown value is a validation error.
+type CardType string
+
+const (
+	// CardCredit is a credit-card checkout (roteiro 9.a / 9.c).
+	CardCredit CardType = "credit"
+	// CardDebit is a debit-card checkout (roteiro 9.b).
+	CardDebit CardType = "debit"
+)
+
+// ParseCardType normalises and validates a card-type string (case-insensitive,
+// trimmed), rejecting anything outside the closed {credit, debit} set.
+func ParseCardType(s string) (CardType, error) {
+	switch CardType(strings.ToLower(strings.TrimSpace(s))) {
+	case CardCredit:
+		return CardCredit, nil
+	case CardDebit:
+		return CardDebit, nil
+	default:
+		return "", shared.NewValidationError("card_type", "card_type must be credit or debit")
+	}
+}
+
+// valid reports whether c is a known card type.
+func (c CardType) valid() bool { return c == CardCredit || c == CardDebit }
+
 // Item is one line of a checkout session: a human description and a positive
 // amount in cents. Immutable once constructed.
 type Item struct {
@@ -39,11 +67,13 @@ func (i Item) AmountCents() int64 { return i.amountCents }
 // Session is a unified checkout session aggregate. The total is derived from the
 // items (never stored as a separate mutable field) so it cannot drift from them.
 type Session struct {
-	id        string
-	tenantID  string
-	items     []Item
-	total     shared.Money
-	expiresAt time.Time
+	id          string
+	tenantID    string
+	items       []Item
+	total       shared.Money
+	expiresAt   time.Time
+	cardType    CardType
+	requireAuth bool
 }
 
 // New constructs a checkout Session, enforcing: identifiers present, at least one
@@ -68,7 +98,10 @@ func New(id, tenantID, currency string, items []Item, expiresAt time.Time) (Sess
 
 	var sum int64
 	for _, it := range items {
-		sum += it.amountCents
+		var err error
+		if sum, err = shared.AddCents(sum, it.amountCents); err != nil {
+			return Session{}, err
+		}
 	}
 	total, err := shared.NewMoney(sum, currency)
 	if err != nil {
@@ -112,6 +145,27 @@ func (s Session) Currency() string { return s.total.Currency() }
 
 // ExpiresAt returns the expiry instant.
 func (s Session) ExpiresAt() time.Time { return s.expiresAt }
+
+// CardType returns the permitted card payment method (empty until set via WithCard).
+func (s Session) CardType() CardType { return s.cardType }
+
+// RequireAuthentication reports whether the hosted page must authenticate the
+// payer (step-up / 3-DS) before capture (roteiro 9.c).
+func (s Session) RequireAuthentication() bool { return s.requireAuth }
+
+// WithCard returns a copy of the session carrying the permitted card type and
+// whether the hosted page must authenticate the payer. It validates the card
+// type (the only closed-set field) and is the canonical way to attach the
+// payment-method routing to a validated session, keeping New's signature stable.
+// The value-receiver copy keeps Session effectively immutable.
+func (s Session) WithCard(card CardType, requireAuth bool) (Session, error) {
+	if !card.valid() {
+		return Session{}, shared.NewValidationError("card_type", "card_type must be credit or debit")
+	}
+	s.cardType = card
+	s.requireAuth = requireAuth
+	return s, nil
+}
 
 // IsExpired reports whether the session has expired at instant at (expiry is
 // exclusive: a session is live up to and including its expiry instant).

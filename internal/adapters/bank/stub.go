@@ -7,6 +7,7 @@ package bank
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
@@ -17,22 +18,48 @@ import (
 // (GetCharge) can be driven in tests.
 type StubProvider struct {
 	creds ports.CredentialStore
+	// now is the clock for PIX QR-expiry computation. Defaults to time.Now;
+	// overridable (SetClock) so tests can pin the immediate-charge window/listing.
+	now func() time.Time
 
-	mu       sync.Mutex
-	charges  map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+txID
-	byIdem   map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+idempotencyKey
-	consents map[string]ports.ConsentResult // keyed by tenantID+"\x00"+consentID (C6-C)
+	mu         sync.Mutex
+	charges    map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+txID
+	byIdem     map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+idempotencyKey
+	consents   map[string]ports.ConsentResult // keyed by tenantID+"\x00"+consentID (C6-C)
+	pixCharges map[string]stubPixCharge       // keyed by tenantID+"\x00"+txID (PIX cobrança imediata)
+	pixByIdem  map[string]string              // keyed by tenantID+"\x00"+idempotencyKey -> txID
+}
+
+// stubPixCharge is the in-memory record for an immediate PIX charge: the port
+// result plus the creation instant so ListImmediateCharges can filter by date.
+type stubPixCharge struct {
+	result    ports.PixChargeResult
+	createdAt time.Time
 }
 
 // NewStubProvider builds a StubProvider. creds is used to demonstrate per-tenant
 // credential isolation at charge time (the secret is never logged).
 func NewStubProvider(creds ports.CredentialStore) *StubProvider {
 	return &StubProvider{
-		creds:    creds,
-		charges:  make(map[string]ports.ChargeResult),
-		byIdem:   make(map[string]ports.ChargeResult),
-		consents: make(map[string]ports.ConsentResult),
+		creds:      creds,
+		now:        time.Now,
+		charges:    make(map[string]ports.ChargeResult),
+		byIdem:     make(map[string]ports.ChargeResult),
+		consents:   make(map[string]ports.ConsentResult),
+		pixCharges: make(map[string]stubPixCharge),
+		pixByIdem:  make(map[string]string),
 	}
+}
+
+// SetClock overrides the stub's clock (PIX QR expiry / list-window filtering) so a
+// test can pin time deterministically. Passing nil restores time.Now.
+func (s *StubProvider) SetClock(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now == nil {
+		now = time.Now
+	}
+	s.now = now
 }
 
 func key(tenantID, txID string) string { return tenantID + "\x00" + txID }

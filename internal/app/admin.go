@@ -15,12 +15,13 @@ import (
 // privileged (RBAC enforced at the boundary) and every successful mutation is
 // recorded to the append-only audit trail with the operator's identity.
 type AdminService struct {
-	tenants    ports.TenantRepository
-	pricing    ports.PricingRepository
-	credWriter ports.CredentialWriter
-	audit      ports.AuditLog
-	clock      ports.Clock
-	ids        ports.IDProvider
+	tenants     ports.TenantRepository
+	pricing     ports.PricingRepository
+	credWriter  ports.CredentialWriter
+	credEvictor ports.CredentialInvalidator
+	audit       ports.AuditLog
+	clock       ports.Clock
+	ids         ports.IDProvider
 }
 
 // noopAudit is the fallback AuditLog used when Deps.Audit is nil. It keeps the
@@ -30,15 +31,28 @@ type noopAudit struct{}
 
 func (noopAudit) Append(context.Context, audit.Entry) error { return nil }
 
+// noopCredInvalidator is the fallback CredentialInvalidator used when
+// Deps.CredInvalidator is nil — e.g. the in-memory bank stub holds no token cache
+// to evict. It drops nothing.
+type noopCredInvalidator struct{}
+
+func (noopCredInvalidator) InvalidateToken(string) {}
+
 // NewAdminService wires an AdminService from the provided ports. A nil audit log
 // degrades to a no-op so existing callers keep working; production wires a real
-// append-only audit log.
+// append-only audit log. A nil credential invalidator likewise degrades to a
+// no-op (the credential write still succeeds; only the cache-eviction step is
+// skipped).
 func NewAdminService(d Deps) *AdminService {
 	a := d.Audit
 	if a == nil {
 		a = noopAudit{}
 	}
-	return &AdminService{tenants: d.Tenants, pricing: d.Pricing, credWriter: d.CredWriter, audit: a, clock: d.Clock, ids: d.IDs}
+	ci := d.CredInvalidator
+	if ci == nil {
+		ci = noopCredInvalidator{}
+	}
+	return &AdminService{tenants: d.Tenants, pricing: d.Pricing, credWriter: d.CredWriter, credEvictor: ci, audit: a, clock: d.Clock, ids: d.IDs}
 }
 
 // recordAudit appends an audit entry for a privileged action. who is derived
@@ -106,6 +120,11 @@ func (s *AdminService) SetBankCredential(ctx context.Context, tenantID, clientID
 		// Wrap with a non-sensitive context only; never include the secret.
 		return fmt.Errorf("set bank credential: %w", err)
 	}
+	// Evict any cached OAuth2 token minted under the prior credential so the
+	// rotation/revocation takes effect immediately instead of after the cached
+	// bearer expires (token-revocation lag, ADR-0003). Best-effort and local; the
+	// write has already committed and a missing cache entry is a no-op.
+	s.credEvictor.InvalidateToken(tenantID)
 	// Audit records who set a credential for which tenant — never the secret or
 	// even the client id (the entry carries only who/what/tenant/when).
 	if err := s.recordAudit(ctx, audit.ActionSetBankCredential, tenantID); err != nil {

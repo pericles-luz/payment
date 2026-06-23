@@ -64,6 +64,19 @@ type Provider struct {
 // compile-time assertion that Provider satisfies the port.
 var _ ports.BankProvider = (*Provider)(nil)
 
+// compile-time assertion that Provider can evict its per-tenant token cache when
+// a credential is rotated/revoked (token-revocation-lag fix, ADR-0003).
+var _ ports.CredentialInvalidator = (*Provider)(nil)
+
+// InvalidateToken evicts any cached OAuth2 token for tenantID so the next bank
+// call obtains a fresh token under the tenant's current credential. It is the
+// adapter side of ports.CredentialInvalidator: the admin plane calls it right
+// after a credential rotation/revocation to close the token-revocation lag
+// (ADR-0003). Safe to call for an unknown tenant (no-op).
+func (p *Provider) InvalidateToken(tenantID string) {
+	p.tokens.invalidate(tenantID)
+}
+
 // New validates the config and builds a Provider. Both endpoints must be absolute
 // HTTPS URLs; an http:// or malformed endpoint is rejected (secure-by-default,
 // TLS-only). creds resolves per-tenant OAuth2 credentials at token-fetch time.
