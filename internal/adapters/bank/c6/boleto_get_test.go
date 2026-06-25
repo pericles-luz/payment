@@ -1,0 +1,170 @@
+package c6
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
+	"github.com/ia-dev-sindireceita/payment/internal/ports"
+)
+
+// --- Boleto: register carries discount tiers, read reconciles them (roteiro 3/6.a) ---
+
+func TestCreateBoletoCarriesDiscounts(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
+
+	if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
+		TenantID: "t1", BoletoID: "bol_1", AmountCents: 100000, Currency: "BRL",
+		FineBps: 200, MonthlyInterestBps: 100,
+		Payer: fullBoletoPayer(),
+		Discounts: []ports.BoletoDiscountTier{
+			{DaysBeforeDue: 10, Bps: 1000},
+			{DaysBeforeDue: 0, FixedCents: 500},
+		},
+	}); err != nil {
+		t.Fatalf("CreateBoleto: %v", err)
+	}
+	var sent struct {
+		Discounts []struct {
+			DaysBeforeDue int   `json:"days_before_due"`
+			Bps           int64 `json:"bps"`
+			FixedCents    int64 `json:"fixed_cents"`
+		} `json:"discounts"`
+	}
+	if err := json.Unmarshal(ps.body(), &sent); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(sent.Discounts) != 2 || sent.Discounts[0].Bps != 1000 || sent.Discounts[1].FixedCents != 500 {
+		t.Fatalf("discounts not transported: body=%s", ps.body())
+	}
+}
+
+func TestGetBoletoSuccess(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
+
+	res, err := p.GetBoleto(context.Background(), "t1", "bol_1")
+	if err != nil {
+		t.Fatalf("GetBoleto: %v", err)
+	}
+	if res.BoletoID != "bol_1" || res.Status != "REGISTERED" {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if res.FineBps != 200 || res.MonthlyInterestBps != 100 {
+		t.Fatalf("registered rates not reconciled: %+v", res)
+	}
+	if len(res.Discounts) != 1 || res.Discounts[0].Bps != 500 {
+		t.Fatalf("discounts not reconciled: %+v", res.Discounts)
+	}
+	if ps.lastAuthHeader != "Bearer tok-client-1" {
+		t.Fatalf("bearer not attached: %q", ps.lastAuthHeader)
+	}
+}
+
+func TestGetBoletoNotFoundMapping(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	ps.boletoGet = func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"code":"NOT_FOUND"}`))
+	}
+	p := ps.provider(t, oneTenant("t1", "c", "s"))
+	if _, err := p.GetBoleto(context.Background(), "t1", "nope"); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("404 should map to ErrNotFound, got %v", err)
+	}
+}
+
+func TestGetBoletoMissingCredential(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	p := ps.provider(t, &fakeCreds{creds: map[string]ports.BankCredential{}})
+	if _, err := p.GetBoleto(context.Background(), "unknown", "b"); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("missing credential should propagate ErrNotFound, got %v", err)
+	}
+	if ps.tokenCount() != 0 {
+		t.Fatalf("token must not be hit without a credential, hits=%d", ps.tokenCount())
+	}
+}
+
+// roteiro grupo 4: baixa/cancelamento via DELETE; bearer attached, status reconciled.
+func TestCancelBoletoSuccess(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
+
+	res, err := p.CancelBoleto(context.Background(), "t1", "bol_1")
+	if err != nil {
+		t.Fatalf("CancelBoleto: %v", err)
+	}
+	if res.Status != "CANCELLED" {
+		t.Fatalf("status = %q, want CANCELLED", res.Status)
+	}
+	if ps.lastAuthHeader != "Bearer tok-client-1" {
+		t.Fatalf("bearer not attached: %q", ps.lastAuthHeader)
+	}
+}
+
+func TestCancelBoletoNotFoundMapping(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	ps.boletoCancel = func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"code":"NOT_FOUND"}`))
+	}
+	p := ps.provider(t, oneTenant("t1", "c", "s"))
+	if _, err := p.CancelBoleto(context.Background(), "t1", "nope"); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("404 should map to ErrNotFound, got %v", err)
+	}
+}
+
+// roteiro grupo 5: alteração via PUT carries the new params; bearer + idempotency.
+func TestUpdateBoletoSuccess(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
+
+	res, err := p.UpdateBoleto(context.Background(), "t1", "bol_1", ports.BoletoRequest{
+		TenantID: "t1", BoletoID: "bol_1", AmountCents: 2000, Currency: "BRL",
+		FineBps: 150, MonthlyInterestBps: 80, IdempotencyKey: "upd-key",
+	})
+	if err != nil {
+		t.Fatalf("UpdateBoleto: %v", err)
+	}
+	if res.AmountCents != 2000 || res.FineBps != 150 {
+		t.Fatalf("amended params not reconciled: %+v", res)
+	}
+	var sent struct {
+		Amount  int64 `json:"amount"`
+		FineBps int64 `json:"fine_bps"`
+	}
+	if err := json.Unmarshal(ps.body(), &sent); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if sent.Amount != 2000 || sent.FineBps != 150 {
+		t.Fatalf("update body not transported: %s", ps.body())
+	}
+	if ps.idemKey() != "upd-key" {
+		t.Fatalf("idempotency key not forwarded: %q", ps.idemKey())
+	}
+}
+
+func TestUpdateBoletoNotFoundMapping(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	ps.boletoUpdate = func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"code":"NOT_FOUND"}`))
+	}
+	p := ps.provider(t, oneTenant("t1", "c", "s"))
+	if _, err := p.UpdateBoleto(context.Background(), "t1", "nope", ports.BoletoRequest{
+		TenantID: "t1", BoletoID: "nope", AmountCents: 1, Currency: "BRL", IdempotencyKey: "k",
+	}); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("404 should map to ErrNotFound, got %v", err)
+	}
+}

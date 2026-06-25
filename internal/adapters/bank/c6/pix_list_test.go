@@ -78,7 +78,7 @@ func TestCreateImmediateChargeNoDevedor(t *testing.T) {
 }
 
 // pixListTestServer is a C6 + OAuth2 double exposing the cob-list endpoint
-// (GET /v1/pix with inicio/fim) so the list path can be exercised distinctly from
+// (GET /v2/pix/cob with inicio/fim) so the list path can be exercised distinctly from
 // the per-txid PUT/GET.
 type pixListTestServer struct {
 	*httptest.Server
@@ -96,7 +96,7 @@ func newPixListTestServer(t *testing.T) *pixListTestServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
-	mux.HandleFunc("/v1/pix", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2/pix/cob", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		ts.lastQuery = r.URL.Query()
 		w.Header().Set("Content-Type", "application/json")

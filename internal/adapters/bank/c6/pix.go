@@ -38,6 +38,12 @@ const (
 	// characters from [a-zA-Z0-9]; a 32-char hex digest sits safely inside that
 	// range and uses only [0-9a-f].
 	pixTxIDLen = 32
+
+	// pixCobPath is the BACEN PIX v2 immediate-charge (cobrança imediata) collection
+	// path the C6 sandbox exposes (SIN-65856, live-verified): PUT/GET
+	// /v2/pix/cob/{txid} for a single charge and GET /v2/pix/cob?inicio=&fim= for the
+	// list. It replaced the placeholder /v1/pix that 404'd against the real PSP.
+	pixCobPath = "/v2/pix/cob"
 )
 
 // compile-time assertion that Provider satisfies the PIX port.
@@ -84,15 +90,26 @@ type pixChargeRequestBody struct {
 	Calendario pixCalendario `json:"calendario"`
 	Devedor    *pixDevedor   `json:"devedor,omitempty"`
 	Valor      pixValor      `json:"valor"`
+	// Chave is the recebedor's PIX key the cob is registered under. The real C6
+	// BACEN PIX v2 cob create requires it to route the funds and mint the QR
+	// (SIN-65856, live-verified). omitempty so a stub/test charge that omits the
+	// creditor key sends no chave field.
+	Chave string `json:"chave,omitempty"`
 }
 
 // buildDevedor maps the request's optional devedor fields into the PSP block, or
-// returns nil when no payer was supplied. The document is placed in cpf or cnpj by
-// length (14 ⇒ CNPJ, otherwise CPF): the use-case has already validated the id is
-// an 11- or 14-digit string before it reaches here, so no further check is needed.
+// returns nil when no payer was supplied (immediate charges may omit the payer).
 func buildDevedor(req ports.ChargeRequest) *pixDevedor {
-	taxID := strings.TrimSpace(req.DebtorTaxID)
-	name := strings.TrimSpace(req.DebtorName)
+	return buildDevedorFields(req.DebtorTaxID, req.DebtorName)
+}
+
+// buildDevedorFields maps a (taxID, name) pair into the PSP devedor block, or
+// returns nil when both are empty. The document is placed in cpf or cnpj by length
+// (14 ⇒ CNPJ, otherwise CPF): the use-case has already validated the id is an 11- or
+// 14-digit string before it reaches here, so no further check is needed.
+func buildDevedorFields(taxID, name string) *pixDevedor {
+	taxID = strings.TrimSpace(taxID)
+	name = strings.TrimSpace(name)
 	if taxID == "" && name == "" {
 		return nil
 	}
@@ -108,12 +125,16 @@ func buildDevedor(req ports.ChargeRequest) *pixDevedor {
 // pixChargeResponseBody is the subset of C6's PIX charge representation we
 // consume. Human-readable / unmodelled fields are ignored on purpose.
 type pixChargeResponseBody struct {
-	TxID          string        `json:"txid"`
-	Status        string        `json:"status"`
-	Calendario    pixCalendario `json:"calendario"`
-	Valor         pixValor      `json:"valor"`
-	Loc           pixLoc        `json:"loc"`
-	PixCopiaECola string        `json:"pixCopiaECola"`
+	TxID       string        `json:"txid"`
+	Status     string        `json:"status"`
+	Calendario pixCalendario `json:"calendario"`
+	Valor      pixValor      `json:"valor"`
+	// Loc is the BACEN loc object; Location is the top-level location string the real
+	// C6 sandbox returns (SIN-65856, live-verified). C6 populates the top-level
+	// "location"; toPixResult prefers it and falls back to loc.location.
+	Loc           pixLoc `json:"loc"`
+	Location      string `json:"location"`
+	PixCopiaECola string `json:"pixCopiaECola"`
 	// Pix is the list of received transactions, present once the charge has been
 	// paid (CONCLUIDA). Reconciliation sums each receipt's valor to learn how much
 	// was actually received versus valor.original.
@@ -121,7 +142,7 @@ type pixChargeResponseBody struct {
 }
 
 // CreateImmediateCharge creates an immediate PIX charge at C6 via an idempotent
-// PUT on /v1/pix/{txid}. The txid is derived deterministically from the request's
+// PUT on /v2/pix/cob/{txid}. The txid is derived deterministically from the request's
 // idempotency anchor (IdempotencyKey, falling back to PaymentID), so a re-submit
 // targets the very same resource and the PSP returns the existing charge rather
 // than creating a duplicate. The caller's idempotency key is additionally
@@ -153,16 +174,22 @@ func (p *Provider) CreateImmediateCharge(ctx context.Context, tenantID string, r
 	}
 	txid := pixTxID(req)
 
+	chave, err := p.resolveCreditorKey(ctx, tenantID, req.CreditorKey)
+	if err != nil {
+		return ports.PixChargeResult{}, err
+	}
+
 	payload, err := json.Marshal(pixChargeRequestBody{
 		Calendario: pixCalendario{Expiracao: int64(expiresIn / time.Second)},
 		Devedor:    buildDevedor(req),
 		Valor:      pixValor{Original: formatAmount(req.AmountCents)},
+		Chave:      chave,
 	})
 	if err != nil {
 		return ports.PixChargeResult{}, &Error{Op: "create_pix", sentinel: shared.ErrValidation}
 	}
 
-	endpoint := p.baseURL + "/v1/pix/" + url.PathEscape(txid)
+	endpoint := p.baseURL + pixCobPath + "/" + url.PathEscape(txid)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return ports.PixChargeResult{}, transportError("create_pix")
@@ -191,7 +218,7 @@ func (p *Provider) GetImmediateCharge(ctx context.Context, tenantID, txID string
 		return ports.PixChargeResult{}, err
 	}
 
-	endpoint := p.baseURL + "/v1/pix/" + url.PathEscape(txID)
+	endpoint := p.baseURL + pixCobPath + "/" + url.PathEscape(txID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return ports.PixChargeResult{}, transportError("get_pix")
@@ -206,7 +233,7 @@ func (p *Provider) GetImmediateCharge(ctx context.Context, tenantID, txID string
 	return p.toPixResult(out, "get_pix")
 }
 
-// pixListResponseBody is the subset of C6's immediate-charge list (GET /v1/pix,
+// pixListResponseBody is the subset of C6's immediate-charge list (GET /v2/pix/cob,
 // the BACEN /cob list) we consume: the pagination block and the cobs array. Each
 // cob reuses the single-charge wire shape so toPixResult maps it identically.
 type pixListResponseBody struct {
@@ -222,7 +249,7 @@ type pixListResponseBody struct {
 }
 
 // ListImmediateCharges lists the immediate PIX charges created within [Start,End]
-// via GET /v1/pix?inicio=…&fim=… (BACEN cob list, roteiro 7.4). The window bounds
+// via GET /v2/pix/cob?inicio=…&fim=… (BACEN cob list, roteiro 7.4). The window bounds
 // are mandatory and rendered as RFC3339 UTC instants; pagination is forwarded only
 // when supplied. Like the single-charge reads this is fail-secure on the money: a
 // malformed amount in any cob maps to ErrUnavailable rather than reconciling to
@@ -246,7 +273,7 @@ func (p *Provider) ListImmediateCharges(ctx context.Context, tenantID string, fi
 		q.Set("paginacao.itensPorPagina", strconv.Itoa(filter.PageSize))
 	}
 
-	endpoint := p.baseURL + "/v1/pix?" + q.Encode()
+	endpoint := p.baseURL + pixCobPath + "?" + q.Encode()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return ports.PixChargeList{}, transportError("list_pix")
@@ -276,6 +303,16 @@ func (p *Provider) ListImmediateCharges(ctx context.Context, tenantID string, fi
 	}, nil
 }
 
+// pixLocation returns the QR render location, preferring the top-level "location"
+// the real C6 sandbox populates (SIN-65856, live-verified) and falling back to the
+// BACEN loc.location object when the top-level field is absent.
+func pixLocation(b pixChargeResponseBody) string {
+	if b.Location != "" {
+		return b.Location
+	}
+	return b.Loc.Location
+}
+
 // toPixResult maps the PSP wire shape into the port result, computing the QR
 // expiry from the charge calendar and reconciling the money: valor.original is
 // the expected amount and the sum of the pix[] receipts is what was received.
@@ -303,7 +340,7 @@ func (p *Provider) toPixResult(b pixChargeResponseBody, op string) (ports.PixCha
 		TxID:                b.TxID,
 		Status:              b.Status,
 		QRCodePayload:       b.PixCopiaECola,
-		QRCodeLocation:      b.Loc.Location,
+		QRCodeLocation:      pixLocation(b),
 		ExpiresAt:           p.pixExpiresAt(b.Calendario),
 		ExpectedAmountCents: expected,
 		ReceivedAmountCents: received,

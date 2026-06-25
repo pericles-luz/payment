@@ -3,6 +3,7 @@ package c6
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 )
@@ -99,16 +100,24 @@ func sentinelForStatus(status int) error {
 }
 
 // errorEnvelope is the minimal, safe slice of a C6/OAuth2 error response. Only the
-// short machine code fields are read; the human message/description is ignored on
-// purpose so it cannot leak into an error or log.
+// short machine code fields are read; the human message/description (title/detail)
+// is ignored on purpose so it cannot leak into an error or log.
+//
+// Type is the RFC7807 problem+json "type" URN both real C6 surfaces return
+// (SIN-65856): BACEN PIX echoes ".../api/v2/error/RequisicaoInvalida" and the
+// C6-proprietary surfaces echo ".../v1/error/invalid_request". Only its final path
+// segment (a stable token) is surfaced as the code.
 type errorEnvelope struct {
 	Error string `json:"error"` // OAuth2 style: "invalid_client", "invalid_scope"
-	Code  string `json:"code"`  // C6 REST style machine code
+	Code  string `json:"code"`  // legacy C6 REST style machine code
+	Type  string `json:"type"`  // RFC7807 problem+json type URN
 }
 
-// parseErrorCode extracts the PSP's short machine error code, preferring the C6
-// "code" field and falling back to the OAuth2 "error" field. It returns "" when
-// the body is absent or not the expected shape — never an error, never the body.
+// parseErrorCode extracts the PSP's short machine error code, preferring an
+// explicit "code", then the OAuth2 "error", then the final path segment of the
+// RFC7807 "type" URN. A problem+json's title/detail are never read, so they cannot
+// leak into an error or log. Returns "" when the body is absent or not the expected
+// shape — never an error, never the body.
 func parseErrorCode(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -117,8 +126,26 @@ func parseErrorCode(body []byte) string {
 	if err := json.Unmarshal(body, &env); err != nil {
 		return ""
 	}
-	if env.Code != "" {
+	switch {
+	case env.Code != "":
 		return env.Code
+	case env.Error != "":
+		return env.Error
+	default:
+		return problemTypeCode(env.Type)
 	}
-	return env.Error
+}
+
+// problemTypeCode returns the final path segment of an RFC7807 "type" URN — a
+// stable, non-sensitive machine token (e.g. "RequisicaoInvalida", "invalid_request")
+// — or "" when the URN is empty or ends in a slash. Any query/fragment is trimmed
+// so only the bare token is surfaced.
+func problemTypeCode(typ string) string {
+	if typ == "" {
+		return ""
+	}
+	if i := strings.IndexAny(typ, "?#"); i >= 0 {
+		typ = typ[:i]
+	}
+	return typ[strings.LastIndexByte(typ, '/')+1:]
 }

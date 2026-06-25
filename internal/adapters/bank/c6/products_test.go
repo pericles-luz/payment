@@ -35,7 +35,14 @@ type productServer struct {
 	consentGet    http.HandlerFunc
 	consentCancel http.HandlerFunc
 	boletoCreate  http.HandlerFunc
+	boletoGet     http.HandlerFunc
+	boletoCancel  http.HandlerFunc
+	boletoUpdate  http.HandlerFunc
 	checkout      http.HandlerFunc
+	// cobvPut backs both create and amend (both PUT /v2/pix/cobv/{txid}); cobvGet
+	// backs the reconcile read (roteiro 7.5–7.7).
+	cobvPut http.HandlerFunc
+	cobvGet http.HandlerFunc
 }
 
 func newProductServer(t *testing.T) *productServer {
@@ -86,7 +93,7 @@ func newProductServer(t *testing.T) *productServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"consent_id":"con_1","status":"CANCELLED"}`))
 	})
-	mux.HandleFunc("POST /boletos", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/bank_slips", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		if ps.boletoCreate != nil {
 			ps.boletoCreate(w, r)
@@ -94,6 +101,33 @@ func newProductServer(t *testing.T) *productServer {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"REGISTERED","qr_code":"pix-emv","barcode":"123","amount_cents":1000}`))
+	})
+	mux.HandleFunc("GET /boletos/{id}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		if ps.boletoGet != nil {
+			ps.boletoGet(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"REGISTERED","qr_code":"pix-emv","barcode":"123","amount_cents":1000,"fine_bps":200,"monthly_interest_bps":100,"discounts":[{"days_before_due":0,"bps":500}]}`))
+	})
+	mux.HandleFunc("DELETE /boletos/{id}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		if ps.boletoCancel != nil {
+			ps.boletoCancel(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"CANCELLED","qr_code":"pix-emv","barcode":"123","amount_cents":1000}`))
+	})
+	mux.HandleFunc("PUT /boletos/{id}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		if ps.boletoUpdate != nil {
+			ps.boletoUpdate(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"REGISTERED","qr_code":"pix-emv","barcode":"123","amount_cents":2000,"fine_bps":150,"monthly_interest_bps":80}`))
 	})
 	mux.HandleFunc("POST /checkout/sessions", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
@@ -103,6 +137,28 @@ func newProductServer(t *testing.T) *productServer {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"session_id":"sess_1","status":"OPEN","redirect_url":"https://pay.c6/sess_1","amount_cents":1500}`))
+	})
+
+	// Real BACEN cobv wire (SIN-65860): calendario.dataDeVencimento/validadeApos-
+	// Vencimento, valor.original + multa/juros/desconto rate blocks, pixCopiaECola +
+	// top-level location, and a pix[] receipt list on the paid read.
+	mux.HandleFunc("PUT /v2/pix/cobv/{txid}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		if ps.cobvPut != nil {
+			ps.cobvPut(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"txid":"` + r.PathValue("txid") + `","status":"ATIVA","pixCopiaECola":"pix-cobv-emv","location":"https://pix.c6/cobv","calendario":{"dataDeVencimento":"2030-03-17","validadeAposVencimento":5},"valor":{"original":"10.00","multa":{"modalidade":2,"valorPerc":"2.00"},"juros":{"modalidade":3,"valorPerc":"1.00"},"desconto":{"modalidade":5,"valorPerc":"5.00"}}}`))
+	})
+	mux.HandleFunc("GET /v2/pix/cobv/{txid}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		if ps.cobvGet != nil {
+			ps.cobvGet(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"txid":"` + r.PathValue("txid") + `","status":"CONCLUIDA","pixCopiaECola":"pix-cobv-emv","location":"https://pix.c6/cobv","calendario":{"dataDeVencimento":"2030-03-17","validadeAposVencimento":5},"valor":{"original":"10.00","multa":{"modalidade":2,"valorPerc":"2.00"},"juros":{"modalidade":3,"valorPerc":"1.00"}},"pix":[{"valor":"10.00"}]}`))
 	})
 
 	ps.Server = httptest.NewTLSServer(mux)
@@ -301,7 +357,7 @@ func TestCreateBoletoSuccess(t *testing.T) {
 	res, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "bol_1", AmountCents: 1000, Currency: "BRL",
 		DueDate: time.Unix(1_800_000_000, 0), FineBps: 200, MonthlyInterestBps: 100,
-		PayerTaxID: "12345678901",
+		Payer: fullBoletoPayer(),
 	})
 	if err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
@@ -337,6 +393,7 @@ func TestCreateBoletoErrorMapping(t *testing.T) {
 	p := ps.provider(t, oneTenant("t1", "c", "s"))
 	if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "b", AmountCents: 1, Currency: "BRL", DueDate: time.Unix(1, 0),
+		Payer: fullBoletoPayer(),
 	}); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("400 should map to ErrValidation, got %v", err)
 	}
@@ -348,6 +405,7 @@ func TestBoletoMissingCredential(t *testing.T) {
 	p := ps.provider(t, &fakeCreds{creds: map[string]ports.BankCredential{}})
 	if _, err := p.CreateBoleto(context.Background(), "unknown", ports.BoletoRequest{
 		TenantID: "unknown", BoletoID: "b", AmountCents: 1, Currency: "BRL", DueDate: time.Unix(1, 0),
+		Payer: fullBoletoPayer(),
 	}); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("missing credential should propagate ErrNotFound, got %v", err)
 	}
@@ -490,6 +548,7 @@ func TestProductSecretNeverLeaks(t *testing.T) {
 	}
 	_, err = p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "b", AmountCents: 1, Currency: "BRL", DueDate: time.Unix(1, 0),
+		Payer: fullBoletoPayer(),
 	})
 	if err == nil {
 		t.Fatal("expected error")

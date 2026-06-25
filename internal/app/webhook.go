@@ -26,30 +26,33 @@ const systemOperatorWebhook = "system:c6-webhook"
 // service is idempotent (anti-replay) and reconciles the authoritative state
 // with the bank before settling any payment (threats W2/W3).
 type WebhookService struct {
-	bank  ports.BankProvider
-	bus   ports.MessageBus
-	clock ports.Clock
-	uow   ports.UnitOfWork
-	audit ports.AuditLog
-	ids   ports.IDProvider
+	bank     ports.BankProvider
+	checkout ports.CheckoutReconciler
+	bus      ports.MessageBus
+	clock    ports.Clock
+	uow      ports.UnitOfWork
+	audit    ports.AuditLog
+	ids      ports.IDProvider
 }
 
 // NewWebhookService wires a WebhookService from the provided ports. A nil
 // Deps.Audit degrades to a no-op log (foundation default), mirroring
 // AdminService; production MUST wire a real append-only audit log so refused
-// settlements are recorded for forensics/compliance.
+// settlements are recorded for forensics/compliance. A nil Deps.Checkout simply
+// leaves the checkout-webhook path unconfigured (HandleCheckoutEvent then refuses).
 func NewWebhookService(d Deps) *WebhookService {
 	a := d.Audit
 	if a == nil {
 		a = noopAudit{}
 	}
 	return &WebhookService{
-		bank:  d.Bank,
-		bus:   d.Bus,
-		clock: d.Clock,
-		uow:   resolveUoW(d),
-		audit: a,
-		ids:   d.IDs,
+		bank:     d.Bank,
+		checkout: d.Checkout,
+		bus:      d.Bus,
+		clock:    d.Clock,
+		uow:      resolveUoW(d),
+		audit:    a,
+		ids:      d.IDs,
 	}
 }
 
@@ -61,9 +64,54 @@ type PaymentEvent struct {
 	EventKey string
 }
 
-// HandlePaymentEvent reconciles and settles a payment. Duplicate deliveries are
-// acked without side effects. The webhook payload is never trusted as financial
-// truth — settlement requires a positive reconciliation with the bank.
+// reconcileFunc reconciles the authoritative state of the resource named by a webhook
+// event (a charge, or a checkout session) into the generic charge result the
+// settlement core consumes. It is the single seam that differs between the PIX/charge
+// and checkout webhook paths; everything else (dedup, reconcile-before-settle, money
+// reconciliation, audit) is shared.
+type reconcileFunc func(ctx context.Context, tenantID, txID string) (ports.ChargeResult, error)
+
+// HandlePaymentEvent reconciles and settles a PIX/charge payment from a bank webhook
+// (the authoritative state is read via GetCharge). It is a thin wrapper over settle.
+func (s *WebhookService) HandlePaymentEvent(ctx context.Context, ev PaymentEvent) error {
+	return s.settle(ctx, ev, s.bank.GetCharge)
+}
+
+// HandleCheckoutEvent reconciles and settles a checkout-session payment from a bank
+// webhook (roteiro 12). It reuses settle's exact dedup + reconcile-before-settle unit
+// of work, differing only in the reconcile source: the checkout session's
+// authoritative state (GetCheckoutSession) rather than GetCharge. The payment is
+// located by its tx id — the session id stored at session creation. A nil checkout
+// port (the webhook path was not wired) fails closed rather than silently dropping the
+// notification.
+func (s *WebhookService) HandleCheckoutEvent(ctx context.Context, ev PaymentEvent) error {
+	if s.checkout == nil {
+		return fmt.Errorf("checkout webhook not configured: %w", shared.ErrUnavailable)
+	}
+	return s.settle(ctx, ev, s.reconcileCheckout)
+}
+
+// reconcileCheckout reads the authoritative checkout-session state and maps it onto the
+// generic charge result the settlement core understands: the session's authorized
+// total is the expected amount and the PSP-reported capture is the received amount, so
+// the shared money reconciliation (AmountReconciled) refuses to settle a partial/over
+// capture exactly as it does for a charge.
+func (s *WebhookService) reconcileCheckout(ctx context.Context, tenantID, sessionID string) (ports.ChargeResult, error) {
+	res, err := s.checkout.GetCheckoutSession(ctx, tenantID, sessionID)
+	if err != nil {
+		return ports.ChargeResult{}, err
+	}
+	return ports.ChargeResult{
+		TxID:                res.SessionID,
+		Status:              res.Status,
+		ExpectedAmountCents: res.AmountCents,
+		ReceivedAmountCents: res.ReceivedAmountCents,
+	}, nil
+}
+
+// settle reconciles and settles a payment. Duplicate deliveries are acked without side
+// effects. The webhook payload is never trusted as financial truth — settlement
+// requires a positive reconciliation (via reconcile) with the bank.
 //
 // F2 (SIN-64719): marking the event processed (anti-replay) and settling the
 // payment happen in ONE transaction. The previous code committed MarkProcessed
@@ -73,7 +121,7 @@ type PaymentEvent struct {
 // transient failure rolls the whole unit of work back, including the mark, so the
 // redelivery re-attempts and eventually settles. The mark is durable only once
 // the terminal outcome (settled, or authoritatively not-yet-payable) is durable.
-func (s *WebhookService) HandlePaymentEvent(ctx context.Context, ev PaymentEvent) error {
+func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile reconcileFunc) error {
 	if strings.TrimSpace(ev.TenantID) == "" {
 		return shared.NewValidationError("tenant_id", "tenant id is required")
 	}
@@ -100,7 +148,7 @@ func (s *WebhookService) HandlePaymentEvent(ctx context.Context, ev PaymentEvent
 		// Reconcile authoritative state with the bank (never trust the raw
 		// webhook). A transient error here rolls back the mark so the bank's
 		// redelivery is reprocessed rather than swallowed.
-		res, err := s.bank.GetCharge(ctx, ev.TenantID, ev.TxID)
+		res, err := reconcile(ctx, ev.TenantID, ev.TxID)
 		if err != nil {
 			return fmt.Errorf("reconcile charge: %w", err)
 		}

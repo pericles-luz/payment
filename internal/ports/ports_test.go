@@ -116,3 +116,34 @@ func TestPixChargeResultAmountReconciled(t *testing.T) {
 		})
 	}
 }
+
+func TestPixDueChargeResultAmountReconciled(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		expected int64
+		received int64
+		want     bool
+	}{
+		{"exact match settles", 1050, 1050, true},
+		{"partial payment does not reconcile", 1050, 500, false},
+		{"overpayment does not reconcile", 1050, 1100, false},
+		{"unpaid charge does not reconcile", 1050, 0, false},
+		{"degenerate zero-expected never reconciles", 0, 0, false},
+		{"zero-expected with receipt never reconciles", 0, 100, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := ports.PixDueChargeResult{
+				Status:              "CONCLUIDA",
+				ExpectedAmountCents: tc.expected,
+				ReceivedAmountCents: tc.received,
+			}
+			if got := r.AmountReconciled(); got != tc.want {
+				t.Fatalf("AmountReconciled(expected=%d, received=%d): want %v, got %v",
+					tc.expected, tc.received, tc.want, got)
+			}
+		})
+	}
+}

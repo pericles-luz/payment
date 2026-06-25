@@ -77,21 +77,26 @@ func newTestServer(t *testing.T) *testServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
-	mux.HandleFunc("/charges/", func(w http.ResponseWriter, r *http.Request) {
+	// The generic charge surface now maps to the BACEN PIX v2 cob endpoints
+	// (SIN-65856): PUT /v2/pix/cob/{txid} creates and GET /v2/pix/cob/{txid} reads,
+	// distinguished by method on the same path. Responses are the cob wire shape
+	// (txid/status/valor/...).
+	mux.HandleFunc("/v2/pix/cob/", func(w http.ResponseWriter, r *http.Request) {
 		ts.mu.Lock()
-		ts.getHits++
-		ts.lastAuthHeader = r.Header.Get("Authorization")
-		h := ts.getHandler
-		ts.mu.Unlock()
-		if h != nil {
-			h(w, r)
+		if r.Method == http.MethodGet {
+			ts.getHits++
+			ts.lastAuthHeader = r.Header.Get("Authorization")
+			h := ts.getHandler
+			ts.mu.Unlock()
+			if h != nil {
+				h(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"txid":"tx_123","status":"paid"}`))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"txid":"tx_123","status":"paid"}`))
-	})
-	mux.HandleFunc("/charges", func(w http.ResponseWriter, r *http.Request) {
-		ts.mu.Lock()
+		// PUT — idempotent cob create.
 		ts.createHits++
 		ts.lastAuthHeader = r.Header.Get("Authorization")
 		ts.lastIdemKey = r.Header.Get("Idempotency-Key")
@@ -456,9 +461,9 @@ func TestCreateChargeDoesNotFollowRedirect(t *testing.T) {
 	t.Parallel()
 	ts := newTestServer(t)
 	ts.createHandler = func(w http.ResponseWriter, _ *http.Request) {
-		// Were this followed, the client would land on the /charges/ GET handler,
+		// Were this followed, the client would land on the /v2/pix/cob/ GET handler,
 		// which returns a valid 200 body — turning the call into a false success.
-		w.Header().Set("Location", "/charges/should-not-be-followed")
+		w.Header().Set("Location", "/v2/pix/cob/should-not-be-followed")
 		w.WriteHeader(http.StatusFound) // 302
 	}
 

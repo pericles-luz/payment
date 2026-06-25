@@ -1,0 +1,166 @@
+name: CD staging
+
+# Durable CD for the payment receptor (SIN-65900, CEO Opção A on SIN-65858).
+#
+# Mirrors the go-mei-das binary-rsync deploy (build → ship → systemd restart →
+# /healthz smoke); it deliberately does NOT copy the crm docker/cosign/SBOM
+# pipeline — payment has no Dockerfile, it is a single Go binary (cmd/api).
+#
+# Trigger: chained on the `CI` workflow succeeding on `main` (workflow_run), plus
+# workflow_dispatch for manual/forced deploys. The deploy job is OWNER-GATED:
+# it runs only on the upstream `pericles-luz/payment` repo, so the fork
+# (`ia-dev-sindireceita/payment`) is a no-op and never drifts (same rationale as
+# crm SIN-63281).
+#
+# Secrets (the CTO wires these on the UPSTREAM repo; the fork has none, so the
+# guarded job is skipped there):
+#   PAYMENT_STG_SSH_KEY    — private deploy key, constrained on the VPS to the
+#                            payment-deploy.sh wrapper via authorized_keys command=.
+#   PAYMENT_STG_HOST       — VPS host (143.198.66.140).
+#   PAYMENT_STG_USER       — non-root deploy user (`payment`).
+#   PAYMENT_STG_HOST_KEY   — pinned known_hosts line (NO TOFU; ssh-keyscan output).
+#   PAYMENT_STG_SMOKE_URL  — base URL the smoke probe hits (…/healthz appended).
+#
+# Reversibility: on smoke failure the job goes red and the PREVIOUS binary keeps
+# running (systemd restarts the freshly-installed one; if it is unhealthy the
+# operator rolls back per docs/deploy/staging.md). Auto-rollback is deferred
+# (ADR-0006).
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: the workflow only needs to read the repo to build.
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize deploys; never cancel a deploy mid-flight (a half-applied restart
+  # is worse than waiting).
+  group: cd-stg-payment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: build, ship, restart, smoke
+    runs-on: ubuntu-latest
+    # Owner gate: upstream-only. On workflow_run we additionally require the
+    # upstream CI run to have CONCLUDED SUCCESSFULLY (a failed/cancelled CI must
+    # not ship). workflow_dispatch has no workflow_run context, so the
+    # conclusion check is skipped for manual deploys (the operator opted in).
+    if: >-
+      github.repository_owner == 'pericles-luz' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
+    environment:
+      name: staging
+      url: https://payment.lmhost.com.br/healthz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_run, check out the exact commit CI validated (not the
+          # branch tip, which may have advanced) so the stamped SHA matches what
+          # was tested. On workflow_dispatch this input is empty → default ref.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Build cmd/api with stamped provenance
+        # Stamp version/commit/build-time into internal/version via -ldflags -X so
+        # the running binary reports the deployed SHA on /healthz (smoke asserts
+        # it). Backward compatible: a plain build still works and /healthz falls
+        # back to runtime/debug.ReadBuildInfo().
+        run: |
+          set -euo pipefail
+          VERSION="$(git describe --tags --always)"
+          COMMIT="$(git rev-parse HEAD)"
+          BUILD_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PKG="github.com/ia-dev-sindireceita/payment/internal/version"
+          CGO_ENABLED=0 go build -v -trimpath \
+            -ldflags "-s -w -X ${PKG}.Version=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.BuildAt=${BUILD_AT}" \
+            -o build/payment-api ./cmd/api
+          echo "DEPLOY_COMMIT=$COMMIT" >> "$GITHUB_ENV"
+
+      - name: Log binary fingerprint
+        run: |
+          set -euo pipefail
+          SHA=$(sha256sum build/payment-api | cut -d' ' -f1)
+          SIZE=$(stat -c%s build/payment-api)
+          {
+            echo "### payment-api — deploy fingerprint"
+            echo
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| commit | \`${DEPLOY_COMMIT}\` |"
+            echo "| sha256 | \`$SHA\` |"
+            echo "| size | $SIZE bytes |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install deploy SSH key (pinned known_hosts, no TOFU)
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.PAYMENT_STG_SSH_KEY }}
+          known_hosts: ${{ secrets.PAYMENT_STG_HOST_KEY }}
+          if_key_exists: fail
+
+      - name: Ship binary to staging path
+        # set +x so the host/user never leak into logs. The key is constrained on
+        # the VPS to the deploy wrapper (authorized_keys command=), but scp is the
+        # transport the wrapper's own rsync/install consumes: we upload to a fixed
+        # staging path, then invoke the locked `deploy` verb which atomically
+        # installs + restarts. StrictHostKeyChecking=yes enforces the pin.
+        env:
+          STG_HOST: ${{ secrets.PAYMENT_STG_HOST }}
+          STG_USER: ${{ secrets.PAYMENT_STG_USER }}
+        run: |
+          set -euo pipefail
+          { set +x; } 2>/dev/null
+          scp -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            build/payment-api "${STG_USER}@${STG_HOST}:/opt/payment/incoming/payment-api"
+
+      - name: Invoke locked deploy verb (atomic install + systemd restart)
+        env:
+          STG_HOST: ${{ secrets.PAYMENT_STG_HOST }}
+          STG_USER: ${{ secrets.PAYMENT_STG_USER }}
+        run: |
+          set -euo pipefail
+          { set +x; } 2>/dev/null
+          # authorized_keys pins command=…/payment-deploy.sh, so SSH_ORIGINAL_COMMAND
+          # is what the wrapper validates. It accepts ONLY `deploy` — anything else
+          # is rejected non-zero. No arbitrary shell is reachable over this key.
+          ssh -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "${STG_USER}@${STG_HOST}" deploy
+
+      - name: Smoke /healthz (HTTP 200 + deployed SHA, short retry budget)
+        env:
+          SMOKE_URL: ${{ secrets.PAYMENT_STG_SMOKE_URL }}
+        run: |
+          set -euo pipefail
+          { set +x; } 2>/dev/null
+          url="${SMOKE_URL%/}/healthz"
+          ok=0
+          for i in $(seq 1 10); do
+            body="$(curl -fsS --max-time 10 "$url" 2>/dev/null || true)"
+            if [ -n "$body" ]; then
+              echo "healthz attempt ${i}: ${body}"
+              # Assert HTTP 200 already (curl -f) AND the deployed commit is live.
+              # If the body does not yet carry the SHA (older binary still up mid
+              # restart), keep retrying within the budget.
+              if printf '%s' "$body" | grep -q "${DEPLOY_COMMIT}"; then
+                echo "deployed commit ${DEPLOY_COMMIT} is live"
+                ok=1
+                break
+              fi
+            fi
+            sleep 3
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::/healthz did not report deployed commit ${DEPLOY_COMMIT} within the retry budget — previous binary may still be running; roll back per docs/deploy/staging.md"
+            exit 1
+          fi

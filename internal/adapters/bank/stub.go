@@ -23,11 +23,29 @@ type StubProvider struct {
 	now func() time.Time
 
 	mu         sync.Mutex
-	charges    map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+txID
-	byIdem     map[string]ports.ChargeResult  // keyed by tenantID+"\x00"+idempotencyKey
-	consents   map[string]ports.ConsentResult // keyed by tenantID+"\x00"+consentID (C6-C)
-	pixCharges map[string]stubPixCharge       // keyed by tenantID+"\x00"+txID (PIX cobrança imediata)
-	pixByIdem  map[string]string              // keyed by tenantID+"\x00"+idempotencyKey -> txID
+	charges    map[string]ports.ChargeResult   // keyed by tenantID+"\x00"+txID
+	byIdem     map[string]ports.ChargeResult   // keyed by tenantID+"\x00"+idempotencyKey
+	consents   map[string]ports.ConsentResult  // keyed by tenantID+"\x00"+consentID (C6-C)
+	pixCharges map[string]stubPixCharge        // keyed by tenantID+"\x00"+txID (PIX cobrança imediata)
+	pixByIdem  map[string]string               // keyed by tenantID+"\x00"+idempotencyKey -> txID
+	boletos    map[string]ports.BoletoResult   // keyed by tenantID+"\x00"+boletoID (BolePix)
+	checkouts  map[string]ports.CheckoutResult // keyed by tenantID+"\x00"+sessionID (unified checkout)
+	// cobvCharges holds PIX cobrança-com-vencimento (cobv) charges keyed by
+	// tenantID+"\x00"+txID; cobvDueByIdem maps the idempotency anchor to its txID so a
+	// re-submit resolves to the same charge (roteiro 7.5–7.7).
+	cobvCharges   map[string]ports.PixDueChargeResult
+	cobvDueByIdem map[string]string // keyed by tenantID+"\x00"+anchor -> txID
+	// ddaBoletos holds the boletos open in a tenant's DDA (roteiro 8.1), keyed by
+	// tenantID. ddaGroups holds DDA payment groups keyed by tenantID+"\x00"+groupID;
+	// ddaGroupByIdem maps the idempotency anchor to its groupID so a re-submitted
+	// consult resolves to the same group (roteiro 8.2–8.6).
+	ddaBoletos     map[string][]ports.DDABoleto
+	ddaGroups      map[string]*stubDDAGroup
+	ddaGroupByIdem map[string]string // keyed by tenantID+"\x00"+anchor -> groupID
+	// stmtEntries holds the statement entries (extrato, roteiro 13.a) posted to a
+	// tenant's account, keyed by tenantID. GetStatement filters them by the requested
+	// date window.
+	stmtEntries map[string][]ports.StatementEntry
 }
 
 // stubPixCharge is the in-memory record for an immediate PIX charge: the port
@@ -41,13 +59,21 @@ type stubPixCharge struct {
 // credential isolation at charge time (the secret is never logged).
 func NewStubProvider(creds ports.CredentialStore) *StubProvider {
 	return &StubProvider{
-		creds:      creds,
-		now:        time.Now,
-		charges:    make(map[string]ports.ChargeResult),
-		byIdem:     make(map[string]ports.ChargeResult),
-		consents:   make(map[string]ports.ConsentResult),
-		pixCharges: make(map[string]stubPixCharge),
-		pixByIdem:  make(map[string]string),
+		creds:          creds,
+		now:            time.Now,
+		charges:        make(map[string]ports.ChargeResult),
+		byIdem:         make(map[string]ports.ChargeResult),
+		consents:       make(map[string]ports.ConsentResult),
+		pixCharges:     make(map[string]stubPixCharge),
+		pixByIdem:      make(map[string]string),
+		boletos:        make(map[string]ports.BoletoResult),
+		checkouts:      make(map[string]ports.CheckoutResult),
+		cobvCharges:    make(map[string]ports.PixDueChargeResult),
+		cobvDueByIdem:  make(map[string]string),
+		ddaBoletos:     make(map[string][]ports.DDABoleto),
+		ddaGroups:      make(map[string]*stubDDAGroup),
+		ddaGroupByIdem: make(map[string]string),
+		stmtEntries:    make(map[string][]ports.StatementEntry),
 	}
 }
 

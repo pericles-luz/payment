@@ -77,6 +77,17 @@ func run() error {
 	// segregated checkout port; the settlement wrapper does not, so derive it from
 	// pixProvider (the raw provider) rather than bankProvider.
 	checkoutProvider, _ := pixProvider.(ports.CheckoutProvider)
+	// The raw provider also satisfies the segregated boleto port (BolePix grupos 1–6).
+	boletoProvider, _ := pixProvider.(ports.BoletoProvider)
+	// The raw provider also satisfies the segregated cobv port (PIX cobrança com
+	// vencimento, roteiro 7.5–7.8), kept apart from the immediate Pix port (ISP).
+	cobvProvider, _ := pixProvider.(ports.PixDueChargeProvider)
+	// The raw provider also satisfies the segregated DDA port (agendamento de
+	// pagamentos, roteiro grupo 8), kept apart from the other bank ports (ISP).
+	ddaProvider, _ := pixProvider.(ports.DDAProvider)
+	// The raw provider also satisfies the segregated statement port (extrato, roteiro
+	// grupo 13), kept apart from the other bank ports (ISP).
+	statementProvider, _ := pixProvider.(ports.StatementProvider)
 
 	deps := app.Deps{
 		Payments:        store,
@@ -87,7 +98,11 @@ func run() error {
 		Bus:             inmemory.NewBus(),
 		Bank:            bankProvider,
 		Pix:             pixProvider,
+		PixDueCharge:    cobvProvider,
 		Checkout:        checkoutProvider,
+		Boleto:          boletoProvider,
+		DDA:             ddaProvider,
+		Statement:       statementProvider,
 		Credentials:     creds,
 		CredWriter:      creds,
 		CredInvalidator: credInvalidator,
@@ -144,7 +159,11 @@ func run() error {
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:       app.NewChargeService(deps),
 		Pix:           app.NewPixService(deps),
+		PixCobV:       app.NewPixDueChargeService(deps),
 		Checkout:      app.NewCheckoutService(deps),
+		Boleto:        app.NewBoletoService(deps),
+		DDA:           app.NewDDAService(deps),
+		Statement:     app.NewStatementService(deps),
 		Admin:         app.NewAdminService(deps),
 		Console:       console,
 		UI:            ui,
@@ -209,12 +228,26 @@ func newBankProvider(cfg config.Config, creds ports.CredentialStore) (ports.Bank
 		stub := bank.NewStubProvider(creds)
 		return stub, stub, nil
 	}
-	c6p, err := c6.New(c6.Config{
+	c6cfg := c6.Config{
 		BaseURL:  cfg.C6.BaseURL,
 		TokenURL: cfg.C6.TokenURL,
 		Scope:    cfg.C6.Scope,
 		Timeout:  cfg.C6.Timeout,
-	}, creds)
+	}
+	// C6 requires an mTLS client certificate on the connection. When a cert/key
+	// path is configured, build a client-cert transport and inject it; a load
+	// failure fails the boot closed (explicit error) rather than silently
+	// connecting without the cert. Both paths empty ⇒ no client cert (the default
+	// transport), preserving stub/dev behaviour.
+	if cfg.C6.ClientCertPath != "" || cfg.C6.ClientKeyPath != "" {
+		httpc, err := c6.MTLSHTTPClient(cfg.C6.ClientCertPath, cfg.C6.ClientKeyPath, cfg.C6.Timeout)
+		if err != nil {
+			return nil, nil, err
+		}
+		c6cfg.HTTPClient = httpc
+		log.Print("api: C6 mTLS client certificate loaded")
+	}
+	c6p, err := c6.New(c6cfg, creds)
 	if err != nil {
 		return nil, nil, err
 	}

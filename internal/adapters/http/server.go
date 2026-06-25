@@ -9,6 +9,7 @@ import (
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/adminweb"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
+	"github.com/ia-dev-sindireceita/payment/internal/version"
 )
 
 // Server holds the application services and authenticators behind the HTTP
@@ -17,7 +18,11 @@ import (
 type Server struct {
 	charges     *app.ChargeService
 	pix         *app.PixService
+	pixCobV     *app.PixDueChargeService
 	checkout    *app.CheckoutService
+	boleto      *app.BoletoService
+	dda         *app.DDAService
+	statement   *app.StatementService
 	admin       *app.AdminService
 	console     *app.ConsoleService
 	ui          *adminweb.Renderer
@@ -37,10 +42,26 @@ type Config struct {
 	// deployments/tests that do not serve the PIX surface — the routes are then
 	// registered but never exercised.
 	Pix *app.PixService
+	// PixCobV backs the PIX cobrança-com-vencimento tenant routes (/v1/pix/cobv). It
+	// may be nil for deployments/tests that do not serve the cobv surface — the routes
+	// are then registered but never exercised.
+	PixCobV *app.PixDueChargeService
 	// Checkout backs the unified hosted-checkout tenant route (POST /v1/checkout). It
 	// may be nil for deployments/tests that do not serve checkout — the route is then
 	// registered but never exercised.
-	Checkout    *app.CheckoutService
+	Checkout *app.CheckoutService
+	// Boleto backs the BolePix boleto tenant routes (/v1/boletos). It may be nil for
+	// deployments/tests that do not serve the boleto surface — the routes are then
+	// registered but never exercised.
+	Boleto *app.BoletoService
+	// DDA backs the DDA / agendamento-de-pagamentos tenant routes (/v1/dda, roteiro
+	// grupo 8). It may be nil for deployments/tests that do not serve the DDA surface —
+	// the routes are then registered but never exercised.
+	DDA *app.DDAService
+	// Statement backs the account-statement tenant route (GET /v1/statement, roteiro
+	// grupo 13). It may be nil for deployments/tests that do not serve the extrato
+	// surface — the route is then registered but never exercised.
+	Statement   *app.StatementService
 	Admin       *app.AdminService
 	Console     *app.ConsoleService
 	UI          *adminweb.Renderer
@@ -59,7 +80,11 @@ func NewServer(c Config) *Server {
 	return &Server{
 		charges:     c.Charges,
 		pix:         c.Pix,
+		pixCobV:     c.PixCobV,
 		checkout:    c.Checkout,
+		boleto:      c.Boleto,
+		dda:         c.DDA,
+		statement:   c.Statement,
 		admin:       c.Admin,
 		console:     c.Console,
 		ui:          c.UI,
@@ -96,8 +121,19 @@ func (s *Server) Router() http.Handler {
 	consoleLimiter := newRateLimiter(20, 10, nil)
 	webhookLimiter := newRateLimiter(50, 25, nil)
 
+	// Public health check (the only unauthenticated route). It also surfaces the
+	// build provenance (version/commit/built_at) so the CD smoke gate can assert
+	// the deployed SHA actually went live, not just that *some* binary answers.
+	// version.Info() carries no secrets — only the git SHA, tag, and build time —
+	// so it is safe on an unauthenticated endpoint.
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		b := version.Info()
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":   "ok",
+			"version":  b.Version,
+			"commit":   b.Commit,
+			"built_at": b.BuiltAt,
+		})
 	})
 
 	// Tenant API (TB1) — authenticated, tenant-scoped, rate-limited.
@@ -111,10 +147,46 @@ func (s *Server) Router() http.Handler {
 		// (?start&end) is registered before the {txid} read so chi routes them apart.
 		r.Post("/pix", s.handleCreatePix)
 		r.Get("/pix", s.handleListPix)
+		// PIX cobrança com vencimento (cobv, roteiro 7.5–7.8): criar (7.5), consultar
+		// (7.6), alterar (7.7). The static "/pix/cobv" segment is registered before the
+		// immediate-charge "/pix/{txid}" read so chi routes the literal "cobv" segment
+		// apart from a txid. Create generates the txid server-side (like immediate pix);
+		// get/update address it. Settlement notification (7.8) is reconciled through the
+		// shared C6 webhook (/webhooks/c6/{tenantRef}, C6-D), not a per-charge endpoint.
+		r.Post("/pix/cobv", s.handleCreatePixCobV)
+		r.Get("/pix/cobv/{txid}", s.handleGetPixCobV)
+		r.Put("/pix/cobv/{txid}", s.handleUpdatePixCobV)
 		r.Get("/pix/{txid}", s.handleGetPix)
-		// Unified hosted checkout — open a session (roteiro 9.a–9.c). Create only in
-		// F1; consultar/cancelar/webhook (grupos 10–12) are deferred to F3.
+		// Unified hosted checkout — open a session (roteiro 9.a–9.c), reconcile it
+		// (grupo 10, GET) and cancel it (grupo 11, DELETE). The status webhook (grupo
+		// 12) reuses the shared /webhooks/c6/{tenantRef} handler below.
 		r.Post("/checkout", s.handleCreateCheckout)
+		r.Get("/checkout/{id}", s.handleGetCheckout)
+		r.Delete("/checkout/{id}", s.handleCancelCheckout)
+		// BolePix boletos — full lifecycle: register with fine/interest/discount
+		// variants (grupos 1–3), read by id (6.a), baixa/cancelamento (DELETE, grupo
+		// 4) and alteração de vencimento/validade/valor (PUT, grupo 5).
+		r.Post("/boletos", s.handleCreateBoleto)
+		r.Get("/boletos/{id}", s.handleGetBoleto)
+		r.Delete("/boletos/{id}", s.handleDeleteBoleto)
+		r.Put("/boletos/{id}", s.handleUpdateBoleto)
+		// DDA / agendamento de pagamentos (roteiro grupo 8): list the boletos open in
+		// the tenant's DDA (8.1), submit a payment group for the initial consult (8.2),
+		// read its items (8.3), trim items as a list (8.4) or one at a time (8.5) and
+		// submit the group for approval (8.6). The {id}/{itemID} path params are
+		// tenant-scoped in the use-case (a group owned by another tenant is 404, never a
+		// cross-tenant existence oracle).
+		r.Get("/dda/boletos", s.handleListDDABoletos)
+		r.Post("/dda/payment-groups", s.handleCreateDDAGroup)
+		r.Get("/dda/payment-groups/{id}/items", s.handleGetDDAGroupItems)
+		r.Delete("/dda/payment-groups/{id}/items", s.handleRemoveDDAGroupItems)
+		r.Delete("/dda/payment-groups/{id}/items/{itemID}", s.handleRemoveDDAGroupItem)
+		r.Post("/dda/payment-groups/{id}/submit", s.handleSubmitDDAGroup)
+		// Account statement (extrato, roteiro grupo 13): read the entries posted to the
+		// authenticated tenant's account over a period (inicio/fim, máx. 30 dias, 13.a).
+		// The tenant is derived from the credential, never the query — no parameter
+		// selects which tenant's extrato is read (threat H1/P1).
+		r.Get("/statement", s.handleGetStatement)
 	})
 
 	// Admin plane (TB6) — admin auth, segregated from tenant plane. Every route

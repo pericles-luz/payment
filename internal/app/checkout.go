@@ -187,6 +187,32 @@ func (s *CheckoutService) CreateSession(ctx context.Context, in CreateCheckoutSe
 	return p, res, nil
 }
 
+// GetSession reconciles the authoritative state of a checkout session from the bank
+// for the authenticated tenant (roteiro 10). The tenant is always the authenticated
+// tenant (never client input); the bank read is tenant-scoped, so an id owned by
+// another tenant — like an unknown id — surfaces as not-found, never disclosing
+// cross-tenant existence.
+func (s *CheckoutService) GetSession(ctx context.Context, tenantID, sessionID string) (ports.CheckoutResult, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ports.CheckoutResult{}, shared.NewValidationError("session_id", "session id is required")
+	}
+	return s.checkout.GetCheckoutSession(ctx, tenantID, sessionID)
+}
+
+// CancelSession cancels a checkout session at the bank for the authenticated tenant
+// (roteiro 11). Cancelling is a write but idempotent: cancelling an already-cancelled
+// session returns the cancelled state without error. An id owned by another tenant or
+// an unknown id surfaces as not-found, so a cancel can never confirm a session's
+// existence across tenants.
+func (s *CheckoutService) CancelSession(ctx context.Context, tenantID, sessionID string) (ports.CheckoutResult, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ports.CheckoutResult{}, shared.NewValidationError("session_id", "session id is required")
+	}
+	return s.checkout.CancelCheckoutSession(ctx, tenantID, sessionID)
+}
+
 // resolveExpiry turns the input's absolute/relative expiry into an absolute instant
 // that must lie in the future. ExpiresAt wins when both are set; otherwise a positive
 // ExpiresInSeconds is applied to the clock. A missing/past expiry is a validation error.

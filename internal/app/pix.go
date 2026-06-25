@@ -221,17 +221,8 @@ type ListImmediateChargesInput struct {
 // window. The window is mandatory and bounded (end after start, range <=
 // maxPixListRange); pagination must be non-negative.
 func (s *PixService) ListImmediateCharges(ctx context.Context, in ListImmediateChargesInput) (ports.PixChargeList, error) {
-	if in.Start.IsZero() || in.End.IsZero() {
-		return ports.PixChargeList{}, shared.NewValidationError("start_end", "start and end are required")
-	}
-	if !in.End.After(in.Start) {
-		return ports.PixChargeList{}, shared.NewValidationError("end", "end must be after start")
-	}
-	if in.End.Sub(in.Start) > maxPixListRange {
-		return ports.PixChargeList{}, shared.NewValidationError("range", "date range too large")
-	}
-	if in.Page < 0 || in.PageSize < 0 {
-		return ports.PixChargeList{}, shared.NewValidationError("pagination", "page and page_size must not be negative")
+	if err := validatePixListWindow(in.Start, in.End, in.Page, in.PageSize); err != nil {
+		return ports.PixChargeList{}, err
 	}
 	return s.pix.ListImmediateCharges(ctx, in.TenantID, ports.PixListFilter{
 		Start:    in.Start,
@@ -270,6 +261,25 @@ func validTaxID(s string) bool {
 		}
 	}
 	return true
+}
+
+// validatePixListWindow enforces the listing constraints for the immediate PIX list
+// endpoint (roteiro 7.4): a mandatory, ordered, bounded date window and non-negative
+// pagination.
+func validatePixListWindow(start, end time.Time, page, pageSize int) error {
+	if start.IsZero() || end.IsZero() {
+		return shared.NewValidationError("start_end", "start and end are required")
+	}
+	if !end.After(start) {
+		return shared.NewValidationError("end", "end must be after start")
+	}
+	if end.Sub(start) > maxPixListRange {
+		return shared.NewValidationError("range", "date range too large")
+	}
+	if page < 0 || pageSize < 0 {
+		return shared.NewValidationError("pagination", "page and page_size must not be negative")
+	}
+	return nil
 }
 
 // publishPaymentEvent best-effort publishes a payment lifecycle event. A publish

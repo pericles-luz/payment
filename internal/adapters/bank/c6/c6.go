@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
@@ -56,6 +57,12 @@ type Provider struct {
 	baseURL string
 	httpc   *http.Client
 	tokens  *tokenManager
+	// creds resolves a tenant's bank credential, including its registered PIX
+	// creditor key (chave do recebedor), which the adapter injects into a cob/cobv
+	// when the request omits one (per-tenant config injection, ADR-0004 /
+	// SIN-65862). It is the same per-tenant store the token manager uses, so a
+	// charge can never route funds under another tenant's identity (threat H1/P1).
+	creds ports.CredentialStore
 	// now is the clock used for PIX QR-expiry computation when the PSP omits the
 	// charge creation timestamp. Defaults to time.Now (overridable for tests).
 	now func() time.Time
@@ -108,8 +115,35 @@ func New(cfg Config, creds ports.CredentialStore) (*Provider, error) {
 		baseURL: trimTrailingSlash(cfg.BaseURL),
 		httpc:   httpc,
 		tokens:  newTokenManager(creds, cfg.TokenURL, cfg.Scope, httpc, now),
+		creds:   creds,
 		now:     now,
 	}, nil
+}
+
+// resolveCreditorKey returns the PIX key (chave do recebedor) a cob/cobv is
+// registered under. A non-empty reqKey (the optional per-request override,
+// reserved for a future multi-key hook) wins; otherwise the tenant's configured
+// key (BankCredential.CreditorKey) is injected from the per-tenant store. Sourcing
+// the key from per-tenant config instead of per-request input constrains fund
+// routing to the tenant's registered account: a compromised or buggy app surface
+// cannot reroute funds to an arbitrary PIX key (OWASP A01, confused-deputy
+// defense; ADR-0004 / SIN-65862).
+//
+// A credential-store failure (e.g. unknown tenant) is propagated verbatim so the
+// caller surfaces the same typed error it always has. When BOTH the request and
+// the configured key are empty, the resolved key is "" and the caller currently
+// omits the chave (the wire field is omitempty); turning that into a fail-fast
+// adapter-boundary error is gated on CTO authorization to update the existing
+// create-charge tests that omit a key (rule 3; tracked in SIN-65862).
+func (p *Provider) resolveCreditorKey(ctx context.Context, tenantID, reqKey string) (string, error) {
+	if k := strings.TrimSpace(reqKey); k != "" {
+		return k, nil
+	}
+	cred, err := p.creds.GetBankCredential(ctx, tenantID)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(cred.CreditorKey), nil
 }
 
 // requireHTTPS rejects any endpoint that is not an absolute https:// URL. A
@@ -169,121 +203,86 @@ func idempotencyKey(req ports.ChargeRequest) string {
 	return req.PaymentID
 }
 
-// chargeRequestBody is the JSON sent to C6 to create a charge.
-type chargeRequestBody struct {
-	PaymentID   string `json:"payment_id"`
-	AmountCents int64  `json:"amount_cents"`
-	Currency    string `json:"currency"`
-}
-
-// chargeResponseBody is the subset of C6's charge representation we consume.
-//
-// Beyond txid/status it carries the money needed to reconcile a settlement: the
-// original amount (valor.original) and the received receipts (pix[]), mirroring
-// the PIX charge wire shape (pixValor / pixReceipt are reused). Reconciling only
-// the status proves the charge is marked paid; it does NOT prove the payer paid
-// the right amount, so the generic webhook settlement path also asserts the money
-// adds up before liquidating (reconcile-before-settle, threat W3, SIN-64777).
-type chargeResponseBody struct {
-	TxID   string   `json:"txid"`
-	Status string   `json:"status"`
-	Valor  pixValor `json:"valor"`
-	// Pix is the list of received transactions, present once the charge has been
-	// paid. Reconciliation sums each receipt's valor to learn how much was actually
-	// received versus valor.original.
-	Pix []pixReceipt `json:"pix"`
-}
-
-// toChargeResult maps the PSP wire shape into the generic charge port result,
-// reconciling the money: valor.original is the expected amount and the sum of the
-// pix[] receipts is what was received. It mirrors toPixResult and is fail-secure
-// for settlement — an absent amount (empty string) reconciles to zero cents (and
-// AmountReconciled then refuses to settle), while a present-but-malformed amount
-// is a corrupt money field that maps to ErrUnavailable rather than being silently
-// read as zero.
-func toChargeResult(b chargeResponseBody, op string) (ports.ChargeResult, error) {
-	expected, err := parseAmountCents(b.Valor.Original)
+// cobToChargeResult maps a BACEN cob representation into the generic charge port
+// result, reconciling the money through the shared PIX mapping: valor.original is
+// the expected amount and the sum of the pix[] receipts is what was received. It is
+// fail-secure for settlement — an absent amount reconciles to zero cents (and
+// AmountReconciled then refuses to settle), while a malformed amount maps to
+// ErrUnavailable rather than being read as zero.
+func (p *Provider) cobToChargeResult(b pixChargeResponseBody, op string) (ports.ChargeResult, error) {
+	r, err := p.toPixResult(b, op)
 	if err != nil {
-		return ports.ChargeResult{}, &Error{Op: op, sentinel: shared.ErrUnavailable}
-	}
-	var received int64
-	for _, r := range b.Pix {
-		amount, err := parseAmountCents(r.Valor)
-		if err != nil {
-			return ports.ChargeResult{}, &Error{Op: op, sentinel: shared.ErrUnavailable}
-		}
-		received += amount
+		return ports.ChargeResult{}, err
 	}
 	return ports.ChargeResult{
-		TxID:                b.TxID,
-		Status:              b.Status,
-		ExpectedAmountCents: expected,
-		ReceivedAmountCents: received,
+		TxID:                r.TxID,
+		Status:              r.Status,
+		ExpectedAmountCents: r.ExpectedAmountCents,
+		ReceivedAmountCents: r.ReceivedAmountCents,
 	}, nil
 }
 
-// CreateCharge creates a charge at C6. It forwards the PaymentID as the
-// Idempotency-Key header so the PSP collapses retried/concurrent creations into a
-// single charge — defense-in-depth against double-charging that does not depend on
-// the local reservation. The OAuth2 bearer token is attached per tenant.
+// CreateCharge creates a charge at C6 against the BACEN PIX v2 immediate-charge
+// (cob) surface — an idempotent PUT on /v2/pix/cob/{txid}. This is the real C6
+// contract; the prior placeholder POST /charges 404'd against the sandbox
+// (SIN-65856, live-verified). The txid is derived deterministically from the
+// idempotency anchor so a re-submit targets the same resource (idempotent create)
+// and matches the txid the settlement reconcile read (GetCharge / the
+// PixSettlementProvider) addresses. The anchor is also forwarded as the
+// Idempotency-Key header (F3b defense-in-depth, SIN-64720); the OAuth2 bearer is
+// attached per tenant.
 func (p *Provider) CreateCharge(ctx context.Context, tenantID string, req ports.ChargeRequest) (ports.ChargeResult, error) {
-	token, err := p.tokens.token(ctx, tenantID)
+	// Complete mediation at the money seam (mirrors CreateImmediateCharge): an empty
+	// idempotency anchor would derive the constant txid sha256("")[:32] and collide
+	// distinct charges onto one resource; a non-positive amount is never a valid
+	// charge. Fail securely at the boundary.
+	if idempotencyKey(req) == "" || req.AmountCents <= 0 {
+		return ports.ChargeResult{}, &Error{Op: "create_charge", sentinel: shared.ErrValidation}
+	}
+	txid := pixTxID(req)
+
+	chave, err := p.resolveCreditorKey(ctx, tenantID, req.CreditorKey)
 	if err != nil {
 		return ports.ChargeResult{}, err
 	}
 
-	payload, err := json.Marshal(chargeRequestBody{
-		PaymentID:   req.PaymentID,
-		AmountCents: req.AmountCents,
-		Currency:    req.Currency,
+	payload, err := json.Marshal(pixChargeRequestBody{
+		Calendario: pixCalendario{Expiracao: int64(defaultPixExpiry / time.Second)},
+		Devedor:    buildDevedor(req),
+		Valor:      pixValor{Original: formatAmount(req.AmountCents)},
+		Chave:      chave,
 	})
 	if err != nil {
 		return ports.ChargeResult{}, &Error{Op: "create_charge", sentinel: shared.ErrValidation}
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/charges", bytes.NewReader(payload))
+	endpoint := p.baseURL + pixCobPath + "/" + url.PathEscape(txid)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, "create_charge", http.MethodPut, endpoint, payload, idempotencyKey(req))
 	if err != nil {
-		return ports.ChargeResult{}, transportError("create_charge")
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
-	// Forward the idempotency key so the PSP collapses retried/concurrent creations
-	// (F3b defense-in-depth, SIN-64720). Honor the caller's key; fall back to the
-	// PaymentID — a deterministic key — when none was supplied, never silently
-	// dropping idempotency (the ports.ChargeRequest contract).
-	if idem := idempotencyKey(req); idem != "" {
-		httpReq.Header.Set("Idempotency-Key", idem)
+		return ports.ChargeResult{}, err
 	}
 
-	var out chargeResponseBody
+	var out pixChargeResponseBody
 	if err := p.do(httpReq, "create_charge", &out); err != nil {
 		return ports.ChargeResult{}, err
 	}
-	return toChargeResult(out, "create_charge")
+	return p.cobToChargeResult(out, "create_charge")
 }
 
-// GetCharge reconciles the authoritative state of a charge from C6 (never trust a
-// raw webhook — threat W3).
+// GetCharge reconciles the authoritative state of a charge from C6 via the BACEN
+// cob read (GET /v2/pix/cob/{txid}); never trust a raw webhook (threat W3).
 func (p *Provider) GetCharge(ctx context.Context, tenantID, txID string) (ports.ChargeResult, error) {
-	token, err := p.tokens.token(ctx, tenantID)
+	endpoint := p.baseURL + pixCobPath + "/" + url.PathEscape(txID)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, "get_charge", http.MethodGet, endpoint, nil, "")
 	if err != nil {
 		return ports.ChargeResult{}, err
 	}
 
-	endpoint := p.baseURL + "/charges/" + url.PathEscape(txID)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return ports.ChargeResult{}, transportError("get_charge")
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-	httpReq.Header.Set("Accept", "application/json")
-
-	var out chargeResponseBody
+	var out pixChargeResponseBody
 	if err := p.do(httpReq, "get_charge", &out); err != nil {
 		return ports.ChargeResult{}, err
 	}
-	return toChargeResult(out, "get_charge")
+	return p.cobToChargeResult(out, "get_charge")
 }
 
 // authedJSONRequest builds an HTTP request for tenant carrying a fresh per-tenant

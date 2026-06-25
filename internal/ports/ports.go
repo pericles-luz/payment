@@ -137,21 +137,34 @@ type BankCredential struct {
 	ClientID string
 	// Secret is populated only transiently when resolved from the store.
 	Secret string
+	// CreditorKey is the tenant's registered PIX key (chave do recebedor) the
+	// adapter injects into a cob/cobv when the request does not carry one. It is
+	// NOT a secret — it is the account's public PIX identifier — but it IS
+	// sensitive to fund routing: it belongs to the same identity aggregate as
+	// ClientID (the tenant's bank identity) and sourcing it from per-tenant config
+	// instead of per-request input constrains fund routing to the tenant's
+	// registered account (OWASP A01, confused-deputy defense; ADR-0004, SIN-65862).
+	// It is redacted from String()/LogValue() so an error or log path that prints a
+	// credential cannot leak account-routing data (threat C1/C4).
+	CreditorKey string
 }
 
 // String implements fmt.Stringer so a credential can never leak its secret
-// through %v/%s/%+v formatting in logs or errors (defense-in-depth, threat C1).
+// (or the routing-sensitive creditor key) through %v/%s/%+v formatting in logs
+// or errors (defense-in-depth, threat C1/C4; ADR-0004).
 func (c BankCredential) String() string {
-	return fmt.Sprintf("BankCredential{TenantID:%s ClientID:%s Secret:[REDACTED]}", c.TenantID, c.ClientID)
+	return fmt.Sprintf("BankCredential{TenantID:%s ClientID:%s Secret:[REDACTED] CreditorKey:[REDACTED]}", c.TenantID, c.ClientID)
 }
 
 // LogValue implements slog.LogValuer so structured logging emits the credential
-// without its secret, even when logged as an attribute value (threat C1/C4).
+// without its secret or its routing-sensitive creditor key, even when logged as
+// an attribute value (threat C1/C4; ADR-0004).
 func (c BankCredential) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("tenant_id", c.TenantID),
 		slog.String("client_id", c.ClientID),
 		slog.String("secret", "[REDACTED]"),
+		slog.String("creditor_key", "[REDACTED]"),
 	)
 }
 
@@ -213,6 +226,18 @@ type ChargeRequest struct {
 	// PSP's devedor block. DebtorName is the payer's name and is never logged.
 	DebtorTaxID string
 	DebtorName  string
+	// CreditorKey is the recebedor's PIX key (chave) the immediate charge is
+	// registered under at the PSP. The real C6 BACEN PIX v2 cob create
+	// (PUT /v2/pix/cob/{txid}) requires it to route the funds and mint the QR; the
+	// adapter forwards it as the BACEN "chave" field. OPTIONAL on the port (a
+	// stub/test charge may omit it, and the omitempty wire field then drops it); a
+	// real homologação/production charge MUST carry the tenant's registered key.
+	// No app surface (HTTP DTO / HTMX form) populates it: the C6 adapter injects
+	// the tenant's configured key (BankCredential.CreditorKey) when this field is
+	// empty, so the client boundary never carries fund-routing data (opção (a),
+	// ADR-0004 / SIN-65862). A non-empty value here is an optional per-request
+	// override, reserved for a future multi-key hook, and wins over the config.
+	CreditorKey string
 }
 
 // ChargeResult is the bank's response to a generic charge (the non-PIX charge
@@ -340,6 +365,98 @@ type PixProvider interface {
 	ListImmediateCharges(ctx context.Context, tenantID string, filter PixListFilter) (PixChargeList, error)
 }
 
+// PixDueChargeRequest is the input to register or amend a PIX charge with a due
+// date (cobrança com vencimento, cobv — roteiro 7.5/7.7). It carries the fine,
+// interest and discount RATES so the bank registers them; the amount owed at any
+// instant is computed by the pixcobv domain, never here (Hexagonal). The devedor
+// (DebtorTaxID/DebtorName) and the creditor PIX key are required for a cobv, unlike
+// an immediate charge. The tenant is explicit so per-tenant credential isolation is
+// never bypassed (threat H1/P1).
+type PixDueChargeRequest struct {
+	TenantID    string
+	TxID        string
+	AmountCents int64
+	Currency    string
+	DueDate     time.Time
+	// ValidityDays is the number of days after the due date the charge may still be
+	// paid (validade após vencimento, roteiro 7.5). Zero means payable only up to the
+	// due date.
+	ValidityDays       int
+	FineBps            int64
+	MonthlyInterestBps int64
+	// DiscountBps and DiscountFixedCents are the mutually exclusive early-payment
+	// discount forms (desconto). At most one is non-zero.
+	DiscountBps        int64
+	DiscountFixedCents int64
+	DebtorTaxID        string
+	DebtorName         string
+	// CreditorKey is the recebedor's PIX key (chave) the charge is registered under.
+	CreditorKey string
+	// IdempotencyKey, when present, is forwarded so the PSP collapses retried/
+	// concurrent registrations into one charge.
+	IdempotencyKey string
+}
+
+// PixDueChargeResult is the bank's response to a cobv register/read/amend. It
+// carries the QR material (the BACEN "PIX copia e cola" string + render location)
+// the payer scans, the reconciled lifecycle status, the due date / validity echoed
+// back for reconciliation (roteiro 7.6), and the money needed to reconcile a
+// settlement (expected vs received).
+//
+//   - Status is the PSP's charge status verbatim (e.g. "ATIVA", "CONCLUIDA").
+//     Settlement decisions read this from GetDueCharge, never from a raw webhook
+//     (reconcile-before-settle, threat W3).
+//   - ExpectedAmountCents is the charge's original amount (valor.original) in cents.
+//   - ReceivedAmountCents is the amount actually received in cents (zero while
+//     unpaid). AmountReconciled asserts the two add up before settling.
+type PixDueChargeResult struct {
+	TxID                string
+	Status              string
+	QRCodePayload       string
+	QRCodeLocation      string
+	DueDate             time.Time
+	ValidityDays        int
+	FineBps             int64
+	MonthlyInterestBps  int64
+	DiscountBps         int64
+	DiscountFixedCents  int64
+	ExpectedAmountCents int64
+	ReceivedAmountCents int64
+}
+
+// AmountReconciled reports whether the amount received exactly matches the expected
+// (original) amount. It mirrors PixChargeResult.AmountReconciled: a non-positive
+// expected amount is never reconciled and overpayment is a divergence too, so the
+// check is strict equality.
+func (r PixDueChargeResult) AmountReconciled() bool {
+	return r.ExpectedAmountCents > 0 && r.ReceivedAmountCents == r.ExpectedAmountCents
+}
+
+// PixDueChargeProvider is the output port for PIX charges with a due date (cobv,
+// roteiro 7.5–7.7): register, reconcile-read and amend. It is kept SEPARATE from
+// PixProvider (ISP) rather than widening it: a cobv carries a richer request shape
+// (due date, validity window, fine/interest/discount, devedor, creditor key) that
+// the immediate-charge port does not, and an immediate-charge consumer must not be
+// forced to depend on cobv semantics — exactly the segregation BoletoProvider
+// follows for the BolePix slip, of which cobv is the PIX analogue. The C6 adapter
+// implements both; a stub backs them for tests. Each carries tenantID explicitly so
+// the per-tenant credential isolation the adapter enforces is never bypassed.
+type PixDueChargeProvider interface {
+	// CreateDueCharge idempotently registers a cobv charge and returns its QR code.
+	// req.IdempotencyKey (falling back to the TxID) anchors idempotency: a re-submit
+	// with the same anchor resolves to the same charge and never creates a duplicate.
+	CreateDueCharge(ctx context.Context, tenantID string, req PixDueChargeRequest) (PixDueChargeResult, error)
+	// GetDueCharge reconciles the authoritative state of a cobv charge — the source
+	// of truth for settlement (never trust a raw webhook — threat W3). An unknown
+	// txid within the tenant is shared.ErrNotFound; the read is tenant-scoped.
+	GetDueCharge(ctx context.Context, tenantID, txID string) (PixDueChargeResult, error)
+	// UpdateDueCharge amends a registered cobv's parameters (roteiro 7.7). req carries
+	// the full new parameter set. An unknown txid within the tenant is
+	// shared.ErrNotFound; the operation is tenant-scoped so one tenant can never amend
+	// another's charge.
+	UpdateDueCharge(ctx context.Context, tenantID, txID string, req PixDueChargeRequest) (PixDueChargeResult, error)
+}
+
 // PixListFilter is the date-window + pagination filter for listing immediate PIX
 // charges. Start and End are the BACEN inicio/fim bounds (required); Page and
 // PageSize map to paginacao.paginaAtual / paginacao.itensPorPagina (optional — a
@@ -405,36 +522,104 @@ type ConsentProvider interface {
 	CancelConsent(ctx context.Context, tenantID, consentID string) (ConsentResult, error)
 }
 
-// BoletoRequest is the input to register a BolePix boleto at the bank. The fine
-// and interest RATES are transported so the bank registers them, but the amount
-// owed at any instant is computed by the boleto domain, never here (Hexagonal).
+// BoletoDiscountTier is the transport mirror of a boleto early-payment discount step
+// (roteiro grupo 3). Exactly one of Bps/FixedCents is set; DaysBeforeDue is the
+// minimum number of whole days before the due date the payment must occur for the
+// tier to apply.
+type BoletoDiscountTier struct {
+	DaysBeforeDue int
+	Bps           int64
+	FixedCents    int64
+}
+
+// BoletoAddress is the payer's address. Number is an int because the real C6
+// contract (POST /v1/bank_slips) models the address number as an integer; see
+// ADR-0005 "Riscos conhecidos" for the "S/N"/alphanumeric homologation question.
+// These are plain Go types — transport tags and wire formatting live in the adapter.
+type BoletoAddress struct {
+	Street  string
+	Number  int
+	City    string
+	State   string // UF, 2 letters
+	ZipCode string // CEP, digits only
+}
+
+// BoletoPayer identifies the sacado/pagador of a boleto. It is the domain mirror of
+// the `payer` object the real C6 contract requires for POST /v1/bank_slips. It is a
+// per-charge value object (each boleto has a different payer), so it flows from the
+// boundary — it is not adapter/tenant config (ADR-0005). Plain Go types, no transport
+// tags: the JSON shape and mandatory-field validation are the C6 adapter's job.
+type BoletoPayer struct {
+	Name    string
+	TaxID   string // CPF/CNPJ, digits only
+	Address BoletoAddress
+}
+
+// BoletoRequest is the input to register a BolePix boleto at the bank. The fine,
+// interest and discount RATES are transported so the bank registers them, but the
+// amount owed at any instant is computed by the boleto domain, never here
+// (Hexagonal).
 type BoletoRequest struct {
-	TenantID           string
-	BoletoID           string
-	AmountCents        int64
-	Currency           string
-	DueDate            time.Time
-	FineBps            int64
-	MonthlyInterestBps int64
-	PayerTaxID         string
-	IdempotencyKey     string
-}
-
-// BoletoResult is the bank's response to a boleto registration. It carries the
-// scannable artifacts (the PIX EMV "copia e cola" payload and the boleto's
-// barcode/linha digitável) the caller renders for the payer.
-type BoletoResult struct {
+	TenantID    string
 	BoletoID    string
-	TxID        string
-	Status      string
-	QRCode      string // PIX EMV copy-and-paste payload (BolePix)
-	Barcode     string // boleto linha digitável / barcode
-	AmountCents int64  // principal the bank registered
+	AmountCents int64
+	Currency    string
+	DueDate     time.Time
+	// ValidUntil is the last day the boleto may be paid (data limite de pagamento,
+	// roteiro 5.b). Zero when unset.
+	ValidUntil time.Time
+	FineBps    int64
+	// FineFixedCents is the late-payment fine as a fixed amount (roteiro 2.c). It is
+	// mutually exclusive with FineBps; zero when the fine is a percentage or absent.
+	FineFixedCents     int64
+	MonthlyInterestBps int64
+	// Discounts is the early-payment discount schedule (roteiro grupo 3), ordered
+	// descending by DaysBeforeDue. Empty when the boleto carries no discount.
+	Discounts []BoletoDiscountTier
+	// Payer is the boleto's sacado/pagador. The real C6 contract requires the full
+	// payer (name + tax id + address) on POST /v1/bank_slips; mandatory-field
+	// validation lives in the C6 adapter so the stub stays lenient (ADR-0005).
+	Payer          BoletoPayer
+	IdempotencyKey string
 }
 
-// BoletoProvider is the output port for BolePix boleto registration.
+// BoletoResult is the bank's response to a boleto registration or read. It carries
+// the scannable artifacts (the PIX EMV "copia e cola" payload and the boleto's
+// barcode/linha digitável) the caller renders for the payer, plus the registered
+// parameters echoed back for reconciliation/homologação evidence (roteiro 6.a).
+type BoletoResult struct {
+	BoletoID           string
+	TxID               string
+	Status             string
+	QRCode             string    // PIX EMV copy-and-paste payload (BolePix)
+	Barcode            string    // boleto linha digitável / barcode
+	AmountCents        int64     // principal the bank registered
+	DueDate            time.Time // registered due date (vencimento); zero when unknown
+	ValidUntil         time.Time // registered payment-validity limit (roteiro 5.b); zero when unset
+	FineBps            int64     // registered one-time fine rate
+	FineFixedCents     int64     // registered fixed fine (roteiro 2.c); zero when percentage
+	MonthlyInterestBps int64     // registered monthly mora interest rate
+	Discounts          []BoletoDiscountTier
+}
+
+// BoletoProvider is the output port for the BolePix boleto lifecycle: register, read,
+// cancel (baixa) and amend (alteração).
 type BoletoProvider interface {
 	CreateBoleto(ctx context.Context, tenantID string, req BoletoRequest) (BoletoResult, error)
+	// GetBoleto reconciles the authoritative state of a registered boleto for the
+	// tenant (roteiro 6.a). An unknown id within the tenant is shared.ErrNotFound;
+	// the read is tenant-scoped so one tenant can never observe another's boleto.
+	GetBoleto(ctx context.Context, tenantID, boletoID string) (BoletoResult, error)
+	// CancelBoleto performs the baixa/cancelamento of a registered boleto (roteiro
+	// grupo 4), whether still due (4.a) or overdue (4.b). It is idempotent: cancelling
+	// an already-cancelled boleto succeeds and returns the cancelled state. An unknown
+	// id within the tenant is shared.ErrNotFound; the operation is tenant-scoped.
+	CancelBoleto(ctx context.Context, tenantID, boletoID string) (BoletoResult, error)
+	// UpdateBoleto amends a registered boleto's parameters (roteiro grupo 5): due date
+	// (5.a), validity (5.b) and amount/fine/interest (5.c). req carries the full new
+	// parameter set. An unknown id within the tenant is shared.ErrNotFound; the
+	// operation is tenant-scoped so one tenant can never amend another's boleto.
+	UpdateBoleto(ctx context.Context, tenantID, boletoID string, req BoletoRequest) (BoletoResult, error)
 }
 
 // CheckoutItem is one line of a checkout request (transport mirror of the
@@ -460,13 +645,26 @@ type CheckoutRequest struct {
 	IdempotencyKey        string
 }
 
-// CheckoutResult is the bank's response to opening a checkout session. RedirectURL
-// is the hosted page the caller sends the payer to.
+// CheckoutResult is the bank's response to a checkout-session operation (open,
+// reconcile, cancel). RedirectURL is the hosted page the caller sends the payer to
+// (only meaningful while a session is open).
+//
+// For settlement (the checkout webhook, roteiro 12) the money is reconciled, not only
+// the status (threat W3, mirroring ChargeResult): AmountCents is the session's
+// authorized total (the expected amount) and ReceivedAmountCents is what the PSP
+// reports as actually captured. AmountReconciled asserts the two add up before a
+// payment is liquidated, so a partial/over capture or a manipulated notification can
+// never settle for the wrong amount.
 type CheckoutResult struct {
 	SessionID   string
 	Status      string
 	RedirectURL string
+	// AmountCents is the session's authorized total in cents (the expected amount).
 	AmountCents int64
+	// ReceivedAmountCents is the amount the PSP reports as captured for the session in
+	// cents (zero while the session is open/unpaid). AmountReconciled compares it to
+	// AmountCents before settlement.
+	ReceivedAmountCents int64
 	// CardType / RequireAuthentication echo the permitted payment method back so the
 	// caller's response is self-describing (the C6 create response does not echo
 	// them; the adapter sets them from the request).
@@ -474,7 +672,158 @@ type CheckoutResult struct {
 	RequireAuthentication bool
 }
 
-// CheckoutProvider is the output port for the unified C6 checkout session.
+// AmountReconciled reports whether the amount captured on the session exactly matches
+// its authorized total. It mirrors ChargeResult.AmountReconciled: a non-positive
+// expected total is never reconciled, so an absent/garbled amount fails closed
+// (settlement refused) rather than liquidating for zero.
+func (r CheckoutResult) AmountReconciled() bool {
+	return r.AmountCents > 0 && r.ReceivedAmountCents == r.AmountCents
+}
+
+// CheckoutProvider is the output port for the unified C6 checkout session: open a
+// session (roteiro 9), reconcile its authoritative state (roteiro 10) and cancel it
+// (roteiro 11). Each method carries tenantID explicitly so per-tenant credential
+// isolation is never bypassed.
 type CheckoutProvider interface {
 	CreateCheckoutSession(ctx context.Context, tenantID string, req CheckoutRequest) (CheckoutResult, error)
+	// GetCheckoutSession reconciles the authoritative state of a checkout session
+	// (roteiro 10). The read is tenant-scoped (per-tenant token); an unknown id within
+	// the tenant is shared.ErrNotFound, so one tenant can never observe another's
+	// session. It is the source of truth for settlement (never trust a raw webhook).
+	GetCheckoutSession(ctx context.Context, tenantID, sessionID string) (CheckoutResult, error)
+	// CancelCheckoutSession cancels a checkout session (roteiro 11). It is idempotent:
+	// cancelling an already-cancelled session succeeds and returns the cancelled state.
+	// An unknown id within the tenant is shared.ErrNotFound (no cross-tenant oracle).
+	CancelCheckoutSession(ctx context.Context, tenantID, sessionID string) (CheckoutResult, error)
+}
+
+// CheckoutReconciler is the narrow read-only view of CheckoutProvider the webhook
+// settlement path depends on (ISP): it only needs to reconcile a session's
+// authoritative state before settling, not to open or cancel one.
+type CheckoutReconciler interface {
+	GetCheckoutSession(ctx context.Context, tenantID, sessionID string) (CheckoutResult, error)
+}
+
+// DDABoleto is one boleto open in a client's DDA (Débito Direto Autorizado, roteiro
+// 8.1): the bank's boleto id, the scannable barcode / linha digitável, the amount in
+// cents, the due date and the beneficiary name. It is a read projection the adapter
+// transports from the bank.
+type DDABoleto struct {
+	ID              string
+	Barcode         string
+	AmountCents     int64
+	DueDate         time.Time
+	BeneficiaryName string
+}
+
+// DDAItem is one payment line of a DDA payment group (transport mirror of the domain
+// dda.Item): the bank's item id, the boleto barcode, the amount and due date the bank
+// resolved for it.
+type DDAItem struct {
+	ID          string
+	Barcode     string
+	AmountCents int64
+	DueDate     time.Time
+}
+
+// DDAGroup is a DDA payment group's transported state: its bank id (the txid returned
+// on create), its lifecycle status verbatim ("consultando"/"aprovado") and the items
+// currently in it. The use-case maps it onto the domain PaymentGroup to enforce the
+// transition rules before any mutation.
+type DDAGroup struct {
+	ID     string
+	Status string
+	Items  []DDAItem
+}
+
+// DDAGroupRequest is the input to submit a payment group for the initial consult
+// (roteiro 8.2). Barcodes are the boletos the client selects into the group; the bank
+// resolves each into an item with its amount and due date. IdempotencyKey, when
+// present, is forwarded so the PSP collapses retried/concurrent submissions into one
+// group.
+type DDAGroupRequest struct {
+	TenantID       string
+	Barcodes       []string
+	IdempotencyKey string
+}
+
+// DDAProvider is the output port for the DDA / agendamento de pagamentos surface
+// (roteiro grupo 8). It is kept SEPARATE from the other bank ports (ISP): a use-case
+// that schedules DDA payments must not be forced to depend on PIX/boleto/checkout
+// semantics, and those consumers must not depend on DDA. The C6 adapter implements it;
+// a stub backs it for tests. Every method carries tenantID explicitly so the
+// per-tenant credential/token isolation the adapter enforces is never bypassed — the
+// tenant is derived from the authenticated caller, never client input (threat H1/P1).
+// An id owned by another tenant is shared.ErrNotFound (no cross-tenant existence
+// oracle), never a distinct error.
+type DDAProvider interface {
+	// ListOpenBoletos returns the boletos currently open in the tenant's DDA
+	// (roteiro 8.1). Pure read; never mutates state.
+	ListOpenBoletos(ctx context.Context, tenantID string) ([]DDABoleto, error)
+	// CreatePaymentGroup submits a group of boletos (by barcode) for the initial
+	// consult (roteiro 8.2) and returns the resulting consultando group with its txid
+	// and resolved items. Idempotent on req.IdempotencyKey: a re-submit with the same
+	// (tenant, key) resolves to the same group and never creates a duplicate.
+	CreatePaymentGroup(ctx context.Context, tenantID string, req DDAGroupRequest) (DDAGroup, error)
+	// GetPaymentGroup reconciles the authoritative state (status + items) of a payment
+	// group for the tenant (roteiro 8.3, and the source of truth the use-case reads
+	// before 8.4/8.5/8.6). An unknown id within the tenant is shared.ErrNotFound.
+	GetPaymentGroup(ctx context.Context, tenantID, groupID string) (DDAGroup, error)
+	// RemovePaymentGroupItems removes a list of items from a group (roteiro 8.4). It is
+	// tenant-scoped; an unknown group is shared.ErrNotFound. The transition legality
+	// (group not yet approved) is enforced by the domain in the use-case before this
+	// call; the adapter only applies the removal.
+	RemovePaymentGroupItems(ctx context.Context, tenantID, groupID string, itemIDs []string) error
+	// RemovePaymentGroupItem removes a single item from a group (roteiro 8.5). Same
+	// tenant-scoping and not-found semantics as RemovePaymentGroupItems.
+	RemovePaymentGroupItem(ctx context.Context, tenantID, groupID, itemID string) error
+	// SubmitPaymentGroup submits a consulting group for approval (roteiro 8.6). idemKey
+	// (when present) is forwarded so a retried submit collapses to one effect.
+	// Tenant-scoped; an unknown group is shared.ErrNotFound.
+	SubmitPaymentGroup(ctx context.Context, tenantID, groupID, idemKey string) error
+}
+
+// StatementEntry is one posted line of an account statement (extrato, roteiro
+// 13.a): the bank's entry id, the posting date, the amount in cents, its direction
+// ("credit"/"debit" verbatim) and a short description (histórico). It is a read
+// projection the adapter transports from the bank; the amount is always positive and
+// the direction carries the sign meaning.
+type StatementEntry struct {
+	ID          string
+	Date        time.Time
+	AmountCents int64
+	Kind        string
+	Description string
+}
+
+// Statement is a tenant's account statement over a period: the entries posted within
+// the requested window. The use-case maps it onto the domain statement.Statement to
+// re-validate the entries (defense in depth) before surfacing it.
+type Statement struct {
+	Entries []StatementEntry
+}
+
+// StatementFilter is the date window for an extrato query (roteiro 13.a). Start and
+// End are the inicio/fim bounds; both are required and the use-case validates the
+// window (fim >= inicio, <= 30 days) through the domain before this reaches the
+// adapter.
+type StatementFilter struct {
+	Start time.Time
+	End   time.Time
+}
+
+// StatementProvider is the output port for the account-statement surface (extrato,
+// roteiro grupo 13). It is kept SEPARATE from the other bank ports (ISP): a use-case
+// that reads an extrato must not be forced to depend on PIX/boleto/checkout/DDA
+// semantics, and those consumers must not depend on the statement read. The C6
+// adapter implements it; a stub backs it for tests. The single method carries
+// tenantID explicitly so the per-tenant credential/token isolation the adapter
+// enforces is never bypassed — the tenant is derived from the authenticated caller,
+// never client input (threat H1/P1).
+type StatementProvider interface {
+	// GetStatement returns the entries posted to the tenant's account within the
+	// filter's date window (roteiro 13.a). Pure read; never mutates state. The window
+	// is already validated by the use-case (the domain caps it at 30 days); the
+	// adapter only transports it.
+	GetStatement(ctx context.Context, tenantID string, filter StatementFilter) (Statement, error)
 }

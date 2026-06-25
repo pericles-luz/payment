@@ -130,6 +130,36 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+// TestHealthzReportsBuildProvenance verifies the health check surfaces the build
+// provenance (status + version/commit/built_at keys) so the CD smoke gate can
+// assert the deployed SHA. Under `go test` no ldflags are injected, so version
+// resolves to a non-empty fallback ("dev" or the VCS revision) and commit/built_at
+// may be empty — only the keys' presence and a non-empty version are asserted here
+// (the resolver's value precedence is covered in internal/version).
+func TestHealthzReportsBuildProvenance(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	rec := do(t, f.handler, http.MethodGet, "/healthz", "", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz: %d", rec.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode healthz body: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("status = %q; want ok", body["status"])
+	}
+	if body["version"] == "" {
+		t.Errorf("version is empty; want a non-empty build provenance value")
+	}
+	for _, k := range []string{"version", "commit", "built_at"} {
+		if _, ok := body[k]; !ok {
+			t.Errorf("healthz body missing key %q (smoke gate asserts the deployed SHA)", k)
+		}
+	}
+}
+
 func TestAuthDenyByDefault(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)

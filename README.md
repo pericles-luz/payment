@@ -112,6 +112,7 @@ Variáveis de ambiente (todas opcionais, com defaults seguros):
 | `PAYMENT_ADMIN_TOKENS` | — | Tokens do plano admin, separados por vírgula. |
 | `PAYMENT_WEBHOOK_SECRET` | — | Segredo do webhook (em produção: mTLS). |
 | `PAYMENT_BANK_CREDS` | — | `tenant:clientID:secret,...` (em produção: vault). |
+| `PAYMENT_BANK_CREDITOR_KEYS` | — | `tenant:creditorKey,...` — chave PIX do recebedor por tenant, injetada na cob/cobv (ADR-0004). Não-segredo, mas sensível a roteamento; nunca logada. |
 | `PAYMENT_RABBIT_URL` | — | URL do RabbitMQ (vazio = bus em memória). |
 
 > Os tokens/segredos acima são de **desenvolvimento**. Em produção use um IdP /

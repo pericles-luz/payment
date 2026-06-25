@@ -46,8 +46,8 @@ func newPixTestServer(t *testing.T) *pixTestServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
-	mux.HandleFunc("/v1/pix/", func(w http.ResponseWriter, r *http.Request) {
-		txid := strings.TrimPrefix(r.URL.Path, "/v1/pix/")
+	mux.HandleFunc("/v2/pix/cob/", func(w http.ResponseWriter, r *http.Request) {
+		txid := strings.TrimPrefix(r.URL.Path, "/v2/pix/cob/")
 		ts.mu.Lock()
 		ts.lastMethod = r.Method
 		ts.lastAuth = r.Header.Get("Authorization")

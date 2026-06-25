@@ -186,6 +186,11 @@ func (s *Server) handleSetBankCredential(w http.ResponseWriter, r *http.Request)
 // notification is a few hundred bytes — 64 KiB is generous. Oversize → 413.
 const maxWebhookBytes = 64 << 10
 
+// webhookServiceCheckout is the c6WebhookNotification.service value that marks a
+// checkout-session status notification (roteiro 12). Matched case-insensitively; any
+// other service is reconciled as a PIX/charge.
+const webhookServiceCheckout = "checkout"
+
 // c6WebhookNotification is the inbound C6 callback body (notificações.yaml,
 // WebhookNotification). It is UNTRUSTED: the tenant comes from the authenticated
 // channel (never client_id), and settlement reconciles the authoritative state
@@ -263,11 +268,23 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	//    C6 contract signs nothing (no timestamp), so dedup is the only replay
 	//    barrier and pruning a key would reopen a replay window. A bounded
 	//    signed-timestamp window is deferred to SIN-64762 (if C6 ever signs).
-	err := s.webhooks.HandlePaymentEvent(r.Context(), app.PaymentEvent{
+	//
+	//    The service field selects which authoritative state to reconcile before
+	//    settling: a checkout notification reconciles the checkout session (roteiro
+	//    12), every other service the PIX/charge. Both paths share the same dedup +
+	//    reconcile-before-settle unit of work and the EventKey carries the service, so
+	//    a checkout and a charge event for the same external id never collide.
+	ev := app.PaymentEvent{
 		TenantID: id.TenantID,
 		TxID:     note.ExternalID,
 		EventKey: note.ExternalID + "|" + note.Service + "|" + note.Status,
-	})
+	}
+	var err error
+	if strings.EqualFold(strings.TrimSpace(note.Service), webhookServiceCheckout) {
+		err = s.webhooks.HandleCheckoutEvent(r.Context(), ev)
+	} else {
+		err = s.webhooks.HandlePaymentEvent(r.Context(), ev)
+	}
 	if err != nil {
 		writeDomainError(w, err)
 		return

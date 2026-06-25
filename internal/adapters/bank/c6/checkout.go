@@ -31,12 +31,15 @@ type checkoutRequestBody struct {
 }
 
 // checkoutResponseBody is the subset of C6's checkout-session representation we
-// consume: the status and the hosted redirect URL.
+// consume: the status, the hosted redirect URL and the money. ReceivedAmountCents is
+// what the PSP reports as captured — settlement reconciles it against amount_cents
+// (the authorized total) before liquidating (reconcile-before-settle, threat W3).
 type checkoutResponseBody struct {
-	SessionID   string `json:"session_id"`
-	Status      string `json:"status"`
-	RedirectURL string `json:"redirect_url"`
-	AmountCents int64  `json:"amount_cents"`
+	SessionID           string `json:"session_id"`
+	Status              string `json:"status"`
+	RedirectURL         string `json:"redirect_url"`
+	AmountCents         int64  `json:"amount_cents"`
+	ReceivedAmountCents int64  `json:"received_amount_cents"`
 }
 
 // CreateCheckoutSession opens a unified hosted checkout session at C6 and returns
@@ -91,6 +94,60 @@ func (p *Provider) CreateCheckoutSession(ctx context.Context, tenantID string, r
 		// so the result is self-describing for the caller's response/traceability.
 		CardType:              req.CardType,
 		RequireAuthentication: req.RequireAuthentication,
+	}, nil
+}
+
+// GetCheckoutSession reconciles the authoritative state of a checkout session from C6
+// via GET /checkout/sessions/{id} (roteiro 10). It is the source of truth for
+// settlement — never trust a raw webhook (threat W3). A 404 surfaces as
+// shared.ErrNotFound; the read is tenant-scoped through the per-tenant OAuth2 bearer
+// token. A redirect URL, when present, is validated (open-redirect defense) so a
+// reconcile read can never hand the caller an untrusted target.
+func (p *Provider) GetCheckoutSession(ctx context.Context, tenantID, sessionID string) (ports.CheckoutResult, error) {
+	endpoint := p.baseURL + "/checkout/sessions/" + url.PathEscape(sessionID)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, "get_checkout", http.MethodGet, endpoint, nil, "")
+	if err != nil {
+		return ports.CheckoutResult{}, err
+	}
+	var out checkoutResponseBody
+	if err := p.do(httpReq, "get_checkout", &out); err != nil {
+		return ports.CheckoutResult{}, err
+	}
+	return toCheckoutResult(out, "get_checkout")
+}
+
+// CancelCheckoutSession cancels a checkout session at C6 via DELETE
+// /checkout/sessions/{id} (roteiro 11). It is idempotent at the PSP: cancelling an
+// already-cancelled session returns its cancelled representation rather than an error.
+// A 404 surfaces as shared.ErrNotFound (no cross-tenant existence oracle).
+func (p *Provider) CancelCheckoutSession(ctx context.Context, tenantID, sessionID string) (ports.CheckoutResult, error) {
+	endpoint := p.baseURL + "/checkout/sessions/" + url.PathEscape(sessionID)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, "cancel_checkout", http.MethodDelete, endpoint, nil, "")
+	if err != nil {
+		return ports.CheckoutResult{}, err
+	}
+	var out checkoutResponseBody
+	if err := p.do(httpReq, "cancel_checkout", &out); err != nil {
+		return ports.CheckoutResult{}, err
+	}
+	return toCheckoutResult(out, "cancel_checkout")
+}
+
+// toCheckoutResult maps a reconcile/cancel response into the port result. The redirect
+// URL is validated only when present (a cancelled or paid session need not carry one);
+// an untrusted non-https/relative target fails closed rather than being forwarded.
+func toCheckoutResult(out checkoutResponseBody, op string) (ports.CheckoutResult, error) {
+	if out.RedirectURL != "" {
+		if err := validateRedirectURL(out.RedirectURL); err != nil {
+			return ports.CheckoutResult{}, &Error{Op: op, detail: "untrusted redirect url", sentinel: shared.ErrUnavailable}
+		}
+	}
+	return ports.CheckoutResult{
+		SessionID:           out.SessionID,
+		Status:              out.Status,
+		RedirectURL:         out.RedirectURL,
+		AmountCents:         out.AmountCents,
+		ReceivedAmountCents: out.ReceivedAmountCents,
 	}, nil
 }
 

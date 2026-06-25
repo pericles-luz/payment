@@ -1,0 +1,57 @@
+# payment-api.service — systemd unit for the payment receptor (SIN-65900).
+#
+# Single Go binary (cmd/api), serves /healthz on :8080 behind HAProxy at
+# payment.lmhost.com.br. Installed to /opt/payment/bin/payment-api by the CD
+# deploy wrapper; restarted by that wrapper via a single scoped NOPASSWD sudoers
+# entry (see docs/deploy/staging.md).
+#
+# !!! EnvironmentFile CAVEAT (this exact gotcha bit crm) !!!
+# systemd's EnvironmentFile parses KEY=VALUE lines ONLY. It is NOT a shell: do
+# NOT prefix lines with `export`, do NOT use shell quoting/`$VAR` expansion. Write
+# /opt/payment/.env.stg as bare `KEY=value` pairs, e.g.:
+#     PAYMENT_HTTP_ADDR=:8080
+#     PAYMENT_C6_BASE_URL=https://...
+# A line like `export PAYMENT_HTTP_ADDR=:8080` makes the key literally
+# `export PAYMENT_HTTP_ADDR`, which the app never reads. See docs/deploy/staging.md.
+
+[Unit]
+Description=Payment receptor API (Sindireceita / lmhost)
+Documentation=https://github.com/pericles-luz/payment/blob/main/docs/deploy/staging.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Non-root, dedicated service account (least privilege). Created once by the
+# operator bootstrap; owns /opt/payment and the 0600 C6 cert/key files.
+User=payment
+Group=payment
+
+# KEY=VALUE only — see the caveat at the top of this file.
+EnvironmentFile=/opt/payment/.env.stg
+
+ExecStart=/opt/payment/bin/payment-api
+
+# Resilience: restart on crash with a small backoff; do not give up.
+Restart=on-failure
+RestartSec=2s
+
+# Graceful shutdown: the binary traps SIGTERM and drains within 10s.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# Defense-in-depth hardening (the binary needs only its working dir + the
+# SQLite DB + the C6 cert/key files, all under /opt/payment).
+WorkingDirectory=/opt/payment
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/payment
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
