@@ -63,3 +63,13 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: govulncheck
         run: govulncheck ./...
+
+  deploy-wrapper:
+    name: deploy wrapper (shellcheck + stdin transport guardrail)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck the deploy wrapper + its test
+        run: shellcheck --severity=warning deploy/scripts/payment-deploy.sh deploy/scripts/payment-deploy_test.sh
+      - name: payment-deploy.sh guardrail (stdin transport + allow-list)
+        run: bash deploy/scripts/payment-deploy_test.sh

@@ -109,33 +109,25 @@ jobs:
           known_hosts: ${{ secrets.PAYMENT_STG_HOST_KEY }}
           if_key_exists: fail
 
-      - name: Ship binary to staging path
-        # set +x so the host/user never leak into logs. The key is constrained on
-        # the VPS to the deploy wrapper (authorized_keys command=), but scp is the
-        # transport the wrapper's own rsync/install consumes: we upload to a fixed
-        # staging path, then invoke the locked `deploy` verb which atomically
-        # installs + restarts. StrictHostKeyChecking=yes enforces the pin.
+      - name: Ship + deploy (pipe binary over the locked deploy verb on stdin)
+        # set +x so the host/user never leak into logs. The deploy key is pinned on
+        # the VPS to the wrapper via authorized_keys command=, which intercepts
+        # EVERY connection on that key — there is NO scp/SFTP exemption under a
+        # forced command. So we do NOT scp: we open a single ssh session that runs
+        # the `deploy` verb and stream the binary into the wrapper on stdin. The
+        # wrapper reads stdin to its staging path, validates it (non-empty + ELF),
+        # then atomically installs + restarts. SSH_ORIGINAL_COMMAND is exactly
+        # `deploy`, so the strict allow-list still matches and the key can run
+        # ONLY the wrapper — no scp/SFTP surface. StrictHostKeyChecking=yes
+        # enforces the host-key pin.
         env:
           STG_HOST: ${{ secrets.PAYMENT_STG_HOST }}
           STG_USER: ${{ secrets.PAYMENT_STG_USER }}
         run: |
           set -euo pipefail
           { set +x; } 2>/dev/null
-          scp -o StrictHostKeyChecking=yes -o BatchMode=yes \
-            build/payment-api "${STG_USER}@${STG_HOST}:/opt/payment/incoming/payment-api"
-
-      - name: Invoke locked deploy verb (atomic install + systemd restart)
-        env:
-          STG_HOST: ${{ secrets.PAYMENT_STG_HOST }}
-          STG_USER: ${{ secrets.PAYMENT_STG_USER }}
-        run: |
-          set -euo pipefail
-          { set +x; } 2>/dev/null
-          # authorized_keys pins command=…/payment-deploy.sh, so SSH_ORIGINAL_COMMAND
-          # is what the wrapper validates. It accepts ONLY `deploy` — anything else
-          # is rejected non-zero. No arbitrary shell is reachable over this key.
           ssh -o StrictHostKeyChecking=yes -o BatchMode=yes \
-            "${STG_USER}@${STG_HOST}" deploy
+            "${STG_USER}@${STG_HOST}" deploy < build/payment-api
 
       - name: Smoke /healthz (HTTP 200 + deployed SHA, short retry budget)
         env:

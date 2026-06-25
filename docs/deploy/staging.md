@@ -106,11 +106,13 @@ printf 'command="/opt/payment/bin/payment-deploy.sh",no-pty,no-port-forwarding,n
 sudo -u payment chmod 0600 /home/payment/.ssh/authorized_keys
 ```
 
-> The `scp` upload step in the workflow lands the binary at
-> `/opt/payment/incoming/payment-api`; the forced command then validates and
-> installs it. (OpenSSH's internal scp transfer is permitted under the forced
-> command; interactive exec lands in the wrapper, which rejects everything but
-> `deploy`/`preflight`.)
+> A forced `command=` intercepts **every** connection on this key — there is **no
+> scp/SFTP exemption**. So the workflow does not scp: it opens one ssh session
+> running the `deploy` verb and streams the binary into the wrapper on **stdin**.
+> The wrapper reads stdin to `/opt/payment/incoming/payment-api`, validates it
+> (non-empty + ELF), then atomically installs + restarts. `SSH_ORIGINAL_COMMAND`
+> is exactly `deploy`, so the allow-list matches; the key can run **only** this
+> wrapper (anything else — including a literal `scp …` — is rejected non-zero).
 
 ### 5c. The PRIVATE key becomes the `PAYMENT_STG_SSH_KEY` GitHub secret
 

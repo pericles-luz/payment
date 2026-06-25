@@ -41,9 +41,11 @@ Espelhar o CD de binário do **go-mei-das**, adaptado ao payment:
    então o smoke **afirma o SHA que subiu**, não apenas que *algum* binário responde.
    Sem as flags o binário ainda builda e `/healthz` cai no fallback
    `runtime/debug.ReadBuildInfo()` (backward compatible).
-3. **SSH com chave travada** — `scp` do binário para um path de staging fixo, depois
-   o verbo `deploy` travado por `authorized_keys command=` invoca o wrapper VPS, que
-   instala atomicamente e dá `systemctl restart`. `known_hosts` **pinado** (sem TOFU).
+3. **SSH com chave travada** — o binário é **streamado por stdin** numa única
+   sessão `ssh … deploy` (sem `scp`: um `command=` intercepta toda conexão da chave,
+   não há exceção scp/SFTP). O verbo `deploy` travado por `authorized_keys command=`
+   invoca o wrapper VPS, que lê o stdin, valida (não-vazio + ELF), instala
+   atomicamente e dá `systemctl restart`. `known_hosts` **pinado** (sem TOFU).
 4. **`deploy/scripts/payment-deploy.sh`** — wrapper que valida
    `SSH_ORIGINAL_COMMAND`/argv e aceita **apenas** `deploy` (e `preflight`
    read-only); qualquer outra coisa sai não-zero. Install atômico (`rename(2)`) +
@@ -62,7 +64,7 @@ Espelhar o CD de binário do **go-mei-das**, adaptado ao payment:
   [SIN-65806](/SIN/issues/SIN-65806); **nunca** bytes inline em repo/thread (threat C1).
 - **Reversibilidade / blast radius:** no smoke-fail o job fica vermelho e o binário
   **anterior segue rodando** (rollback manual documentado no runbook nesta fase).
-- **Boring technology:** stdlib + systemd + rsync/scp; nenhuma infra nova.
+- **Boring technology:** stdlib + systemd + ssh (binário por stdin); nenhuma infra nova.
 
 ## Consequências
 
