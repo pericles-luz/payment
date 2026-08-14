@@ -27,6 +27,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
+	"github.com/ia-dev-sindireceita/payment/internal/platform/stgseed"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 	"github.com/ia-dev-sindireceita/payment/migrations"
 )
@@ -179,6 +180,27 @@ func run() error {
 		Clock:           system.Clock{},
 		IDs:             system.IDProvider{},
 	})
+
+	// Staging-stub demo seed (SIN-69226): triple-gated (PAYMENT_STG_SEED set AND
+	// stub bank AND empty store) so it is inert in every real deployment and
+	// idempotent across restarts. It reuses the console use-cases and the ledger
+	// port — no SQL here, no migration. A gate miss is a silent no-op; only an
+	// underlying use-case failure aborts startup (a broken seed on a stub is a
+	// misconfiguration worth surfacing loudly).
+	if _, err := stgseed.Apply(ctx, stgseed.Config{
+		Enabled:  cfg.STGSeed,
+		StubMode: cfg.C6.BaseURL == "",
+	}, stgseed.Deps{
+		Console:  console,
+		Accounts: store,
+		Tenants:  store,
+		Ledger:   store,
+		Clock:    system.Clock{},
+		IDs:      system.IDProvider{},
+	}); err != nil {
+		return err
+	}
+
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:     app.NewChargeService(deps),
 		Pix:         app.NewPixService(deps),

@@ -71,6 +71,14 @@ type Config struct {
 	// per-environment and resolved from config (never hard-coded). The per-tenant
 	// OAuth2 credentials live in BankCreds / the secret store, not here.
 	C6 C6Config
+	// STGSeed opts into the staging-stub demo seed (SIN-69226): when set AND the
+	// bank adapter is the stub (C6.BaseURL empty) AND the store is empty, boot
+	// populates a small synthetic two-level-tenancy dataset (Conta "Verz" + two
+	// empresas-clientes + a little consumption + one Fatura) so the board can
+	// navigate the admin console instead of empty tables. Defaults to false; the
+	// seed itself re-checks stub mode and store-emptiness, so this flag alone can
+	// never touch a real environment. Set PAYMENT_STG_SEED truthy to enable.
+	STGSeed bool
 }
 
 // C6Config configures the C6 bank adapter's HTTP/OAuth2 transport. URLs are
@@ -135,6 +143,7 @@ func FromEnv() Config {
 			RateLimitBurst: getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
 			MaxRetries:     getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
 		},
+		STGSeed: getenvBool("PAYMENT_STG_SEED", false),
 	}
 }
 
