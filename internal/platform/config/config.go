@@ -71,6 +71,19 @@ type Config struct {
 	// per-environment and resolved from config (never hard-coded). The per-tenant
 	// OAuth2 credentials live in BankCreds / the secret store, not here.
 	C6 C6Config
+	// ConsoleUsername is the single fixed operator login for the self-contained
+	// console login (ADR-0001 Opção B, SIN-69265). It is config (not hard-coded in
+	// the domain) so a deployment can rename the operator without a code change.
+	// Defaults to "pericles.luz" (board direction). Set PAYMENT_CONSOLE_USERNAME.
+	ConsoleUsername string
+	// ConsoleBootstrapToken gates first-access provisioning of the console
+	// credential (POST /console/bootstrap): the operator must present this exact
+	// token AND no credential may be provisioned yet. It is a SECRET delivered to
+	// the operator out-of-band at deploy time — never logged, never in a URL.
+	// Empty (the default) DISABLES bootstrap entirely (failure-closed): with no
+	// token there is no way to provision a credential, so the route can never become
+	// an anonymous land-grab. Set PAYMENT_CONSOLE_BOOTSTRAP_TOKEN.
+	ConsoleBootstrapToken string
 	// STGSeed opts into the staging-stub demo seed (SIN-69226): when set AND the
 	// bank adapter is the stub (C6.BaseURL empty) AND the store is empty, boot
 	// populates a small synthetic two-level-tenancy dataset (Conta "Verz" + two
@@ -120,17 +133,19 @@ func FromEnv() Config {
 	bankCreds := mergeCreditorKeys(parseBankCreds(os.Getenv("PAYMENT_BANK_CREDS"), logger), os.Getenv("PAYMENT_BANK_CREDITOR_KEYS"), logger)
 	logLoadedBankCreds(bankCreds, logger)
 	return Config{
-		HTTPAddr:            getenv("PAYMENT_HTTP_ADDR", ":8080"),
-		DBPath:              getenv("PAYMENT_DB_PATH", "payment.db"),
-		TenantTokens:        parseKV(os.Getenv("PAYMENT_TENANT_TOKENS")),
-		AdminTokens:         splitNonEmpty(os.Getenv("PAYMENT_ADMIN_TOKENS")),
-		OperatorTokens:      splitNonEmpty(os.Getenv("PAYMENT_OPERATOR_TOKENS")),
-		WebhookRefs:         parseKV(os.Getenv("PAYMENT_WEBHOOK_REFS")),
-		BankCreds:           bankCreds,
-		RabbitURL:           os.Getenv("PAYMENT_RABBIT_URL"),
-		SecureCookies:       getenvBool("PAYMENT_SECURE_COOKIES", true),
-		TrustedProxyHops:    getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
-		SelfServeCredIntake: getenvBool("PAYMENT_SELFSERVE_CRED_INTAKE", false),
+		HTTPAddr:              getenv("PAYMENT_HTTP_ADDR", ":8080"),
+		DBPath:                getenv("PAYMENT_DB_PATH", "payment.db"),
+		TenantTokens:          parseKV(os.Getenv("PAYMENT_TENANT_TOKENS")),
+		AdminTokens:           splitNonEmpty(os.Getenv("PAYMENT_ADMIN_TOKENS")),
+		OperatorTokens:        splitNonEmpty(os.Getenv("PAYMENT_OPERATOR_TOKENS")),
+		WebhookRefs:           parseKV(os.Getenv("PAYMENT_WEBHOOK_REFS")),
+		BankCreds:             bankCreds,
+		RabbitURL:             os.Getenv("PAYMENT_RABBIT_URL"),
+		SecureCookies:         getenvBool("PAYMENT_SECURE_COOKIES", true),
+		TrustedProxyHops:      getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
+		SelfServeCredIntake:   getenvBool("PAYMENT_SELFSERVE_CRED_INTAKE", false),
+		ConsoleUsername:       getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
+		ConsoleBootstrapToken: os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
 		C6: C6Config{
 			BaseURL:        os.Getenv("PAYMENT_C6_BASE_URL"),
 			TokenURL:       os.Getenv("PAYMENT_C6_TOKEN_URL"),

@@ -7,10 +7,21 @@
   (Aceito — **Opção A**).
 - **Lentes:** secure-by-default, least privilege, defense-in-depth.
 
-> ⚠️ **Bloqueio de go-live.** As três premissas abaixo são **pré-requisito
-> não-negociável** para colocar o console em produção. A Opção A do ADR-0001 só é
-> segura sob elas. Se qualquer uma não puder ser garantida pelo edge, **o go-live
-> não acontece** até ser resolvida ou até o ADR ser revisto (ver §4).
+> 🔀 **PIVOT (2026-08-14, direção do board — SIN-69265):** o transporte de auth do
+> browser passou da **Opção A** (edge injeta `Authorization: Bearer`) para a
+> **Opção B** — **login self-contained na aplicação** (usuário + senha + TOTP 2FA,
+> cookie de sessão de primeira parte). Ver [`../security/adr-0010-console-self-contained-login.md`](../security/adr-0010-console-self-contained-login.md),
+> que **supersede** a Opção A do ADR-0001. **O que muda para o operador de infra:**
+> o edge **não precisa mais injetar o bearer** nem autenticar a sessão — o app faz
+> o login. As seções da Opção A abaixo (§0–§5, §8) ficam como **fallback histórico**;
+> a operação vigente está na **§9**. **O que NÃO muda:** TLS termina na borda e
+> **nunca** se loga segredo (senha, token de bootstrap, cookie de sessão, path do
+> webhook C6). O plano JSON `/admin` (Bearer) segue intacto.
+
+> ⚠️ **Bloqueio de go-live (Opção A — histórico).** As três premissas abaixo eram
+> **pré-requisito não-negociável** da Opção A. Sob a Opção B (§9) elas deixam de
+> bloquear (a fronteira de confiança volta para a aplicação), mas o app continua
+> só devendo ser servido sobre TLS e nunca em claro.
 
 ## 0. Por que isto importa
 
@@ -235,9 +246,216 @@ isso habilita rotação sem downtime.
 - Se o tenant continua ativo, cunhar+registrar um ref novo e atualizar o C6
   (rotação acima). O ref nunca é logado em nenhuma etapa.
 
+## 8. Configuração de referência — nginx para `payment.lmhost.com.br` (Opção A, pronta para aplicar)
+
+> **Objetivo:** tornar `/console` acessível pelo browser ao board/Verz **sem violar
+> o ADR-0001**. Esta é a configuração mínima que satisfaz as premissas A, B, C e D
+> acima. Origem: [SIN-69261](/SIN/issues/SIN-69261) (o deploy em `payment.lmhost.com.br`
+> subiu sem o proxy de borda).
+>
+> **Quem aplica:** dono do host/deploy (Pericles, ver [SIN-69225](/SIN/issues/SIN-69225)).
+> Ação de operador — o app **não muda**. O CTO fornece esta config; o operador a
+> aplica, provisiona o htpasswd + `PAYMENT_ADMIN_TOKENS`, e entrega credenciais ao
+> board por canal seguro.
+
+### 8.1 Modelo desta config
+
+- **Borda autentica o operador** por **HTTP Basic Auth** (diálogo nativo do browser
+  — satisfaz Premissa C: identidade estabelecida no edge antes de qualquer injeção).
+- **Injeção do bearer é consequência da auth** — um `map $remote_user → token`
+  mapeia cada operador Basic-Auth para um admin-token de `PAYMENT_ADMIN_TOKENS`.
+  Usuário desconhecido → `$admin_token` vazio → `403` no edge, **nunca** passa ao
+  upstream (Premissa C, deny-by-default).
+- **O proxy SEMPRE sobrescreve `Authorization`** no salto upstream — o cliente nunca
+  controla o header que chega ao app; o `Authorization: Basic` consumido pelo
+  `auth_basic` é substituído pelo `Bearer` (Premissa B: token só existe no salto
+  edge→app, nunca ecoa ao browser).
+- **App só escuta em loopback** (`PAYMENT_HTTP_ADDR=127.0.0.1:8080`) — inalcançável
+  fora do proxy (Premissa A).
+
+### 8.2 Provisionar credenciais (operador, canal seguro)
+
+```sh
+# 1. Cunhar o admin-token (32 bytes CSPRNG, base64url) — é o valor de PAYMENT_ADMIN_TOKENS
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+#    → exporte no ambiente do app: PAYMENT_ADMIN_TOKENS=<token-gerado>
+#    (múltiplos tokens = CSV; ver splitNonEmpty em config.go)
+
+# 2. Criar o htpasswd do operador de borda (uma senha por pessoa do board)
+#    -B = bcrypt. NUNCA versionar este arquivo.
+htpasswd -B -c /etc/nginx/payment.htpasswd board
+#    (repetir sem -c para adicionar mais operadores: htpasswd -B /etc/nginx/payment.htpasswd verz)
+chmod 640 /etc/nginx/payment.htpasswd && chown root:nginx /etc/nginx/payment.htpasswd
+```
+
+O mapa `operador→token` fica num arquivo separado com permissão restrita, **fora do
+git**:
+
+```nginx
+# /etc/nginx/conf.d/payment-admin-token.map   (chmod 600, root:root — contém segredo)
+map $remote_user $admin_token {
+    default   "";                 # operador não mapeado → 403 (deny-by-default)
+    "board"   "<PAYMENT_ADMIN_TOKEN>";   # o MESMO valor que está em PAYMENT_ADMIN_TOKENS
+    "verz"    "<PAYMENT_ADMIN_TOKEN>";
+}
+```
+
+### 8.3 Server block
+
+```nginx
+# Mascaramento do path do webhook C6 no access log (Premissa D, §6)
+map $uri $payment_safe_uri {
+    default          $request_uri;
+    ~^/webhooks/c6/  "/webhooks/c6/***";
+}
+log_format payment_masked
+    '$remote_addr [$time_local] "$request_method $payment_safe_uri $server_protocol" '
+    '$status $body_bytes_sent "$http_user_agent"';
+# NB: nunca usar $request/$request_uri crus aqui; $http_authorization NÃO é logado.
+
+include /etc/nginx/conf.d/payment-admin-token.map;
+
+server {
+    listen 443 ssl http2;
+    server_name payment.lmhost.com.br;
+
+    ssl_certificate     /etc/letsencrypt/live/payment.lmhost.com.br/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/payment.lmhost.com.br/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/payment.access.log payment_masked;
+
+    # ---- Plano admin / console: Basic Auth na borda + injeção do bearer ----
+    location / {
+        auth_basic           "Payment Console — Sindireceita";
+        auth_basic_user_file /etc/nginx/payment.htpasswd;
+
+        # Consequência da auth: operador desconhecido não tem token → 403, não sobe.
+        if ($admin_token = "") { return 403; }
+
+        # SEMPRE sobrescreve Authorization no salto upstream (client nunca controla).
+        proxy_set_header Authorization "Bearer $admin_token";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;   # TLS termina aqui; app lê p/ Secure cookies
+
+        proxy_pass http://127.0.0.1:8080;   # app em loopback — Premissa A
+    }
+
+    # ---- Webhook C6: SEM Basic Auth (autentica pelo tenantRef no path), path mascarado ----
+    location /webhooks/c6/ {
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        # NÃO injetar Authorization aqui; NÃO herdar auth_basic.
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+
+# Redirect 80→443 (nunca servir o console em claro)
+server {
+    listen 80;
+    server_name payment.lmhost.com.br;
+    return 301 https://$host$request_uri;
+}
+```
+
+### 8.4 Bind do app em loopback (Premissa A — obrigatório)
+
+No ambiente do processo da app em `lmhost`:
+
+```
+PAYMENT_HTTP_ADDR=127.0.0.1:8080
+```
+
+Default do binário é `:8080` (todas as interfaces) — **isso é inseguro atrás deste
+modelo**: permitiria bater direto no app e injetar o próprio `Authorization: Bearer`,
+contornando a Basic Auth (OWASP A01). Fixar em loopback (ou rede privada + firewall
+que só admite o nginx) é pré-requisito. Verificar com o checklist da Premissa A (§1).
+
+### 8.5 Verificação pós-apply (rodar antes de liberar ao board)
+
+- [ ] `curl -k https://payment.lmhost.com.br/console` **sem** `-u` → `401` com
+      `WWW-Authenticate: Basic` (diálogo do browser).
+- [ ] `curl -k -u board:<senha> https://payment.lmhost.com.br/console` → `200`, HTML
+      do console.
+- [ ] DevTools → Network numa navegação real: nenhum header/corpo de resposta contém
+      o admin-token (Premissa B).
+- [ ] De fora do host: `curl http://<ip-lmhost>:8080/console` → connection refused /
+      timeout (Premissa A; app em loopback).
+- [ ] `grep -E 'Bearer |PAYMENT_ADMIN_TOKEN' /var/log/nginx/payment.access.log` →
+      vazio (Authorization não é logado).
+- [ ] `grep -E '/webhooks/c6/[A-Za-z0-9_-]{43}' /var/log/nginx/payment.access.log` →
+      vazio (Premissa D; path mascarado).
+
+### 8.6 Rotação do admin-token
+
+O `map` operador→token e `PAYMENT_ADMIN_TOKENS` compartilham o valor. Para rotacionar:
+cunhar token novo, adicioná-lo a `PAYMENT_ADMIN_TOKENS` (CSV, lado a lado), trocar o
+valor no `map`, `nginx -s reload` + restart do app, confirmar acesso, então remover o
+token antigo do CSV e redeployar. Zero downtime pela janela de overlap.
+
+## 9. Opção B — login self-contained (VIGENTE, SIN-69265)
+
+A aplicação agora tem **login próprio**: `/console/login` (usuário + senha + TOTP
+2FA) emite um **cookie de sessão de primeira parte** (`console_session`, HttpOnly,
+`Secure` dirigido por `PAYMENT_SECURE_COOKIES`, `SameSite=Lax`, escopo `/console`).
+O middleware do console aceita **OU** o Bearer admin existente (retrocompat)
+**OU** um cookie de sessão válido. Deny-by-default; só `/console/login`,
+`/console/bootstrap` e os estáticos são públicos. Toda mutação continua sob CSRF
+double-submit (agora *load-bearing*) e o plano `/admin` JSON segue Bearer-only.
+
+### 9.1 O que o edge precisa fazer (mínimo)
+
+- Terminar TLS e encaminhar para o app no loopback (§8.4 continua válido).
+- **NÃO** precisa mais de Basic Auth, `map` operador→token, nem injeção de
+  `Authorization` (aquilo era da Opção A). Um `server` que só faz TLS + `proxy_pass`
+  para `127.0.0.1:8080` basta. Basic Auth de borda pode ser mantido como camada
+  extra, mas não é mais requisito.
+- Continuar **mascarando o path do webhook C6** no access log (§6 / Premissa D) e
+  **nunca** logar `Authorization`, `Cookie` nem corpo de POST de `/console/login`
+  ou `/console/bootstrap` (carregam senha / token de bootstrap).
+
+### 9.2 Flags de configuração (app)
+
+| Env | Efeito | Default |
+|-----|--------|---------|
+| `PAYMENT_CONSOLE_USERNAME` | login fixo do operador | `pericles.luz` |
+| `PAYMENT_CONSOLE_BOOTSTRAP_TOKEN` | **segredo** que libera o provisionamento de 1º acesso; **vazio ⇒ bootstrap DESABILITADO** (failure-closed) | `` (vazio) |
+| `PAYMENT_SECURE_COOKIES` | `Secure` no cookie de sessão e no de CSRF | `true` |
+
+### 9.3 Primeiro acesso (bootstrap) — provisionamento
+
+1. No deploy, o operador de infra gera um token forte (32 bytes CSPRNG, base64url)
+   e o exporta em `PAYMENT_CONSOLE_BOOTSTRAP_TOKEN` no ambiente do app. **Entregue
+   esse token ao Pericles por canal seguro fora de banda** (gerenciador de senhas /
+   mensagem efêmera) — **nunca** em comentário de PR, issue pública, URL ou log.
+2. Pericles abre `https://payment.lmhost.com.br/console/bootstrap`, informa o token,
+   e a aplicação exibe **UMA vez**: a senha gerada + o segredo TOTP (`otpauth://` para
+   QR). Ele cadastra o TOTP no autenticador (Google Authenticator / Authy / 1Password)
+   e guarda a senha no gerenciador. A tela não reexibe esses dados.
+3. Feito o set, o bootstrap **trava** (uso único): novas tentativas retornam 409.
+   Para desabilitar de vez, remova `PAYMENT_CONSOLE_BOOTSTRAP_TOKEN` do ambiente.
+
+> **Trade-off de reinício (1ª entrega):** o store de credencial/sessão é
+> **in-memory** (atrás de porta hexagonal). Um restart do app **derruba as sessões
+> ativas** (operadores relogam) **e a credencial provisionada** (é preciso repetir o
+> bootstrap com o token). O token permanece no ambiente, então o re-bootstrap é
+> imediato, mas é operacionalmente ruidoso. O adaptador durável (sqlite, cripto em
+> repouso) atrás das MESMAS portas é o follow-up planejado — a troca é só fiação.
+
+### 9.4 Rotação / revogação
+
+- **Senha/TOTP do operador:** re-provisionar exige derrubar a credencial atual.
+  Enquanto não há tela de troca de senha, a rotação é: remover a credencial
+  (restart limpa o in-memory) e re-bootstrap. A tela de rotação é follow-up.
+- **Sessão:** `POST /console/logout` revoga a sessão corrente; um restart revoga
+  todas. A expiração é absoluta (12h) + idle (30min), rotação de id a cada login.
+
 ## Referências
 
-- ADR-0001 — [`../security/adr-0001-console-browser-auth-transport.md`](../security/adr-0001-console-browser-auth-transport.md)
+- ADR-0010 (VIGENTE) — [`../security/adr-0010-console-self-contained-login.md`](../security/adr-0010-console-self-contained-login.md)
+- ADR-0001 (histórico, superseded) — [`../security/adr-0001-console-browser-auth-transport.md`](../security/adr-0001-console-browser-auth-transport.md)
 - Baseline de segurança — [`../security/secure-baseline.md`](../security/secure-baseline.md)
   (segredos, "no secrets in URLs", logging)
 - Cookie `Secure` proxy-aware / TLS termina no proxy — [SIN-64731](/SIN/issues/SIN-64731)

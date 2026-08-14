@@ -1,6 +1,13 @@
 # ADR-0001 — Transporte de autenticação do console HTML no browser
 
-- **Status:** Aceito — ratificado pelo CTO em 2026-06-13 (L2 de [SIN-64741](/SIN/issues/SIN-64741)). Decisão: **Opção A**.
+> ⚠️ **SUPERSEDED por [ADR-0010](adr-0010-console-self-contained-login.md) (2026-08-14, SIN-69265).**
+> O board reverteu a decisão: adotou-se a **Opção B** (login self-contained na
+> aplicação — usuário + senha + TOTP + cookie de sessão) no lugar da Opção A
+> (proxy de borda injeta `Authorization: Bearer`). Este ADR fica como **registro
+> histórico**; os três requisitos de CSRF que ele antecipava para a Opção B estão
+> **atendidos** no ADR-0010. A Opção A permanece como fallback documentado.
+
+- **Status:** Superseded por ADR-0010 (Opção B) em 2026-08-14 — originalmente Aceito (Opção A), ratificado pelo CTO em 2026-06-13 (L2 de [SIN-64741](/SIN/issues/SIN-64741)).
 - **Contexto da review:** follow-up de defense-in-depth da review de segurança do PR #6 ([SIN-64740](/SIN/issues/SIN-64740)). Não bloqueou merge; aceite de risco do estado atual já registrado na review.
 - **Autor:** Coder. **Decisor:** CTO.
 

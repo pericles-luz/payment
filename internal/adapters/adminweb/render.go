@@ -46,10 +46,14 @@ var screenFiles = map[string]string{
 }
 
 // Renderer holds the parsed template sets. base carries the layout and all
-// shared partials; pages maps a screen name to its cloned, body-bearing set.
+// shared partials; pages maps a screen name to its cloned, body-bearing set; auth
+// carries the standalone, layout-free login/bootstrap pages (SIN-69265) — they
+// render for UNauthenticated callers, so they deliberately do not use the admin
+// shell (no nav, no operator label).
 type Renderer struct {
 	base  *template.Template
 	pages map[string]*template.Template
+	auth  *template.Template
 }
 
 // New parses the embedded templates, returning an error if any fails to parse so
@@ -70,7 +74,13 @@ func New() (*Renderer, error) {
 		}
 		pages[name] = clone
 	}
-	return &Renderer{base: base, pages: pages}, nil
+	// Standalone auth pages (login + bootstrap): parsed as their own set so they can
+	// render a full page without the authenticated admin shell.
+	auth, err := template.New("auth").ParseFS(templateFS, "templates/auth_login.html", "templates/auth_bootstrap.html")
+	if err != nil {
+		return nil, fmt.Errorf("parse auth templates: %w", err)
+	}
+	return &Renderer{base: base, pages: pages, auth: auth}, nil
 }
 
 // isHX reports whether the request came from htmx (a partial swap is expected).

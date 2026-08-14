@@ -10,15 +10,15 @@ import (
 
 // CSRF protection for the browser-served HTMX admin console (/console).
 //
-// Auth transport (ADR-0001, docs/security): the console today authenticates only
-// via the Authorization: Bearer header — injected at the reverse proxy from an
-// edge-authenticated session — with no first-party session cookie. Because the
-// bearer header is not an ambient credential, a cross-origin attacker cannot
-// forge it, so this double-submit guard is currently belt-and-suspenders
-// (defense-in-depth) rather than load-bearing. It is kept wired so that if the
-// service later adopts a session cookie (ADR-0001 Option B), the model is already
-// in place and becomes load-bearing without a redesign. The JSON tenant/admin API
-// likewise authenticates by Bearer token and is not CSRF-exposed.
+// Auth transport (ADR-0010, supersedes ADR-0001 Opção A — SIN-69265): the console
+// now supports a first-party session cookie (self-contained login: username +
+// password + TOTP). The session cookie IS an ambient credential the browser sends
+// automatically, so this double-submit guard is no longer belt-and-suspenders — it
+// is LOAD-BEARING: every console mutation (login, logout, bootstrap and all admin
+// writes) must pass it, and the session + CSRF cookies share the Secure policy from
+// cfg.SecureCookies (the three ADR-0001 Opção B requirements). The console middleware
+// also still accepts the admin Bearer (retrocompat / the JSON /admin plane), which
+// is not an ambient credential and is not CSRF-exposed.
 //
 // Strategy: double-submit token. On a safe request the middleware mints a random
 // token, sets it in a cookie and exposes the same value via CSRFToken(ctx) so a

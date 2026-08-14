@@ -16,15 +16,22 @@ import (
 // driving adapter. It is constructed once at startup and is safe for concurrent
 // use.
 type Server struct {
-	charges     *app.ChargeService
-	pix         *app.PixService
-	pixCobV     *app.PixDueChargeService
-	checkout    *app.CheckoutService
-	boleto      *app.BoletoService
-	dda         *app.DDAService
-	statement   *app.StatementService
-	admin       *app.AdminService
-	console     *app.ConsoleService
+	charges   *app.ChargeService
+	pix       *app.PixService
+	pixCobV   *app.PixDueChargeService
+	checkout  *app.CheckoutService
+	boleto    *app.BoletoService
+	dda       *app.DDAService
+	statement *app.StatementService
+	admin     *app.AdminService
+	console   *app.ConsoleService
+	// consoleAuth backs the self-contained console login (username + password +
+	// TOTP, ADR-0001 Opção B / SIN-69265): first-access bootstrap, the login/logout
+	// handlers, and the session validation the console auth middleware calls. When
+	// nil the console falls back to Bearer-only auth (retrocompat): the login routes
+	// still register but every login fails closed and only a valid admin Bearer opens
+	// /console.
+	consoleAuth *app.ConsoleAuthService
 	ui          *adminweb.Renderer
 	webhooks    *app.WebhookService
 	tenantAuth  TenantPrincipalAuthenticator
@@ -78,9 +85,14 @@ type Config struct {
 	// Statement backs the account-statement tenant route (GET /v1/statement, roteiro
 	// grupo 13). It may be nil for deployments/tests that do not serve the extrato
 	// surface — the route is then registered but never exercised.
-	Statement   *app.StatementService
-	Admin       *app.AdminService
-	Console     *app.ConsoleService
+	Statement *app.StatementService
+	Admin     *app.AdminService
+	Console   *app.ConsoleService
+	// ConsoleAuth wires the self-contained console login (SIN-69265). Optional: when
+	// nil the console stays Bearer-only (the login form renders but always fails, and
+	// only a valid admin Bearer opens /console) — used by tests and by deployments
+	// that keep the proxy-injected-bearer transport (ADR-0001 Opção A).
+	ConsoleAuth *app.ConsoleAuthService
 	UI          *adminweb.Renderer
 	Webhooks    *app.WebhookService
 	TenantAuth  TenantPrincipalAuthenticator
@@ -131,6 +143,7 @@ func NewServer(c Config) *Server {
 		statement:           c.Statement,
 		admin:               c.Admin,
 		console:             c.Console,
+		consoleAuth:         c.ConsoleAuth,
 		ui:                  c.UI,
 		webhooks:            c.Webhooks,
 		tenantAuth:          c.TenantAuth,
@@ -188,6 +201,12 @@ func (s *Server) Router() http.Handler {
 	// its own limiter with the same budget (SIN-64741 L1). A separate bucket keeps a
 	// console burst from throttling the JSON admin API and vice versa.
 	consoleLimiter := newRateLimiter(20, 10, nil)
+	// The public console login/bootstrap surface (SIN-69265) is unauthenticated, so
+	// it gets its own tight per-IP limiter as the first-line anti-brute-force
+	// control (the per-username lockout in ConsoleAuthService is the second). A small
+	// burst tolerates the GET-then-POST of one honest login while throttling
+	// credential-stuffing from a single origin.
+	loginLimiter := newRateLimiter(10, 1, nil)
 	webhookLimiter := newRateLimiter(50, 25, nil)
 
 	// Public health check (the only unauthenticated route). It also surfaces the
@@ -315,15 +334,42 @@ func (s *Server) Router() http.Handler {
 	// RoleOperator+RoleAdmin; mutations require the full RoleAdmin (least privilege).
 	r.Route("/console", func(r chi.Router) {
 		r.Get("/static/*", s.consoleServeStatic)
+
+		// Public self-contained login/bootstrap surface (ADR-0001 Opção B,
+		// SIN-69265) — the ONLY authenticated-console exception to deny-by-default.
+		// No admin auth (there is no session yet); still hardened: strict security
+		// headers, a tight per-IP limiter (anti-brute-force) and CSRF double-submit
+		// under the SAME Secure-cookie policy as the session cookie so login itself is
+		// not CSRF-forgeable. The double-submit token is seeded on the GET form render
+		// and verified on the POST.
 		r.Group(func(r chi.Router) {
 			r.Use(securityHeaders)
-			r.Use(adminAuthMiddleware(s.adminAuth))
+			r.Use(loginLimiter.middleware(func(req *http.Request) string { return "ip:" + clientIP(req) }))
+			r.Use(s.csrf.Protect)
+			r.Get("/login", s.consoleLoginForm)
+			r.Post("/login", s.consoleLogin)
+			r.Get("/bootstrap", s.consoleBootstrapForm)
+			r.Post("/bootstrap", s.consoleBootstrap)
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(securityHeaders)
+			// Accept EITHER the existing admin Bearer (retrocompat, keeps ADR-0001
+			// Opção A working) OR a valid first-party session cookie (Opção B).
+			// Deny-by-default: neither ⇒ redirect a browser navigation to
+			// /console/login, 401 otherwise. The single operator is a full admin
+			// (board direction).
+			r.Use(s.consoleAuthMiddleware)
 			// Defense-in-depth: throttle per authenticated admin identity (IP fallback),
 			// mirroring the JSON admin plane. Sits after auth so unauthenticated requests
 			// are rejected cheaply, and before CSRF so a token-flood is bounded regardless
 			// of whether the double-submit token is present (SIN-64741 L1).
-			r.Use(consoleLimiter.middleware(adminTokenKey))
-			r.Use(CSRFProtect)
+			r.Use(consoleLimiter.middleware(consoleRateKey))
+			r.Use(s.csrf.Protect)
+
+			// Logout revokes the current session and clears the cookie (CSRF-guarded);
+			// it needs a valid session, so it lives inside the authenticated group.
+			r.Post("/logout", s.consoleLogout)
 
 			r.Group(func(r chi.Router) {
 				r.Use(requireRole(RoleAdmin, RoleOperator))

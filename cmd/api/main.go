@@ -20,6 +20,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/adminweb"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank/c6"
+	consoleauthstore "github.com/ia-dev-sindireceita/payment/internal/adapters/consoleauth"
 	httpadapter "github.com/ia-dev-sindireceita/payment/internal/adapters/http"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/messaging/inmemory"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
@@ -181,6 +182,20 @@ func run() error {
 		IDs:             system.IDProvider{},
 	})
 
+	// Self-contained console login (ADR-0001 Opção B, SIN-69265): username +
+	// password + TOTP over a first-party session cookie, so /console is reachable by
+	// a browser without the edge injecting a bearer. The store is in-memory behind
+	// the app ports — a restart drops sessions AND the provisioned credential (a
+	// documented trade-off; the durable sqlite-backed adapter is the follow-up).
+	// Bootstrap is failure-closed: with PAYMENT_CONSOLE_BOOTSTRAP_TOKEN unset,
+	// first-access provisioning is disabled entirely, so it can never be an
+	// anonymous land-grab. The existing admin Bearer transport keeps working.
+	consoleAuthStore := consoleauthstore.NewMemStore()
+	consoleAuth := app.NewConsoleAuthService(consoleAuthStore, consoleAuthStore, consoleAuthStore, system.Clock{}, app.ConsoleAuthConfig{
+		Username:       cfg.ConsoleUsername,
+		BootstrapToken: cfg.ConsoleBootstrapToken,
+	})
+
 	// Staging-stub demo seed (SIN-69226): triple-gated (PAYMENT_STG_SEED set AND
 	// stub bank AND empty store) so it is inert in every real deployment and
 	// idempotent across restarts. It reuses the console use-cases and the ledger
@@ -211,6 +226,7 @@ func run() error {
 		Statement:   app.NewStatementService(deps),
 		Admin:       app.NewAdminService(deps),
 		Console:     console,
+		ConsoleAuth: consoleAuth,
 		UI:          ui,
 		Webhooks:    app.NewWebhookService(deps),
 		TenantAuth:  auth,
