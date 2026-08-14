@@ -8,6 +8,17 @@ on:
 permissions:
   contents: read
 
+# Pin the Go toolchain deterministically to go1.26.6 across every job, independent
+# of the actions/setup-go manifest (SIN-69227). setup-go's `1.26.x` selector may
+# resolve to an older patch (e.g. 1.26.5) while the manifest lags a fresh go.dev
+# release; setting GOTOOLCHAIN forces the `go` command to re-exec into exactly
+# go1.26.6, so build/vet/test, staticcheck, and — critically — govulncheck all
+# analyze the go1.26.6 stdlib (patched for GO-2026-6218/6091/6090). This is the
+# authoritative pin; `go-version: 1.26.x` remains only as the setup-go bootstrap.
+# Reversible: drop this block to fall back to whatever `1.26.x` resolves to.
+env:
+  GOTOOLCHAIN: go1.26.6
+
 jobs:
   build-test:
     name: build, vet, test, coverage

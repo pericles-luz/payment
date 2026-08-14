@@ -141,3 +141,13 @@ func TestSettlementMismatchActionIsValid(t *testing.T) {
 		t.Fatal("unknown action must be rejected (deny-by-default)")
 	}
 }
+
+// TestInvoiceGeneratedActionIsValid asserts invoice.generated (SIN-69121) is in
+// the deny-by-default action vocabulary so a Fatura-generation audit entry
+// validates.
+func TestInvoiceGeneratedActionIsValid(t *testing.T) {
+	t.Parallel()
+	if _, err := audit.NewEntry("id", "op", audit.ActionInvoiceGenerated, "ten", time.Now()); err != nil {
+		t.Fatalf("invoice.generated should be a valid action: %v", err)
+	}
+}

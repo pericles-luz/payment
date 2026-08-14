@@ -4,7 +4,7 @@
 
 <nav class="tabs" aria-label="Seções do tenant">
   <a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">Visão geral</a>
-  <a href="/console/tenants/{{.Tenant.ID}}/credentials" hx-get="/console/tenants/{{.Tenant.ID}}/credentials" hx-target="#main" hx-push-url="true">Credenciais</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/banks" hx-get="/console/tenants/{{.Tenant.ID}}/banks" hx-target="#main" hx-push-url="true">Bancos</a>
   <a href="/console/tenants/{{.Tenant.ID}}/pricing" aria-current="page">Tarifação</a>
   <a href="/console/tenants/{{.Tenant.ID}}/consumption" hx-get="/console/tenants/{{.Tenant.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo</a>
 </nav>

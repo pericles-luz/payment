@@ -1,0 +1,48 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">‹ {{.Tenant.Name}}</a> / Bancos</p>
+<div class="topbar"><h1>Bancos</h1></div>
+
+<nav class="tabs" aria-label="Seções do tenant">
+  <a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">Visão geral</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/banks" aria-current="page">Bancos</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/pricing" hx-get="/console/tenants/{{.Tenant.ID}}/pricing" hx-target="#main" hx-push-url="true">Tarifação</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/consumption" hx-get="/console/tenants/{{.Tenant.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo</a>
+</nav>
+
+<div class="card">
+  <div class="topbar"><h2>Bancos do tenant</h2></div>
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr><th>Banco</th><th>Apelido</th><th>Credencial</th><th>Certificado</th><th>Status</th></tr></thead>
+      <tbody id="bank-rows">{{template "bank_rows" .}}</tbody>
+    </table>
+  </div>
+</div>
+
+<form class="form card" method="post" action="/console/tenants/{{.Tenant.ID}}/banks"
+      hx-post="/console/tenants/{{.Tenant.ID}}/banks" hx-target="#main" hx-swap="innerHTML">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <h2>Adicionar banco</h2>
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+  {{if .CanAdd}}
+  <div class="field{{if .Errors.bank_type}} has-error{{end}}">
+    <label for="f-bank">Banco</label>
+    <select id="f-bank" name="bank_type" required
+            {{if .Errors.bank_type}}aria-invalid="true" aria-describedby="e-bank"{{end}}>
+      {{range .Addable}}<option value="{{.Slug}}">{{.DisplayName}}</option>{{end}}
+    </select>
+    {{if .Errors.bank_type}}<span class="error" id="e-bank" role="alert">{{.Errors.bank_type}}</span>{{end}}
+  </div>
+  <div class="field">
+    <label for="f-alias">Apelido</label>
+    <input id="f-alias" name="alias" value="{{.Form.alias}}" maxlength="60" autocomplete="off" aria-describedby="h-alias">
+    <span class="help" id="h-alias">Rótulo opcional de exibição. Nesta versão há uma credencial por banco.</span>
+  </div>
+  <div class="form-actions">
+    <button class="btn btn--primary" type="submit">+ Adicionar banco</button>
+  </div>
+  {{else}}
+  <p class="muted">Todos os bancos suportados já constam na lista. Novos bancos ficam disponíveis aqui conforme novos adaptadores são integrados.</p>
+  {{end}}
+</form>
+{{end}}

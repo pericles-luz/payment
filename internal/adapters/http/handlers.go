@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/payment"
+	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
 // maxBodyBytes caps request bodies to bound memory use (threat H3/W4).
@@ -39,6 +41,11 @@ type createChargeRequest struct {
 	Endpoint    string `json:"endpoint"`
 	AmountCents int64  `json:"amount_cents"`
 	Currency    string `json:"currency"`
+	// Bank optionally selects which configured bank handles this charge (multi-bank,
+	// SIN-66022). Empty keeps the header/default routing. It overrides the X-Bank-Id
+	// header when both are present (the body field is the canonical write selector,
+	// ADR-0007).
+	Bank string `json:"bank"`
 }
 
 type paymentView struct {
@@ -74,8 +81,14 @@ func (s *Server) handleCreateCharge(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	nr, ok := s.rebindBank(w, r, req.Bank)
+	if !ok {
+		return
+	}
+	r = nr
 	p, err := s.charges.CreateCharge(r.Context(), app.CreateChargeInput{
 		TenantID:       tenantID,
+		AccountID:      accountFromContext(r.Context()),
 		Endpoint:       req.Endpoint,
 		AmountCents:    req.AmountCents,
 		Currency:       req.Currency,
@@ -149,17 +162,23 @@ func (s *Server) handleSetPrice(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, priceView{TenantID: p.TenantID(), Endpoint: p.Endpoint(), PriceCents: p.PriceCents()})
 }
 
-// setBankCredentialRequest carries a tenant's PSP credential. The secret is
-// write-only: it is accepted here and forwarded to the secret store, never read
-// back, logged or echoed in any response (threat C1/C4).
+// setBankCredentialRequest carries a tenant's PSP credential for one bank. The
+// bank slug selects which bank the credential is stored under (ADR-0007); it is
+// optional and defaults to BankIDC6 for backward compatibility with the legacy
+// single-bank callers. The secret is write-only: it is accepted here and forwarded
+// to the secret store, never read back, logged or echoed in any response (threat
+// C1/C4).
 type setBankCredentialRequest struct {
+	Bank     string `json:"bank"`
 	ClientID string `json:"client_id"`
 	Secret   string `json:"secret"`
 }
 
-// bankCredentialView confirms a credential write WITHOUT the secret.
+// bankCredentialView confirms a credential write WITHOUT the secret. It echoes the
+// resolved (normalized) bank so the caller/UX can confirm which bank was written.
 type bankCredentialView struct {
 	TenantID string `json:"tenant_id"`
+	Bank     string `json:"bank"`
 	ClientID string `json:"client_id"`
 	Status   string `json:"status"`
 }
@@ -170,12 +189,80 @@ func (s *Server) handleSetBankCredential(w http.ResponseWriter, r *http.Request)
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if err := s.admin.SetBankCredential(r.Context(), tenantID, req.ClientID, req.Secret); err != nil {
+	// Boundary validation (deny-by-default): normalize the optional bank slug and
+	// reject an unknown bank with a 400 before reaching the use-case. The
+	// AdminService re-validates (defense-in-depth); both layers resolve "" to c6.
+	bank := ports.NormalizeBankID(req.Bank)
+	if !ports.IsKnownBankID(bank) {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := s.admin.SetBankCredential(r.Context(), tenantID, bank, req.ClientID, req.Secret); err != nil {
 		writeDomainError(w, err)
 		return
 	}
 	// Echo only non-secret fields so the secret never leaves the secret store.
-	writeJSON(w, http.StatusOK, bankCredentialView{TenantID: tenantID, ClientID: req.ClientID, Status: "ok"})
+	writeJSON(w, http.StatusOK, bankCredentialView{TenantID: tenantID, Bank: bank, ClientID: req.ClientID, Status: "ok"})
+}
+
+// setBankCertificateRequest carries a tenant's per-bank mTLS client certificate
+// (SIN-66087). cert_pem is the PUBLIC leaf certificate; key_pem is its private key
+// and is write-only — accepted here, validated server-side, forwarded to the vault,
+// and NEVER read back, logged or echoed in any response (threat C1/C4). The bank
+// slug selects the bank (ADR-0007); optional, defaults to BankIDC6.
+type setBankCertificateRequest struct {
+	Bank    string `json:"bank"`
+	CertPEM string `json:"cert_pem"`
+	KeyPEM  string `json:"key_pem"`
+}
+
+// bankCertificateView confirms a certificate write with ONLY the public metadata
+// of the certificate — never the private key. Timestamps are RFC3339 UTC so the
+// UI can render the validity window and badge a not-yet-valid/expiring cert.
+type bankCertificateView struct {
+	TenantID          string `json:"tenant_id"`
+	Bank              string `json:"bank"`
+	SubjectCN         string `json:"subject_cn"`
+	Issuer            string `json:"issuer"`
+	SerialNumber      string `json:"serial_number"`
+	FingerprintSHA256 string `json:"fingerprint_sha256"`
+	NotBefore         string `json:"not_before"`
+	NotAfter          string `json:"not_after"`
+	Status            string `json:"status"`
+}
+
+func (s *Server) handleSetBankCertificate(w http.ResponseWriter, r *http.Request) {
+	tenantID := chi.URLParam(r, "tenantID")
+	var req setBankCertificateRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// Boundary validation (deny-by-default): normalize the optional bank slug and
+	// reject an unknown bank with a 400 before reaching the use-case. The
+	// AdminService re-validates (defense-in-depth); both layers resolve "" to c6.
+	bank := ports.NormalizeBankID(req.Bank)
+	if !ports.IsKnownBankID(bank) {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	meta, err := s.admin.SetBankCertificate(r.Context(), tenantID, bank, req.CertPEM, req.KeyPEM)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	// Echo only the public certificate metadata; the private key never leaves the
+	// vault and is never serialized into a response.
+	writeJSON(w, http.StatusOK, bankCertificateView{
+		TenantID:          meta.TenantID,
+		Bank:              meta.BankID,
+		SubjectCN:         meta.SubjectCN,
+		Issuer:            meta.Issuer,
+		SerialNumber:      meta.SerialNumber,
+		FingerprintSHA256: meta.FingerprintSHA256,
+		NotBefore:         meta.NotBefore.UTC().Format(time.RFC3339),
+		NotAfter:          meta.NotAfter.UTC().Format(time.RFC3339),
+		Status:            "ok",
+	})
 }
 
 // --- C6 bank webhook ---
@@ -190,6 +277,20 @@ const maxWebhookBytes = 64 << 10
 // checkout-session status notification (roteiro 12). Matched case-insensitively; any
 // other service is reconciled as a PIX/charge.
 const webhookServiceCheckout = "checkout"
+
+// webhookServiceRec / webhookServiceCobR are the c6WebhookNotification.service
+// values that mark a PIX Automático (recorrência) notification (SIN-66036): a
+// mandate-status change (rec) or a recurring-charge event (cobr). C6 fronts every
+// callback — PIX, checkout and the two recurrence streams — on the same opaque
+// channel with the same envelope, distinguishing them by service; routing here
+// reuses the channel auth, body cap and client_id cross-check already applied above.
+// The recurrence handlers reconcile the authoritative mandate/charge (GetRec /
+// GetCobR) before trusting the body (threat W3). Both matched case-insensitively.
+// The exact service tokens are confirmed against the C6 sandbox in F4 (homologação).
+const (
+	webhookServiceRec  = "rec"
+	webhookServiceCobR = "cobr"
+)
 
 // c6WebhookNotification is the inbound C6 callback body (notificações.yaml,
 // WebhookNotification). It is UNTRUSTED: the tenant comes from the authenticated
@@ -280,9 +381,24 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 		EventKey: note.ExternalID + "|" + note.Service + "|" + note.Status,
 	}
 	var err error
-	if strings.EqualFold(strings.TrimSpace(note.Service), webhookServiceCheckout) {
+	switch strings.ToLower(strings.TrimSpace(note.Service)) {
+	case webhookServiceCheckout:
 		err = s.webhooks.HandleCheckoutEvent(r.Context(), ev)
-	} else {
+	case webhookServiceRec:
+		// Mandate-status notification: the external id is the idRec to reconcile.
+		err = s.webhooks.HandleRecEvent(r.Context(), app.RecEvent{
+			TenantID: id.TenantID,
+			IDRec:    note.ExternalID,
+			EventKey: ev.EventKey,
+		})
+	case webhookServiceCobR:
+		// Recurring-charge notification: the external id is the cobr txid.
+		err = s.webhooks.HandleCobREvent(r.Context(), app.CobREvent{
+			TenantID: id.TenantID,
+			TxID:     note.ExternalID,
+			EventKey: ev.EventKey,
+		})
+	default:
 		err = s.webhooks.HandlePaymentEvent(r.Context(), ev)
 	}
 	if err != nil {

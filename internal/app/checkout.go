@@ -66,7 +66,11 @@ type CheckoutItemInput struct {
 // ExpiresInSeconds; one of them is required. CardType is "credit"|"debit";
 // RequireAuthentication asks the hosted page to authenticate the payer (roteiro 9.c).
 type CreateCheckoutSessionInput struct {
-	TenantID              string
+	TenantID string
+	// AccountID is the owning account resolved at the auth choke-point (SIN-69126),
+	// stamped on the ledger for account→tenant→endpoint metering (SIN-69127).
+	// Attribution-only; empty = self-account. See CreateChargeInput.AccountID.
+	AccountID             string
 	Currency              string
 	Items                 []CheckoutItemInput
 	ExpiresAt             time.Time
@@ -155,7 +159,7 @@ func (s *CheckoutService) CreateSession(ctx context.Context, in CreateCheckoutSe
 	}
 	p.SetTxID(res.SessionID)
 
-	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, CheckoutCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now())
+	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, CheckoutCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now(), billing.WithAccount(in.AccountID))
 	if err != nil {
 		return nil, ports.CheckoutResult{}, err
 	}

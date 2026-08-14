@@ -1,0 +1,24 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/accounts" hx-get="/console/accounts" hx-target="#main" hx-push-url="true">‹ Contas</a> / <a href="/console/accounts/{{.Account.ID}}" hx-get="/console/accounts/{{.Account.ID}}" hx-target="#main" hx-push-url="true">{{.Account.Name}}</a> / Nova empresa-cliente</p>
+<div class="topbar"><h1>Nova empresa-cliente</h1></div>
+
+<form class="form card" method="post" action="/console/accounts/{{.Account.ID}}/tenants"
+      hx-post="/console/accounts/{{.Account.ID}}/tenants" hx-target="#main" hx-swap="innerHTML">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+
+  <p class="muted">A empresa-cliente será criada já vinculada à Conta <strong>{{.Account.Name}}</strong>.</p>
+
+  <div class="field{{if .Errors.name}} has-error{{end}}">
+    <label for="f-name">Razão social *</label>
+    <input id="f-name" name="name" value="{{.Form.name}}" required maxlength="200" autocomplete="organization" autofocus
+           {{if .Errors.name}}aria-invalid="true" aria-describedby="e-name"{{end}}>
+    {{if .Errors.name}}<span class="error" id="e-name" role="alert">{{.Errors.name}}</span>{{end}}
+  </div>
+
+  <div class="form-actions">
+    <a class="btn btn--secondary" href="/console/accounts/{{.Account.ID}}" hx-get="/console/accounts/{{.Account.ID}}" hx-target="#main" hx-push-url="true">Cancelar</a>
+    <button class="btn btn--primary" type="submit">Criar empresa-cliente</button>
+  </div>
+</form>
+{{end}}

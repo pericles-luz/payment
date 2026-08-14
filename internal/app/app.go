@@ -19,8 +19,15 @@ type Deps struct {
 	Pricing   ports.PricingRepository
 	Ledger    ports.LedgerRepository
 	Processed ports.ProcessedEventStore
-	Bus       ports.MessageBus
-	Bank      ports.BankProvider
+	// Recs / CobRs are the PIX Automático (recorrência) durable repositories
+	// (SIN-66037). They are bundled into the transactional Repository so a mandate
+	// status transition and its audit entry commit atomically. Optional in unit
+	// tests using per-port fakes; production wires the storage adapter as UoW (which
+	// implements them), so the autocommit fallback rarely uses these directly.
+	Recs  ports.RecRepository
+	CobRs ports.CobRRepository
+	Bus   ports.MessageBus
+	Bank  ports.BankProvider
 	// Pix is the immediate-PIX-charge port (cobrança imediata). It is segregated
 	// from Bank (ISP): PixService depends only on it. In production it is the C6
 	// provider itself (the raw PixProvider, NOT the settlement wrapper); in stub mode
@@ -50,12 +57,27 @@ type Deps struct {
 	// from the other bank ports (ISP): StatementService depends only on it. In
 	// production it is the C6 provider; in stub mode the in-memory StubProvider. When
 	// nil, StatementService is simply not wired.
-	Statement   ports.StatementProvider
+	Statement ports.StatementProvider
+	// RecReader / CobRReader are the recurrence reconcile-read ports (PIX Automático,
+	// SIN-66036). The recurrence webhook handler reconciles the authoritative mandate
+	// (GetRec) / charge (GetCobR) state before acting on an inbound notification —
+	// never trusting the raw webhook body (threat W3). Segregated from the create
+	// ports (ISP): WebhookService depends only on the narrow readers. When nil, the
+	// recurrence webhook dispatch is not wired. In production both are the C6
+	// provider; in stub mode the in-memory StubProvider.
+	RecReader   ports.RecProvider
+	CobRReader  ports.CobRProvider
 	Credentials ports.CredentialStore
 	// CredWriter is the admin-plane write path for per-tenant bank credentials.
 	// Kept separate from Credentials (the reader) so each service depends only on
 	// the capability it needs.
 	CredWriter ports.CredentialWriter
+	// CertWriter is the admin-plane write path for per-(tenant,bank) mTLS client
+	// certificates (SIN-66087). Kept separate from CredWriter (a different secret
+	// aggregate) so the AdminService depends only on the capability it needs. When
+	// nil, the certificate write use-case is unavailable (the endpoint is only wired
+	// when a store is provided).
+	CertWriter ports.BankCertificateWriter
 	// CredInvalidator evicts cached state keyed on a tenant's credential (the C6
 	// OAuth2 token cache) right after a credential write, closing the
 	// token-revocation lag (ADR-0003). Optional: when nil the admin services use a
@@ -72,6 +94,13 @@ type Deps struct {
 	// footgun: production MUST wire a real audit log so privileged actions are
 	// recorded for forensics/compliance.
 	Audit ports.AuditLog
-	Clock ports.Clock
-	IDs   ports.IDProvider
+	// PIIAccess is the append-only LGPD / art.13 register of READ access to a
+	// titular's personal data at rest (ADR-0008, SIN-68748). It is bundled into the
+	// unit of work so a mediated read of local PII and its access record commit
+	// atomically (Complete Mediation). When nil, PIIAccessService falls back to a
+	// no-op recorder (unit tests) — a footgun: production MUST wire a real
+	// append-only recorder so PII reads are recorded for LGPD compliance.
+	PIIAccess ports.PIIAccessRecorder
+	Clock     ports.Clock
+	IDs       ports.IDProvider
 }

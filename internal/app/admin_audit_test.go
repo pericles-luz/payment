@@ -54,7 +54,7 @@ func TestAdminActionsEmitAudit(t *testing.T) {
 	if _, err := admin.SetEndpointPrice(ctx, tn.ID(), "pix.create", 10); err != nil {
 		t.Fatalf("set price: %v", err)
 	}
-	if err := admin.SetBankCredential(ctx, tn.ID(), "client-1", "top-secret"); err != nil {
+	if err := admin.SetBankCredential(ctx, tn.ID(), ports.BankIDC6, "client-1", "top-secret"); err != nil {
 		t.Fatalf("set credential: %v", err)
 	}
 
@@ -96,7 +96,7 @@ func TestSetBankCredentialAuditOmitsSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
-	if err := admin.SetBankCredential(ctx, tn.ID(), clientID, secretVal); err != nil {
+	if err := admin.SetBankCredential(ctx, tn.ID(), ports.BankIDC6, clientID, secretVal); err != nil {
 		t.Fatalf("set credential: %v", err)
 	}
 

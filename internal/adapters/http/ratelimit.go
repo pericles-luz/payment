@@ -3,9 +3,13 @@ package http
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
 )
 
 // rateLimiter is a small concurrency-safe token-bucket limiter keyed by an
@@ -74,6 +78,40 @@ func (rl *rateLimiter) middleware(keyFn func(*http.Request) string) func(http.Ha
 	}
 }
 
+// middlewareSelfServeCred is the DEDICATED inbound limiter for the self-serve
+// credential intake (SIN-69196 Q1). It is deliberately NOT the outbound C6 client
+// limiter (SIN-68742) and NOT the shared tenant-plane limiter: credential rotation
+// is a rare, high-value write, so it gets its own tight bucket keyed STRICTLY on
+// the authenticated tenant (the route sits behind tenant auth, so ctxTenantID is
+// always present). retryAfterSecs is emitted on a 429 so a client can back off
+// deterministically.
+//
+// Fail-securely-for-availability: if the tenant key is unexpectedly empty — only
+// possible via a wiring bug that placed this middleware before tenant auth — it
+// FAILS OPEN (logs a warning and admits the request) rather than throttling. A
+// tenant must never be locked out of rotating its own (security-sensitive)
+// credential by an internal limiter fault; the route is already authenticated, so
+// failing open here does not widen access.
+func (rl *rateLimiter) middlewareSelfServeCred(retryAfterSecs int) func(http.Handler) http.Handler {
+	retryAfter := strconv.Itoa(retryAfterSecs)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tid := tenantFromContext(r.Context())
+			if tid == "" {
+				slog.Warn("self-serve credential limiter: empty tenant key; failing open")
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !rl.allow("selfserve-cred:" + tid) {
+				w.Header().Set("Retry-After", retryAfter)
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // tenantOrIPKey keys by authenticated tenant when present, else remote address.
 func tenantOrIPKey(r *http.Request) string {
 	if tid := tenantFromContext(r.Context()); tid != "" {
@@ -96,8 +134,15 @@ func adminTokenKey(r *http.Request) string {
 }
 
 func clientIP(r *http.Request) string {
-	// RemoteAddr is host:port; strip the port. Trusting proxy headers is a
-	// deployment concern handled at the ingress, not here.
+	// Prefer the spoof-resistant client IP resolved by clientIPMiddleware and
+	// stored on the request context (never the raw, client-controllable
+	// X-Forwarded-For — GO-2026-5775). It is empty only when the configured
+	// trusted-proxy depth found no trustworthy hop (fail-closed); fall back to
+	// the TCP peer so rate limiting still functions.
+	if ip := middleware.GetClientIP(r.Context()); ip != "" {
+		return ip
+	}
+	// RemoteAddr is host:port; strip the port to key on the bare peer IP.
 	addr := r.RemoteAddr
 	for i := len(addr) - 1; i >= 0; i-- {
 		if addr[i] == ':' {

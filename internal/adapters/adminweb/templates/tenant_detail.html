@@ -1,6 +1,10 @@
 {{define "body"}}
 {{with .Tenant}}
-<p class="breadcrumb"><a href="/console/tenants" hx-get="/console/tenants" hx-target="#main" hx-push-url="true">‹ Tenants</a> / {{.Name}}</p>
+{{if and .HasAccount (not .AccountIsSelf)}}
+<p class="breadcrumb"><a href="/console/accounts" hx-get="/console/accounts" hx-target="#main" hx-push-url="true">‹ Contas</a> / <a href="/console/accounts/{{.AccountID}}" hx-get="/console/accounts/{{.AccountID}}" hx-target="#main" hx-push-url="true">{{.AccountName}}</a> / {{.Name}}</p>
+{{else}}
+<p class="breadcrumb"><a href="/console/tenants" hx-get="/console/tenants" hx-target="#main" hx-push-url="true">‹ Empresas-clientes</a> / {{.Name}}</p>
+{{end}}
 <div class="topbar">
   <div>
     <h1>{{.Name}} <span id="tenant-status">{{template "status_badge" .}}</span></h1>
@@ -11,12 +15,14 @@
 
 <nav class="tabs" aria-label="Seções do tenant">
   <a href="/console/tenants/{{.ID}}" aria-current="page">Visão geral</a>
-  <a href="/console/tenants/{{.ID}}/credentials"
-     hx-get="/console/tenants/{{.ID}}/credentials" hx-target="#main" hx-push-url="true">Credenciais</a>
+  <a href="/console/tenants/{{.ID}}/banks"
+     hx-get="/console/tenants/{{.ID}}/banks" hx-target="#main" hx-push-url="true">Bancos</a>
   <a href="/console/tenants/{{.ID}}/pricing"
      hx-get="/console/tenants/{{.ID}}/pricing" hx-target="#main" hx-push-url="true">Tarifação</a>
   <a href="/console/tenants/{{.ID}}/consumption"
      hx-get="/console/tenants/{{.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo</a>
+  <a href="/console/tenants/{{.ID}}/invoices"
+     hx-get="/console/tenants/{{.ID}}/invoices" hx-target="#main" hx-push-url="true">Faturas</a>
 </nav>
 
 <div class="card-grid">
@@ -27,16 +33,26 @@
       <dt>Identificador</dt><dd><code>{{.ID}}</code></dd>
       <dt>Status</dt><dd>{{template "status_badge" .}}</dd>
       <dt>Criado em</dt><dd>{{.CreatedAtBR}}</dd>
+      <dt>Conta</dt>
+      <dd>
+        {{- if and .HasAccount (not .AccountIsSelf) -}}
+        <a class="row-link" href="/console/accounts/{{.AccountID}}" hx-get="/console/accounts/{{.AccountID}}" hx-target="#main" hx-push-url="true">{{.AccountName}}</a>
+        {{- else -}}
+        <span class="muted">Conta própria (legado)</span>
+        {{- end -}}
+      </dd>
     </dl>
   </div>
   <div class="card">
     <h2>Atalhos</h2>
-    <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/credentials"
-          hx-get="/console/tenants/{{.ID}}/credentials" hx-target="#main" hx-push-url="true">Credenciais bancárias ›</a></p>
+    <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/banks"
+          hx-get="/console/tenants/{{.ID}}/banks" hx-target="#main" hx-push-url="true">Bancos ›</a></p>
     <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/pricing"
           hx-get="/console/tenants/{{.ID}}/pricing" hx-target="#main" hx-push-url="true">Tarifação ›</a></p>
     <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/consumption"
           hx-get="/console/tenants/{{.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo ›</a></p>
+    <p><a class="btn btn--ghost" href="/console/tenants/{{.ID}}/invoices"
+          hx-get="/console/tenants/{{.ID}}/invoices" hx-target="#main" hx-push-url="true">Faturas ›</a></p>
   </div>
 </div>
 {{end}}

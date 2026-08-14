@@ -11,10 +11,16 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/ia-dev-sindireceita/payment/internal/domain/access"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/audit"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/billing"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/invoice"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/payment"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/recurrence"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/termsconsent"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
@@ -22,28 +28,45 @@ import (
 type Store struct {
 	mu        sync.RWMutex
 	tenants   map[string]*tenant.Tenant
+	accounts  map[string]*account.Account        // two-level tenancy accounts (ADR-0009)
 	payments  map[string]*payment.Payment        // keyed by tenantID+"\x00"+id
 	pricing   map[string]billing.EndpointPricing // keyed by tenantID+"\x00"+endpoint
 	ledger    []billing.LedgerEntry
-	processed map[string]struct{} // keyed by tenantID+"\x00"+eventKey
+	processed map[string]struct{}         // keyed by tenantID+"\x00"+eventKey
+	audit     []audit.Entry               // append-only audit trail (mirrors audit_log)
+	recs      map[string]*recurrence.Rec  // keyed by tenantID+"\x00"+idRec
+	cobrs     map[string]*recurrence.CobR // keyed by tenantID+"\x00"+txID
+	consents  []*termsconsent.Record      // append-only LGPD terms consent (mirrors terms_consent)
+	piiAccess []access.Entry              // append-only PII read-access log (mirrors pii_access_log)
+	invoices  []invoice.Invoice           // append-only Faturas (mirrors invoices/invoice_items)
 }
 
 // NewStore returns an empty in-memory store.
 func NewStore() *Store {
 	return &Store{
 		tenants:   make(map[string]*tenant.Tenant),
+		accounts:  make(map[string]*account.Account),
 		payments:  make(map[string]*payment.Payment),
 		pricing:   make(map[string]billing.EndpointPricing),
 		processed: make(map[string]struct{}),
+		recs:      make(map[string]*recurrence.Rec),
+		cobrs:     make(map[string]*recurrence.CobR),
 	}
 }
 
 var (
 	_ ports.PaymentRepository   = (*Store)(nil)
 	_ ports.TenantRepository    = (*Store)(nil)
+	_ ports.AccountRepository   = (*Store)(nil)
 	_ ports.PricingRepository   = (*Store)(nil)
 	_ ports.LedgerRepository    = (*Store)(nil)
 	_ ports.ProcessedEventStore = (*Store)(nil)
+	_ ports.RecRepository       = (*Store)(nil)
+	_ ports.CobRRepository      = (*Store)(nil)
+	_ ports.AuditLog            = (*Store)(nil)
+	_ ports.TermsConsentStore   = (*Store)(nil)
+	_ ports.PIIAccessRecorder   = (*Store)(nil)
+	_ ports.PIIAccessPurger     = (*Store)(nil)
 	_ ports.Repository          = (*Store)(nil)
 	_ ports.UnitOfWork          = (*Store)(nil)
 )
@@ -86,6 +109,48 @@ func (s *Store) ListTenants(ctx context.Context) ([]*tenant.Tenant, error) {
 	out := make([]*tenant.Tenant, 0, len(s.tenants))
 	for _, t := range s.tenants {
 		out = append(out, t)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ci, cj := out[i].CreatedAt(), out[j].CreatedAt()
+		if ci.Equal(cj) {
+			return out[i].ID() > out[j].ID()
+		}
+		return ci.After(cj)
+	})
+	return out, nil
+}
+
+// --- Accounts (two-level tenancy, ADR-0009) ---
+
+// SaveAccount stores an account (upsert by id). An account carries no bank
+// credential and no money; it is attribution-only. Not part of the unit of work
+// (the Repository bundle excludes AccountRepository), mirroring the sqlite adapter.
+func (s *Store) SaveAccount(ctx context.Context, a *account.Account) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accounts[a.ID()] = a
+	return nil
+}
+
+// FindAccountByID returns an account or ErrNotFound.
+func (s *Store) FindAccountByID(ctx context.Context, id string) (*account.Account, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return nil, shared.ErrNotFound
+	}
+	return a, nil
+}
+
+// ListAccounts returns every account, newest-first (created_at desc, id desc as a
+// deterministic tie-break). Mirrors the SQLite adapter's ordering.
+func (s *Store) ListAccounts(ctx context.Context) ([]*account.Account, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*account.Account, 0, len(s.accounts))
+	for _, a := range s.accounts {
+		out = append(out, a)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		ci, cj := out[i].CreatedAt(), out[j].CreatedAt()
@@ -170,11 +235,25 @@ func (s *Store) MarkProcessed(ctx context.Context, tenantID, eventKey string) (b
 
 // ListLedgerEntries returns a tenant's ledger entries, newest-first.
 func (s *Store) ListLedgerEntries(ctx context.Context, tenantID string) ([]billing.LedgerEntry, error) {
+	return s.filterLedger(func(e billing.LedgerEntry) bool { return e.TenantID() == tenantID }), nil
+}
+
+// ListLedgerEntriesByAccount returns every ledger entry owned by one account,
+// across all of its tenants, newest-first. It is the read side of the
+// account→tenant→endpoint metering rollup (SIN-69127); the app layer groups the
+// returned entries by tenant then endpoint. Account-scoped like the tenant view.
+func (s *Store) ListLedgerEntriesByAccount(ctx context.Context, accountID string) ([]billing.LedgerEntry, error) {
+	return s.filterLedger(func(e billing.LedgerEntry) bool { return e.AccountID() == accountID }), nil
+}
+
+// filterLedger returns the ledger entries matching keep, newest-first (at desc,
+// id desc tie-break), under the read lock.
+func (s *Store) filterLedger(keep func(billing.LedgerEntry) bool) []billing.LedgerEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]billing.LedgerEntry, 0)
 	for _, e := range s.ledger {
-		if e.TenantID() == tenantID {
+		if keep(e) {
 			out = append(out, e)
 		}
 	}
@@ -185,6 +264,50 @@ func (s *Store) ListLedgerEntries(ctx context.Context, tenantID string) ([]billi
 		}
 		return ai.After(aj)
 	})
+	return out
+}
+
+// SaveInvoice appends a generated invoice (append-only, mirrors the sqlite
+// header+items insert). Invoice is an immutable value type whose Lines() returns
+// copies, so storing it directly is safe.
+func (s *Store) SaveInvoice(ctx context.Context, inv invoice.Invoice) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.invoices = append(s.invoices, inv)
+	return nil
+}
+
+// FindInvoiceByID returns one tenant's invoice by id, or shared.ErrNotFound.
+// Tenant-scoped (threat P1).
+func (s *Store) FindInvoiceByID(ctx context.Context, tenantID, id string) (invoice.Invoice, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, inv := range s.invoices {
+		if inv.TenantID() == tenantID && inv.ID() == id {
+			return inv, nil
+		}
+	}
+	return invoice.Invoice{}, shared.ErrNotFound
+}
+
+// ListInvoices returns a tenant's invoices, newest-first (generated_at desc, id
+// desc tie-break). Tenant-scoped (threat P1).
+func (s *Store) ListInvoices(ctx context.Context, tenantID string) ([]invoice.Invoice, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]invoice.Invoice, 0)
+	for _, inv := range s.invoices {
+		if inv.TenantID() == tenantID {
+			out = append(out, inv)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		gi, gj := out[i].GeneratedAt(), out[j].GeneratedAt()
+		if gi.Equal(gj) {
+			return out[i].ID() > out[j].ID()
+		}
+		return gi.After(gj)
+	})
 	return out, nil
 }
 
@@ -193,6 +316,24 @@ func (s *Store) LedgerLen() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.ledger)
+}
+
+// Append records an audit entry (append-only). Mirrors the SQLite adapter: the
+// entry is durable and never updated or removed.
+func (s *Store) Append(ctx context.Context, e audit.Entry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendAudit(e)
+}
+
+// AuditEntries returns a copy of the recorded audit entries in append order. A
+// copy is returned so callers can never mutate the trail (append-only integrity).
+func (s *Store) AuditEntries() []audit.Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]audit.Entry, len(s.audit))
+	copy(out, s.audit)
+	return out
 }
 
 // --- Unit of work ---
@@ -223,6 +364,10 @@ type snapshot struct {
 	pricing   map[string]billing.EndpointPricing
 	ledger    []billing.LedgerEntry
 	processed map[string]struct{}
+	audit     []audit.Entry
+	recs      map[string]*recurrence.Rec
+	cobrs     map[string]*recurrence.CobR
+	piiAccess []access.Entry
 }
 
 func (s *Store) snapshot() snapshot {
@@ -244,7 +389,19 @@ func (s *Store) snapshot() snapshot {
 	}
 	ledger := make([]billing.LedgerEntry, len(s.ledger))
 	copy(ledger, s.ledger)
-	return snapshot{tenants: tenants, payments: payments, pricing: pricing, ledger: ledger, processed: processed}
+	auditCopy := make([]audit.Entry, len(s.audit))
+	copy(auditCopy, s.audit)
+	recs := make(map[string]*recurrence.Rec, len(s.recs))
+	for k, v := range s.recs {
+		recs[k] = v
+	}
+	cobrs := make(map[string]*recurrence.CobR, len(s.cobrs))
+	for k, v := range s.cobrs {
+		cobrs[k] = v
+	}
+	piiAccess := make([]access.Entry, len(s.piiAccess))
+	copy(piiAccess, s.piiAccess)
+	return snapshot{tenants: tenants, payments: payments, pricing: pricing, ledger: ledger, processed: processed, audit: auditCopy, recs: recs, cobrs: cobrs, piiAccess: piiAccess}
 }
 
 func (s *Store) restore(snap snapshot) {
@@ -253,6 +410,10 @@ func (s *Store) restore(snap snapshot) {
 	s.pricing = snap.pricing
 	s.ledger = snap.ledger
 	s.processed = snap.processed
+	s.audit = snap.audit
+	s.recs = snap.recs
+	s.cobrs = snap.cobrs
+	s.piiAccess = snap.piiAccess
 }
 
 // --- Lock-free core (callers must hold s.mu) ---
@@ -335,6 +496,11 @@ func (s *Store) markProcessed(tenantID, eventKey string) (bool, error) {
 	return true, nil
 }
 
+func (s *Store) appendAudit(e audit.Entry) error {
+	s.audit = append(s.audit, e)
+	return nil
+}
+
 // txView is the tenant-scoped ports.Repository handed to a WithinTx callback. It
 // delegates to the lock-free core; the surrounding WithinTx holds s.mu.
 type txView struct{ s *Store }
@@ -379,4 +545,10 @@ func (v txView) AppendLedgerEntry(ctx context.Context, e billing.LedgerEntry) er
 
 func (v txView) MarkProcessed(ctx context.Context, tenantID, eventKey string) (bool, error) {
 	return v.s.markProcessed(tenantID, eventKey)
+}
+
+// Append records an audit entry within the unit of work; it is rolled back with
+// the rest of the transaction (the audit slice is part of the snapshot).
+func (v txView) Append(ctx context.Context, e audit.Entry) error {
+	return v.s.appendAudit(e)
 }

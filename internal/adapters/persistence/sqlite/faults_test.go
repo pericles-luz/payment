@@ -2,6 +2,8 @@ package sqlite_test
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"path/filepath"
 	"testing"
 	"testing/fstest"
@@ -76,6 +78,58 @@ func TestMigrateBadSQL(t *testing.T) {
 		t.Fatal("expected migration error for bad SQL")
 	}
 }
+
+// TestMigrateClosedDB covers the early error branches of the ledgered runner: a
+// closed database fails the first statement (ensuring schema_migrations).
+func TestMigrateClosedDB(t *testing.T) {
+	t.Parallel()
+	dsn := filepath.Join(t.TempDir(), "closed-migrate.db")
+	db, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := sqlite.Migrate(context.Background(), db, migrations.FS); err == nil {
+		t.Fatal("expected migration error on closed db")
+	}
+}
+
+// TestMigrateReadFileError covers the read-migration error branch: the runner
+// lists a *.up.sql entry it then cannot read.
+func TestMigrateReadFileError(t *testing.T) {
+	t.Parallel()
+	dsn := filepath.Join(t.TempDir(), "readfail.db")
+	db, err := sqlite.Open(dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := sqlite.Migrate(context.Background(), db, listOnlyFS{}); err == nil {
+		t.Fatal("expected migration error when a listed file cannot be read")
+	}
+}
+
+// listOnlyFS lists one *.up.sql file (via ReadDirFS) but errors on ReadFile (via
+// ReadFileFS), so fs.ReadDir succeeds and fs.ReadFile fails — exactly the path the
+// runner takes between discovering a migration and reading its bytes.
+type listOnlyFS struct{}
+
+func (listOnlyFS) Open(string) (fs.File, error) { return nil, fs.ErrNotExist }
+func (listOnlyFS) ReadDir(string) ([]fs.DirEntry, error) {
+	return []fs.DirEntry{upEntry{}}, nil
+}
+func (listOnlyFS) ReadFile(string) ([]byte, error) { return nil, errBoomRead }
+
+var errBoomRead = errors.New("boom: cannot read migration")
+
+type upEntry struct{}
+
+func (upEntry) Name() string               { return "0001_x.up.sql" }
+func (upEntry) IsDir() bool                { return false }
+func (upEntry) Type() fs.FileMode          { return 0 }
+func (upEntry) Info() (fs.FileInfo, error) { return nil, nil }
 
 // TestParseTimeFallback covers the parseTime error branch: a row with a malformed
 // timestamp rehydrates to the zero time rather than failing the read.

@@ -75,6 +75,34 @@ func TestNewLedgerEntry(t *testing.T) {
 			if e.PriceCents() != tt.price || e.Reference() != "ref1" || !e.At().Equal(at) {
 				t.Fatal("value mismatch")
 			}
+			// No account option → self-account (empty), NULL-safe default.
+			if e.AccountID() != "" {
+				t.Fatalf("default account = %q, want empty", e.AccountID())
+			}
 		})
+	}
+}
+
+// TestLedgerEntryWithAccount covers the account attribution option (SIN-69127):
+// WithAccount stamps and trims the owning account; omitting it leaves the
+// self-account (empty), and blank input is normalised to empty.
+func TestLedgerEntryWithAccount(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(100, 0).UTC()
+
+	e, err := billing.NewLedgerEntry("l1", "t1", "pix.create", "ref", 50, at, billing.WithAccount("  acct-t1  "))
+	if err != nil {
+		t.Fatalf("with account: %v", err)
+	}
+	if e.AccountID() != "acct-t1" {
+		t.Fatalf("account = %q, want acct-t1 (trimmed)", e.AccountID())
+	}
+
+	blank, err := billing.NewLedgerEntry("l2", "t1", "pix.create", "ref", 50, at, billing.WithAccount("   "))
+	if err != nil {
+		t.Fatalf("blank account: %v", err)
+	}
+	if blank.AccountID() != "" {
+		t.Fatalf("blank account = %q, want empty (self-account)", blank.AccountID())
 	}
 }

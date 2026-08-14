@@ -8,12 +8,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/ia-dev-sindireceita/payment/internal/domain/access"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/audit"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/billing"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/payment"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/recurrence"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/termsconsent"
 )
 
 // Clock abstracts time so the domain stays deterministic and testable.
@@ -49,6 +55,18 @@ type TenantRepository interface {
 	FindTenantByID(ctx context.Context, id string) (*tenant.Tenant, error)
 }
 
+// AccountRepository persists Account aggregates — the API user / reseller that
+// owns tenants in the two-level tenancy model (ADR-0009, SIN-69119 §3.1). Kept
+// deliberately minimal and separate from TenantRepository: an account is
+// attribution-only and never carries a bank credential. Reads are keyed by the
+// opaque account id (an account spans tenants, so it is not tenant-scoped);
+// isolation between accounts is enforced by the auth choke-point (F1) and by
+// deny-by-default listings (F3), not by this write/lookup port.
+type AccountRepository interface {
+	SaveAccount(ctx context.Context, a *account.Account) error
+	FindAccountByID(ctx context.Context, id string) (*account.Account, error)
+}
+
 // PricingRepository resolves and stores per-endpoint pricing. The admin-console
 // listing (ListEndpointPrices) is declared by app.PricingStore, keeping this
 // port narrow (the concrete stores implement both).
@@ -65,17 +83,56 @@ type LedgerRepository interface {
 	AppendLedgerEntry(ctx context.Context, e billing.LedgerEntry) error
 }
 
+// RecRepository persists PIX Automático recurring-debit mandates (recurrence.Rec).
+// Every read is tenant-scoped — the tenant comes from the authenticated credential,
+// never from client input (threat P1 IDOR). Save is an upsert keyed by idRec so a
+// reconciled status transition (Rec.Transition) is persisted by re-saving the
+// aggregate; pairing the save with its audit entry inside one WithinTx makes the
+// transition and its forensic record atomic.
+type RecRepository interface {
+	SaveRec(ctx context.Context, r *recurrence.Rec) error
+	FindRecByID(ctx context.Context, tenantID, idRec string) (*recurrence.Rec, error)
+}
+
+// CobRRepository persists the recurring charge instances (recurrence.CobR) of a
+// mandate's cycle. Tenant-scoped like RecRepository; Save is an upsert keyed by
+// the charge txid (the anti-double-bill anchor). The cycle-listing read
+// (ListCobRByRec) is kept off this port — like ListLedgerEntries — so the write
+// surface bundled into the transactional Repository stays minimal and runs on a
+// single-row tx handle; the concrete store exposes the listing for the cycle view.
+type CobRRepository interface {
+	SaveCobR(ctx context.Context, c *recurrence.CobR) error
+	FindCobRByTxID(ctx context.Context, tenantID, txID string) (*recurrence.CobR, error)
+}
+
 // Repository is the tenant-scoped persistence surface that can take part in a
 // single unit of work. It bundles the individual repository ports so a use-case
 // can perform several writes that must commit or roll back together — the
 // transactional boundary financial integrity depends on (no payment without its
-// ledger entry, no event marked processed without its settlement).
+// ledger entry, no event marked processed without its settlement, no recurrence
+// transition without its audit entry).
 type Repository interface {
 	PaymentRepository
 	TenantRepository
 	PricingRepository
 	LedgerRepository
 	ProcessedEventStore
+	RecRepository
+	CobRRepository
+	// AuditLog is bundled into the unit of work so a privileged action and its
+	// audit record commit (or roll back) together: the append runs on the SAME
+	// transaction handle as the triggering write (SaveTenant, MarkProcessed),
+	// closing the forensic-gap window where the action persisted but its audit
+	// record did not (or vice-versa). The standalone Deps.Audit port remains for
+	// callers that append outside a transaction (SIN-66025 / SIN-66016).
+	AuditLog
+	// PIIAccessRecorder is bundled so the art.13 / LGPD access record for reading a
+	// titular's PII AT REST (today: pix_rec.devedor_*) commits in the SAME
+	// transaction as the read that materialised it. This makes the access log a
+	// Complete-Mediation choke-point: if the append fails, the read is rolled back,
+	// so there is no unlogged read of local PII (ADR-0008 §5/§6). The standalone
+	// Deps.PIIAccess port remains for best-effort logging of pass-through bank reads.
+	PIIAccessRecorder
 }
 
 // UnitOfWork runs fn inside one atomic transaction. Every write performed through
@@ -99,6 +156,57 @@ type UnitOfWork interface {
 // audit record commit atomically (threat: forensic gaps).
 type AuditLog interface {
 	Append(ctx context.Context, e audit.Entry) error
+}
+
+// TermsConsentStore is the durable, append-only output port for LGPD consent to
+// the Solution's terms of use (C6 Termo 3.5 / B9, SIN-68743). It is a DISTINCT
+// concern from the PIX Automático mandate ports above: it records legal consent to
+// terms, not an authorization to move money.
+//
+// Implementations MUST be append-only — RecordConsent only ever INSERTs; there is
+// no update or delete path, so a captured consent is immutable and re-consent adds
+// a NEW row rather than overwriting the prior one (the forensic property, OWASP
+// A09). Every method is tenant-scoped so one tenant can never read another's
+// consents (threat P1). A termsconsent.Record carries PII (subject/IP/user-agent)
+// which these adapters persist but never log (Record.LogValue redacts it).
+type TermsConsentStore interface {
+	// RecordConsent durably appends one consent event (append-only INSERT). The
+	// Record's id is the opaque primary key, so distinct captures never collide and
+	// re-consent to the same version is preserved as a separate row.
+	RecordConsent(ctx context.Context, r *termsconsent.Record) error
+	// FindLatestConsent returns the most recent consent for (tenant, subject,
+	// version), or shared.ErrNotFound when the subject never consented to that
+	// version. Tenant-scoped: a subject/version owned by another tenant reads as
+	// ErrNotFound (no cross-tenant oracle).
+	FindLatestConsent(ctx context.Context, tenantID, subject, termsVersion string) (*termsconsent.Record, error)
+	// ListConsents returns a subject's full consent history for a tenant, newest
+	// first (granted_at desc, id desc tie-break). It exposes the append-only trail
+	// so the immutability of prior captures is observable. Tenant-scoped.
+	ListConsents(ctx context.Context, tenantID, subject string) ([]*termsconsent.Record, error)
+}
+
+// PIIAccessRecorder is the append-only output port for the LGPD / Decreto
+// 8.771/2016 art.13 register of READ access to a titular's personal data in the
+// data plane (Termo C6 B10-v; ADR-0008). Implementations MUST treat entries as
+// immutable (append-only) and MUST NOT persist or log any plaintext PII — an
+// access.Entry carries only a pseudonymous subject_ref by construction (ADR-0008
+// §4). When backed by a persisted store, the append should share the mediated
+// read's transaction so a read of local PII and its access record commit
+// atomically (Complete Mediation): a read whose append fails is rolled back, so
+// PII at rest cannot be read without being recorded.
+type PIIAccessRecorder interface {
+	RecordPIIAccess(ctx context.Context, e access.Entry) error
+}
+
+// PIIAccessPurger expires access-log entries by retention policy. This is the ONLY
+// delete permitted on the otherwise append-only pii_access_log — LGPD
+// minimisation: the register is kept only as long as needed to evidence art.13
+// compliance (default bounded, ADR-0008 §3). PurgePIIAccessBefore removes entries
+// strictly older than cutoff and returns how many were removed. It runs on the
+// connection pool (a maintenance routine), not inside a business transaction, so
+// it is kept off the bundled Repository surface.
+type PIIAccessPurger interface {
+	PurgePIIAccessBefore(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // ProcessedEventStore records which external events (webhooks) have already been
@@ -129,11 +237,103 @@ type MessageBus interface {
 	Subscribe(ctx context.Context, topic string, h MessageHandler) error
 }
 
-// BankCredential is a tenant's bank (PSP) credential reference. The secret value
+// BankIDC6 is the canonical, non-secret slug for the C6 bank. It is also the
+// retro-compatible DEFAULT bankID applied wherever a bank is not explicitly
+// specified (legacy single-bank config, internal pre-multi-bank calls, an empty
+// selector). Resolving an unspecified bank to "c6" preserves 100% of the current
+// single-bank behaviour while the credential boundary becomes keyed by the
+// composite (tenantID, bankID) pair (ADR-0007 / SIN-66015).
+const BankIDC6 = "c6"
+
+// knownBankIDs is the closed allow-list of bank slugs the platform has a wired
+// adapter for. A credential may be written only for a bank in this set
+// (deny-by-default, ADR-0007): an unknown slug is rejected at the admin boundary
+// rather than silently persisted under a bank that can never route a charge. The
+// set grows as adapters land; today only C6 is integrated.
+var knownBankIDs = map[string]struct{}{
+	BankIDC6: {},
+}
+
+// NormalizeBankID canonicalises a bank slug for the (tenantID, bankID) key: it
+// trims surrounding space and lowercases, and applies the retro-compat default —
+// an empty selector resolves to BankIDC6. So "C6", " c6 " and "" all key the same
+// bank. It is the single place the default is applied on the admin write path so
+// the persisted key and the audited bank_id agree.
+func NormalizeBankID(bankID string) string {
+	bankID = strings.ToLower(strings.TrimSpace(bankID))
+	if bankID == "" {
+		return BankIDC6
+	}
+	return bankID
+}
+
+// CanonicalBankID canonicalises a request- or wiring-influenced bank slug to its
+// store/registry key form and fails closed on anything non-canonical. It lowercases
+// and trims surrounding space, then reports ok=false for an empty result or a slug
+// carrying NUL or any other control char (< 0x20 or 0x7f). Unlike NormalizeBankID it
+// applies NO retro-compat default — an empty selector is reported as not-ok so the
+// caller treats it as "no explicit bank", never as a valid slug.
+//
+// It is the single, shared canonicaliser for the strict slug-key boundaries: the
+// HTTP per-request bank selector and the provider Registry key. The credential store
+// keys on tenantID + "\x00" + bankID, so a NUL- or control-char-bearing slug must be
+// refused BEFORE it can become a key fragment and forge/collide a composite key
+// (SIN-66040 / SIN-66056, ADR-0007). Keep this distinct from NormalizeBankID, which
+// applies the admin write-path default and relies on the IsKnownBankID allow-list to
+// reject unknown slugs.
+func CanonicalBankID(bankID string) (string, bool) {
+	bankID = strings.ToLower(strings.TrimSpace(bankID))
+	if bankID == "" {
+		return "", false
+	}
+	for i := 0; i < len(bankID); i++ {
+		if c := bankID[i]; c < 0x20 || c == 0x7f {
+			return "", false
+		}
+	}
+	return bankID, true
+}
+
+// IsKnownBankID reports whether bankID names a bank the platform supports. Pass a
+// value already run through NormalizeBankID. It is the boundary guard for the
+// admin credential-write path: an unknown bank MUST be rejected as a validation
+// error (deny-by-default) so a credential is never written under a bank with no
+// adapter to route it.
+func IsKnownBankID(bankID string) bool {
+	_, ok := knownBankIDs[bankID]
+	return ok
+}
+
+// KnownBankIDs returns the closed allow-list of supported bank slugs, sorted for
+// deterministic rendering. It is the read side of the same allow-list IsKnownBankID
+// guards: the admin console enumerates it to show, per tenant, which supported
+// banks have a credential configured (✓) and which are still pending (—), and to
+// populate the closed add-bank selector. The returned slice is a fresh copy, so a
+// caller can never mutate the allow-list (ADR-0007 deny-by-default).
+func KnownBankIDs() []string {
+	out := make([]string, 0, len(knownBankIDs))
+	for id := range knownBankIDs {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// BankCredential is a tenant's bank (PSP) credential reference, keyed inside the
+// credential store by the composite pair (TenantID, BankID): a single tenant may
+// hold independent credentials at more than one bank (ADR-0007). The secret value
 // is fetched via the store at use time and never stored in domain state or logs
 // (threat C1).
 type BankCredential struct {
 	TenantID string
+	// BankID is the non-secret routing slug of the bank this credential belongs to
+	// (e.g. "c6"). It is part of the credential's identity — the store keys on
+	// (TenantID, BankID) — and is exposed in String()/LogValue() alongside TenantID
+	// and ClientID so audit/log can reconstruct which bank routed a charge. It is NOT
+	// a secret and never relaxes the tenant scope, it only subdivides it (ADR-0007,
+	// threat T2/T4). An empty BankID is treated as the default BankIDC6 by the store
+	// (retro-compat); callers SHOULD set it explicitly.
+	BankID   string
 	ClientID string
 	// Secret is populated only transiently when resolved from the store.
 	Secret string
@@ -153,7 +353,7 @@ type BankCredential struct {
 // (or the routing-sensitive creditor key) through %v/%s/%+v formatting in logs
 // or errors (defense-in-depth, threat C1/C4; ADR-0004).
 func (c BankCredential) String() string {
-	return fmt.Sprintf("BankCredential{TenantID:%s ClientID:%s Secret:[REDACTED] CreditorKey:[REDACTED]}", c.TenantID, c.ClientID)
+	return fmt.Sprintf("BankCredential{TenantID:%s BankID:%s ClientID:%s Secret:[REDACTED] CreditorKey:[REDACTED]}", c.TenantID, c.BankID, c.ClientID)
 }
 
 // LogValue implements slog.LogValuer so structured logging emits the credential
@@ -162,24 +362,61 @@ func (c BankCredential) String() string {
 func (c BankCredential) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("tenant_id", c.TenantID),
+		slog.String("bank_id", c.BankID),
 		slog.String("client_id", c.ClientID),
 		slog.String("secret", "[REDACTED]"),
 		slog.String("creditor_key", "[REDACTED]"),
 	)
 }
 
-// CredentialStore isolates bank credentials per tenant behind a secret store.
-// No secret ever lives in code; the adapter reads from config/vault (threat C1/C4).
+// CredentialStore isolates bank credentials per tenant AND per bank behind a
+// secret store, keyed by the composite (tenantID, bankID) pair. No secret ever
+// lives in code; the adapter reads from config/vault (threat C1/C4).
 type CredentialStore interface {
-	GetBankCredential(ctx context.Context, tenantID string) (BankCredential, error)
+	// GetBankCredential resolves the credential for the EXACT (tenantID, bankID)
+	// pair. The tenantID always comes from the authenticated caller, never client
+	// input (threat T1/H1); bankID is a non-secret selector WITHIN that tenant's
+	// configured banks. The lookup is exact-match with NO fallback: a missing pair
+	// returns ErrNotFound and never resolves to another bank or another tenant's
+	// credential (deny-by-default, ADR-0007 T1/T2). An empty bankID is treated as the
+	// default BankIDC6 (retro-compat).
+	GetBankCredential(ctx context.Context, tenantID, bankID string) (BankCredential, error)
 }
 
-// CredentialWriter is the write path for per-tenant bank credentials (admin
-// plane). It is kept separate from CredentialStore (the reader) so use-cases
+// CredentialWriter is the write path for per-tenant, per-bank bank credentials
+// (admin plane). It is kept separate from CredentialStore (the reader) so use-cases
 // depend only on the capability they need (ISP). The secret transits straight to
 // the store: it MUST NOT enter domain state, logs, errors or URLs (threat C1/C4).
 type CredentialWriter interface {
-	SetBankCredential(ctx context.Context, tenantID, clientID, secret string) error
+	// SetBankCredential persists the credential for the (tenantID, bankID) pair. An
+	// empty bankID is stored under the default BankIDC6 (retro-compat). Empty
+	// tenantID/clientID/secret are rejected as a validation error WITHOUT echoing the
+	// secret value (threat C1/C4).
+	SetBankCredential(ctx context.Context, tenantID, bankID, clientID, secret string) error
+}
+
+// CreditorKeyWriter is the admin-plane write path for a tenant's registered PIX
+// creditor key (chave do recebedor). It is kept deliberately separate from
+// CredentialWriter so the secret-rotation capability and the fund-routing
+// capability are granted independently (ISP, least privilege): the credential
+// writer rotates the OAuth secret, this writer points the tenant's funds at a PIX
+// key. The creditor key is NOT a secret — it is the account's public PIX
+// identifier — but it IS routing-sensitive (OWASP A01 confused-deputy; ADR-0004,
+// SIN-65862), so a use-case that only needs to set the key never gains the power
+// to rotate the secret and vice versa. The key belongs to the tenant's
+// BankCredential aggregate (default bank BankIDC6, the single allow-listed bank);
+// the adapter resolves it read-modify-write so a creditor-key write never clobbers
+// the secret/client id (ADR-0008).
+type CreditorKeyWriter interface {
+	// SetCreditorKey records the tenant's PIX creditor key (chave do recebedor) on
+	// the tenant's existing bank credential. The adapter MUST preserve the
+	// credential's secret and client id (read-modify-write). A tenant with no
+	// existing credential is rejected (ErrNotFound): a creditor key without a bank
+	// identity is meaningless and a half-credential invites the confused-deputy gap.
+	// Empty tenantID/creditorKey and a creditorKey that is not a syntactically valid
+	// PIX key are rejected as a validation error WITHOUT echoing the value (the key
+	// is routing-sensitive; threat C1/C4).
+	SetCreditorKey(ctx context.Context, tenantID, creditorKey string) error
 }
 
 // CredentialInvalidator is the optional hook the admin plane invokes right after
@@ -199,6 +436,81 @@ type CredentialWriter interface {
 // converge within the token TTL (see ADR-0003).
 type CredentialInvalidator interface {
 	InvalidateToken(tenantID string)
+}
+
+// BankCertificate is the per-(tenant,bank) mTLS client certificate material an
+// admin uploads through the console (SIN-66087). CertPEM is the PUBLIC leaf
+// certificate; KeyPEM is its private key and is a SECRET: write-only, held only
+// transiently on the write path, and NEVER returned, logged or audited. Both
+// String() and LogValue() redact KeyPEM so the key can never leak through
+// %v/%s/%+v formatting or structured logging (threat C1/C4), mirroring
+// BankCredential. An empty BankID is stored under the default BankIDC6 (retro-compat).
+type BankCertificate struct {
+	TenantID string
+	BankID   string
+	CertPEM  string // public leaf certificate (PEM)
+	KeyPEM   string // SECRET private key (PEM) — write-only, transient
+}
+
+// String redacts the private key so a certificate value can never leak it through
+// %v/%s/%+v formatting in logs or errors (defense-in-depth, threat C1/C4). The
+// public certificate is reported only as present/absent, never inlined.
+func (c BankCertificate) String() string {
+	return fmt.Sprintf("BankCertificate{TenantID:%s BankID:%s CertPEM:%s KeyPEM:[REDACTED]}", c.TenantID, c.BankID, certPresence(c.CertPEM))
+}
+
+// LogValue redacts the private key under structured logging, even when the value
+// is logged as an attribute (threat C1/C4), mirroring BankCredential.
+func (c BankCertificate) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("tenant_id", c.TenantID),
+		slog.String("bank_id", c.BankID),
+		slog.String("cert_pem", certPresence(c.CertPEM)),
+		slog.String("key_pem", "[REDACTED]"),
+	)
+}
+
+// certPresence reports whether the public certificate is present without inlining
+// it, keeping log/error lines compact and uniform (the cert is public, but a PEM
+// block does not belong in a log line).
+func certPresence(certPEM string) string {
+	if certPEM == "" {
+		return "[absent]"
+	}
+	return "[present]"
+}
+
+// BankCertificateMeta is the PUBLIC, non-secret metadata of a stored certificate.
+// It is what the admin UI displays and what the write endpoint echoes back; it
+// carries NO private-key material by construction.
+type BankCertificateMeta struct {
+	TenantID          string
+	BankID            string
+	SubjectCN         string
+	Issuer            string
+	SerialNumber      string
+	FingerprintSHA256 string
+	NotBefore         time.Time
+	NotAfter          time.Time
+}
+
+// BankCertificateWriter is the admin-plane write path for a per-(tenant,bank) mTLS
+// certificate. Kept separate from the reader (ISP) so a use-case depends only on
+// the capability it needs. The private key transits straight to the store: beyond
+// the transient BankCertificate it MUST NOT enter domain state, logs, errors or
+// URLs (threat C1/C4). The use-case parses and validates the material BEFORE
+// calling; an empty BankID is stored under the default BankIDC6 (retro-compat).
+type BankCertificateWriter interface {
+	SetBankCertificate(ctx context.Context, cert BankCertificate) error
+}
+
+// BankCertificateReader returns ONLY the public metadata of a stored certificate,
+// never the private key. The tenantID always comes from the authenticated caller
+// (never client input); bankID is a non-secret selector. A missing (tenantID,
+// bankID) pair returns ErrNotFound (deny-by-default). An empty bankID resolves to
+// the default BankIDC6 (retro-compat).
+type BankCertificateReader interface {
+	GetBankCertificateMeta(ctx context.Context, tenantID, bankID string) (BankCertificateMeta, error)
 }
 
 // ChargeRequest is the input to create a charge at the bank.
@@ -457,6 +769,40 @@ type PixDueChargeProvider interface {
 	UpdateDueCharge(ctx context.Context, tenantID, txID string, req PixDueChargeRequest) (PixDueChargeResult, error)
 }
 
+// WebhookRegistration is the registered PIX notification callback read back from
+// the PSP (roteiro: outbound webhook registration). WebhookURL is the HTTPS
+// callback C6 POSTs settlement notifications to for a recebedor key; CreatedAt is
+// the PSP-assigned creation instant (an opaque echo, zero when the PSP omits it).
+//
+// WebhookURL embeds the unguessable per-tenant callback ref (/webhooks/c6/{ref}),
+// which IS the per-tenant credential for the unsigned C6 webhook (ADR-0002/F4) —
+// it is a SECRET and must never be logged. It is returned so a caller can confirm,
+// in memory, that the registered URL matches the one it intended to register
+// (idempotent confirmation) without printing it.
+type WebhookRegistration struct {
+	WebhookURL string
+	CreatedAt  time.Time
+}
+
+// PixWebhookRegistrar is the output port for registering and reading the PSP-side
+// PIX notification webhook (BACEN PIX v2 webhook-by-key). It is kept SEPARATE from
+// the charge ports (ISP): registering the outbound callback URL is a distinct
+// concern from creating/reconciling a charge, and a charge consumer must not be
+// forced to depend on webhook-registration semantics. The C6 adapter implements
+// it; each method carries tenantID explicitly so the per-tenant OAuth2 credential
+// isolation the adapter enforces is never bypassed.
+type PixWebhookRegistrar interface {
+	// RegisterWebhook idempotently registers (PUTs) the HTTPS webhookURL the PSP
+	// will notify for the recebedor key pixKey. A re-run with the same URL replaces
+	// rather than duplicates (the registration is keyed by pixKey at the PSP). A
+	// non-HTTPS webhookURL, or an empty tenantID/pixKey, is shared.ErrValidation.
+	RegisterWebhook(ctx context.Context, tenantID, pixKey, webhookURL string) error
+	// GetWebhook reads back the webhook currently registered for pixKey so a caller
+	// can confirm the registration idempotently. An unregistered key is
+	// shared.ErrNotFound; the read is tenant-scoped through the per-tenant bearer.
+	GetWebhook(ctx context.Context, tenantID, pixKey string) (WebhookRegistration, error)
+}
+
 // PixListFilter is the date-window + pagination filter for listing immediate PIX
 // charges. Start and End are the BACEN inicio/fim bounds (required); Page and
 // PageSize map to paginacao.paginaAtual / paginacao.itensPorPagina (optional — a
@@ -487,40 +833,6 @@ type PixChargeList struct {
 // the per-tenant credential/token isolation the C6 adapter enforces is never
 // bypassed (the tenant is derived from the authenticated caller, never client
 // input — threat H1/P1).
-
-// ConsentRequest is the input to register a recurring-debit (PIX Automático)
-// consent at the bank. Amount and window mirror the domain consent; the adapter
-// only transports them. IdempotencyKey, when present, is forwarded so the PSP
-// collapses retried/concurrent registrations into one consent.
-type ConsentRequest struct {
-	TenantID       string
-	ConsentID      string
-	DebtorTaxID    string
-	MaxAmountCents int64
-	Currency       string
-	Frequency      string
-	StartAt        time.Time
-	EndAt          time.Time // zero => open-ended
-	IdempotencyKey string
-}
-
-// ConsentResult is the bank's response to a consent operation.
-type ConsentResult struct {
-	ConsentID string
-	Status    string
-}
-
-// ConsentProvider is the output port for PIX Automático recurring-debit consents:
-// register, reconcile and cancel. Cancellation must be supported because a payer
-// can revoke authorization at any time.
-type ConsentProvider interface {
-	CreateConsent(ctx context.Context, tenantID string, req ConsentRequest) (ConsentResult, error)
-	// GetConsent reconciles the authoritative consent state from the bank (never
-	// trust a raw webhook — threat W3).
-	GetConsent(ctx context.Context, tenantID, consentID string) (ConsentResult, error)
-	// CancelConsent revokes a consent so no further debits can be originated.
-	CancelConsent(ctx context.Context, tenantID, consentID string) (ConsentResult, error)
-}
 
 // BoletoDiscountTier is the transport mirror of a boleto early-payment discount step
 // (roteiro grupo 3). Exactly one of Bps/FixedCents is set; DaysBeforeDue is the
@@ -588,10 +900,19 @@ type BoletoRequest struct {
 // barcode/linha digitável) the caller renders for the payer, plus the registered
 // parameters echoed back for reconciliation/homologação evidence (roteiro 6.a).
 type BoletoResult struct {
-	BoletoID           string
-	TxID               string
-	Status             string
-	QRCode             string    // PIX EMV copy-and-paste payload (BolePix)
+	BoletoID string
+	// TxID is the bank's registration reference (C6 bank_slips `id`). The app treats a
+	// non-empty TxID as the billing-finalized marker, so the C6 adapter MUST populate it on
+	// create — an empty TxID would let a retry/concurrent registration re-bill (duplicate
+	// ledger entry).
+	TxID   string
+	Status string
+	QRCode string // PIX EMV copy-and-paste payload (BolePix)
+	// OurNumber is C6's "nosso número" (bank_slips `our_number`), reconciliation evidence
+	// (roteiro 6.a). DigitableLine is the linha digitável (bank_slips `digitable_line`),
+	// distinct from the numeric Barcode (`bar_code`). Both zero until the bank returns them.
+	OurNumber          string
+	DigitableLine      string
 	Barcode            string    // boleto linha digitável / barcode
 	AmountCents        int64     // principal the bank registered
 	DueDate            time.Time // registered due date (vencimento); zero when unknown

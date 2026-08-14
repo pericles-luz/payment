@@ -27,6 +27,9 @@ type cobvRequest struct {
 	DiscountFixedCents int64          `json:"discount_fixed_cents"`
 	Devedor            *pixDevedorReq `json:"devedor"`
 	CreditorKey        string         `json:"creditor_key"`
+	// Bank optionally selects which configured bank handles this cobv (multi-bank,
+	// SIN-66022); empty keeps header/default routing, overrides X-Bank-Id (ADR-0007).
+	Bank string `json:"bank"`
 }
 
 // cobvView is the JSON representation of a cobv charge returned to the tenant. The
@@ -72,9 +75,10 @@ func toCobvView(r ports.PixDueChargeResult, amountCents int64) cobvView {
 
 // toDueChargeInput maps the validated boundary body to the use-case input. The due
 // date has already been parsed.
-func toDueChargeInput(tenantID, idemKey string, req cobvRequest, due time.Time) app.DueChargeInput {
+func toDueChargeInput(tenantID, accountID, idemKey string, req cobvRequest, due time.Time) app.DueChargeInput {
 	in := app.DueChargeInput{
 		TenantID:           tenantID,
+		AccountID:          accountID,
 		AmountCents:        req.AmountCents,
 		Currency:           req.Currency,
 		DueDate:            due,
@@ -109,8 +113,13 @@ func (s *Server) handleCreatePixCobV(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid or missing due_date (RFC3339)")
 		return
 	}
+	nr, okBank := s.rebindBank(w, r, req.Bank)
+	if !okBank {
+		return
+	}
+	r = nr
 
-	p, res, err := s.pixCobV.CreateDueCharge(r.Context(), toDueChargeInput(tenantID, idemKey, req, due))
+	p, res, err := s.pixCobV.CreateDueCharge(r.Context(), toDueChargeInput(tenantID, accountFromContext(r.Context()), idemKey, req, due))
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -147,7 +156,7 @@ func (s *Server) handleUpdatePixCobV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.pixCobV.UpdateDueCharge(r.Context(), tenantID, txID, toDueChargeInput(tenantID, idemKey, req, due))
+	res, err := s.pixCobV.UpdateDueCharge(r.Context(), tenantID, txID, toDueChargeInput(tenantID, accountFromContext(r.Context()), idemKey, req, due))
 	if err != nil {
 		writeDomainError(w, err)
 		return

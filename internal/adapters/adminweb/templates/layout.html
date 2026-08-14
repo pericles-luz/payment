@@ -17,7 +17,8 @@
     <div class="brand">◆ Pagamentos · Admin</div>
     <nav aria-label="Seções">
       <ul>
-        <li><a href="/console/tenants"{{if eq .Nav "tenants"}} aria-current="page"{{end}}>Tenants</a></li>
+        <li><a href="/console/accounts"{{if eq .Nav "accounts"}} aria-current="page"{{end}}>Contas</a></li>
+        <li><a href="/console/tenants"{{if eq .Nav "tenants"}} aria-current="page"{{end}}>Empresas-clientes</a></li>
       </ul>
     </nav>
     <div class="account">{{.Role}}</div>

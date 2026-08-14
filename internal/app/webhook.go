@@ -33,6 +33,11 @@ type WebhookService struct {
 	uow      ports.UnitOfWork
 	audit    ports.AuditLog
 	ids      ports.IDProvider
+	// recReader / cobrReader reconcile the authoritative recurrence state before a
+	// recurrence webhook is acted on (PIX Automático, SIN-66036). Nil leaves the
+	// recurrence dispatch unwired: HandleRecEvent/HandleCobREvent then fail closed.
+	recReader  ports.RecProvider
+	cobrReader ports.CobRProvider
 }
 
 // NewWebhookService wires a WebhookService from the provided ports. A nil
@@ -46,13 +51,15 @@ func NewWebhookService(d Deps) *WebhookService {
 		a = noopAudit{}
 	}
 	return &WebhookService{
-		bank:     d.Bank,
-		checkout: d.Checkout,
-		bus:      d.Bus,
-		clock:    d.Clock,
-		uow:      resolveUoW(d),
-		audit:    a,
-		ids:      d.IDs,
+		bank:       d.Bank,
+		checkout:   d.Checkout,
+		bus:        d.Bus,
+		clock:      d.Clock,
+		uow:        resolveUoW(d),
+		audit:      a,
+		ids:        d.IDs,
+		recReader:  d.RecReader,
+		cobrReader: d.CobRReader,
 	}
 }
 

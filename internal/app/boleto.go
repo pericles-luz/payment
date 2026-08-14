@@ -89,7 +89,11 @@ type BoletoPayerInput struct {
 // MonthlyInterestBps are the late-payment rates (groups 1–2); Discounts is the
 // optional early-payment schedule (group 3). Payer is the sacado/pagador (ADR-0005).
 type RegisterBoletoInput struct {
-	TenantID    string
+	TenantID string
+	// AccountID is the owning account resolved at the auth choke-point (SIN-69126),
+	// stamped on the ledger for account→tenant→endpoint metering (SIN-69127).
+	// Attribution-only; empty = self-account. See CreateChargeInput.AccountID.
+	AccountID   string
 	AmountCents int64
 	Currency    string
 	DueDate     time.Time
@@ -166,7 +170,7 @@ func (s *BoletoService) RegisterBoleto(ctx context.Context, in RegisterBoletoInp
 	}
 	p.SetTxID(res.TxID)
 
-	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, BoletoCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now())
+	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, BoletoCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now(), billing.WithAccount(in.AccountID))
 	if err != nil {
 		return nil, ports.BoletoResult{}, err
 	}

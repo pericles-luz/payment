@@ -52,6 +52,7 @@ de terceiros. Todo efeito colateral fica atrás de um *port* (interface), com
 | `cmd/api`, `cmd/worker` | Entrypoints: wiring dos adapters + graceful shutdown. |
 | `migrations` | SQL portável (SQLite agora, Postgres depois), com passo de rollback. |
 | `docs/security` | Threat model + baseline seguro (gate de revisão do PR). |
+| `docs/compliance` | Conformidade contratual C6 (Termo de APIs): **regras BLOQUEANTES A1–A7** + gap analysis ([`c6-termo-apis-regras.md`](docs/compliance/c6-termo-apis-regras.md)). |
 
 ### Plugabilidade demonstrada
 

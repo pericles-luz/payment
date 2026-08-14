@@ -49,7 +49,7 @@ func pixAnchor(req ports.ChargeRequest) string {
 // A non-positive amount or an empty anchor is rejected (complete mediation at the
 // money seam, mirroring the C6 adapter).
 func (s *StubProvider) CreateImmediateCharge(ctx context.Context, tenantID string, req ports.ChargeRequest, expiresIn time.Duration) (ports.PixChargeResult, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.PixChargeResult{}, err
 	}
 	anchor := pixAnchor(req)
@@ -84,7 +84,7 @@ func (s *StubProvider) CreateImmediateCharge(ctx context.Context, tenantID strin
 // GetImmediateCharge returns the authoritative state of an immediate PIX charge for
 // reconciliation. An unknown txid (within the tenant) is shared.ErrNotFound.
 func (s *StubProvider) GetImmediateCharge(ctx context.Context, tenantID, txID string) (ports.PixChargeResult, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.PixChargeResult{}, err
 	}
 	s.mu.Lock()
@@ -100,7 +100,7 @@ func (s *StubProvider) GetImmediateCharge(ctx context.Context, tenantID, txID st
 // [Start,End] (inclusive), paginated. Results are ordered by creation instant so
 // pagination is stable. PageSize <= 0 returns every match on page 0.
 func (s *StubProvider) ListImmediateCharges(ctx context.Context, tenantID string, filter ports.PixListFilter) (ports.PixChargeList, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.PixChargeList{}, err
 	}
 	if filter.Start.IsZero() || filter.End.IsZero() {

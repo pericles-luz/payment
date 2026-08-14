@@ -1,0 +1,23 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/accounts" hx-get="/console/accounts" hx-target="#main" hx-push-url="true">‹ Contas</a> / Nova conta</p>
+<div class="topbar"><h1>Nova conta</h1></div>
+
+<form class="form card" method="post" action="/console/accounts"
+      hx-post="/console/accounts" hx-target="#main" hx-swap="innerHTML">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+
+  <div class="field{{if .Errors.name}} has-error{{end}}">
+    <label for="f-name">Nome da Conta *</label>
+    <input id="f-name" name="name" value="{{.Form.name}}" required maxlength="200" autocomplete="organization" autofocus
+           {{if .Errors.name}}aria-invalid="true" aria-describedby="e-name"{{end}}>
+    {{if .Errors.name}}<span class="error" id="e-name" role="alert">{{.Errors.name}}</span>{{end}}
+  </div>
+
+  <p class="muted">Após criar, aninhe as empresas-clientes desta Conta no detalhe.</p>
+  <div class="form-actions">
+    <a class="btn btn--secondary" href="/console/accounts" hx-get="/console/accounts" hx-target="#main" hx-push-url="true">Cancelar</a>
+    <button class="btn btn--primary" type="submit">Criar conta</button>
+  </div>
+</form>
+{{end}}

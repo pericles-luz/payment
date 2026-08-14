@@ -1,0 +1,824 @@
+openapi: 3.1.0
+info:
+  title: API de Pagamentos Sindireceita
+  version: "1.0.0"
+  summary: Cobrança e conciliação (PIX, boleto, checkout, DDA) sobre bancos do cliente.
+  description: |
+    API REST `/v1` que empresas usam como meio de cobrança sobre a **sua própria**
+    credencial bancária (modelo PSP-Indireto — o dinheiro liquida direto na conta
+    da empresa). Primeiro banco em produção: **C6**.
+
+    Guia de integração/onboarding: `integration-guide.md` (mesma pasta).
+
+    Convenções globais:
+    - **Autenticação:** `Authorization: Bearer <token>` em toda rota `/v1`. A
+      empresa-cliente é derivada do token, nunca de um parâmetro. Token
+      ausente/inválido → `401`.
+    - **Valores monetários:** sempre em **centavos** (inteiro). R$ 10,00 → `1000`.
+    - **Datas/hora:** RFC 3339 (ex. `2026-08-20T00:00:00-03:00`), exceto a janela
+      do extrato que usa `YYYY-MM-DD`.
+    - **Idempotência:** rotas de escrita exigem o header `Idempotency-Key`.
+    - **Erros:** envelope uniforme `{ "error": "..." }` (não é RFC 7807; ver guia).
+    - **Limites de entrada:** corpo até 1 MiB (`413` acima); campos JSON
+      desconhecidos são rejeitados (`400`).
+    - **Rate limit:** token-bucket por empresa (burst 20, 10 req/s) → `429`.
+  contact:
+    name: Suporte técnico Sindireceita
+  license:
+    name: Proprietária
+servers:
+  - url: https://api.pagamentos.sindireceita.example
+    description: Produção (URL real definida por ambiente)
+  - url: https://homolog.api.pagamentos.sindireceita.example
+    description: Homologação
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: PIX
+    description: Cobrança PIX imediata e com vencimento (cobv).
+  - name: Checkout
+    description: Sessão de checkout hospedado (venda online).
+  - name: Boleto
+    description: Boletos BolePix com multa/juros/desconto.
+  - name: DDA
+    description: Consulta e pagamento de boletos no DDA / agendamento.
+  - name: Extrato
+    description: Extrato da conta por período.
+  - name: Cobranças
+    description: Cobrança genérica (compat).
+  - name: Sistema
+    description: Health check e provisionamento.
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [Sistema]
+      summary: Health check (público)
+      description: Única rota não autenticada. Não expõe segredos.
+      security: []
+      responses:
+        "200":
+          description: Serviço no ar.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  version: { type: string, example: v1.2.3 }
+                  commit: { type: string, example: b1e1cbc }
+                  built_at: { type: string, example: "2026-08-12T10:00:00Z" }
+
+  /v1/charges:
+    post:
+      operationId: createCharge
+      tags: [Cobranças]
+      summary: Criar cobrança genérica
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateChargeRequest" }
+      responses:
+        "201":
+          description: Cobrança criada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Charge" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/charges/{id}:
+    get:
+      operationId: getCharge
+      tags: [Cobranças]
+      summary: Consultar cobrança
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Cobrança.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Charge" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/pix:
+    post:
+      operationId: createPix
+      tags: [PIX]
+      summary: Criar cobrança PIX imediata
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePixRequest" }
+      responses:
+        "201":
+          description: Cobrança PIX criada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixCharge" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    get:
+      operationId: listPix
+      tags: [PIX]
+      summary: Listar cobranças PIX por período
+      parameters:
+        - name: start
+          in: query
+          required: true
+          description: Início da janela (RFC 3339).
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          required: true
+          description: Fim da janela (RFC 3339).
+          schema: { type: string, format: date-time }
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, default: 0 }
+        - name: page_size
+          in: query
+          required: false
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: Página de cobranças.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/pix/{txid}:
+    get:
+      operationId: getPix
+      tags: [PIX]
+      summary: Consultar cobrança PIX imediata
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+      responses:
+        "200":
+          description: Cobrança PIX (conciliada com o PSP).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixCharge" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/pix/cobv:
+    post:
+      operationId: createCobV
+      tags: [PIX]
+      summary: Criar cobrança PIX com vencimento (cobv)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CobVRequest" }
+      responses:
+        "201":
+          description: Cobrança cobv criada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobV" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/pix/cobv/{txid}:
+    get:
+      operationId: getCobV
+      tags: [PIX]
+      summary: Consultar cobrança cobv
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+      responses:
+        "200":
+          description: Cobrança cobv.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobV" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    put:
+      operationId: updateCobV
+      tags: [PIX]
+      summary: Alterar cobrança cobv
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CobVRequest" }
+      responses:
+        "200":
+          description: Cobrança cobv alterada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobV" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/checkout:
+    post:
+      operationId: createCheckout
+      tags: [Checkout]
+      summary: Abrir sessão de checkout hospedado
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateCheckoutRequest" }
+      responses:
+        "201":
+          description: Sessão criada (com URL de redirecionamento).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CheckoutSession" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/checkout/{id}:
+    get:
+      operationId: getCheckout
+      tags: [Checkout]
+      summary: Consultar sessão de checkout
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Sessão de checkout (conciliada).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CheckoutSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      operationId: cancelCheckout
+      tags: [Checkout]
+      summary: Cancelar sessão de checkout (idempotente)
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Sessão cancelada (repetir o cancelamento retorna o estado cancelado).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CheckoutSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/boletos:
+    post:
+      operationId: createBoleto
+      tags: [Boleto]
+      summary: Registrar boleto (BolePix)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBoletoRequest" }
+      responses:
+        "201":
+          description: Boleto registrado.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Boleto" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/boletos/{id}:
+    get:
+      operationId: getBoleto
+      tags: [Boleto]
+      summary: Consultar boleto
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Boleto.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Boleto" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    put:
+      operationId: updateBoleto
+      tags: [Boleto]
+      summary: Alterar boleto (vencimento/validade/valor/multa/juros/desconto)
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateBoletoRequest" }
+      responses:
+        "200":
+          description: Boleto alterado.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Boleto" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      operationId: deleteBoleto
+      tags: [Boleto]
+      summary: Baixa / cancelamento de boleto
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "204":
+          description: Boleto baixado/cancelado.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/dda/boletos:
+    get:
+      operationId: listDDABoletos
+      tags: [DDA]
+      summary: Listar boletos abertos no DDA
+      responses:
+        "200":
+          description: Boletos no DDA da empresa.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DDABoletoList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/dda/payment-groups:
+    post:
+      operationId: createDDAGroup
+      tags: [DDA]
+      summary: Criar grupo de pagamento (consulta inicial)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateDDAGroupRequest" }
+      responses:
+        "201":
+          description: Grupo criado com itens consultados.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DDAGroup" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/dda/payment-groups/{id}/items:
+    get:
+      operationId: getDDAGroupItems
+      tags: [DDA]
+      summary: Ler itens de um grupo de pagamento
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Itens do grupo.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DDAItemList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      operationId: removeDDAGroupItems
+      tags: [DDA]
+      summary: Remover itens do grupo (lista)
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RemoveDDAItemsRequest" }
+      responses:
+        "204":
+          description: Itens removidos.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/dda/payment-groups/{id}/items/{itemID}:
+    delete:
+      operationId: removeDDAGroupItem
+      tags: [DDA]
+      summary: Remover um item do grupo
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: itemID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: Item removido.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /v1/dda/payment-groups/{id}/submit:
+    post:
+      operationId: submitDDAGroup
+      tags: [DDA]
+      summary: Submeter grupo para aprovação (idempotente)
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Grupo submetido (reenviar um grupo já aprovado retorna 204).
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/statement:
+    get:
+      operationId: getStatement
+      tags: [Extrato]
+      summary: Extrato da conta por período
+      description: Janela máxima de 30 dias; `fim` deve ser &gt;= `inicio`.
+      parameters:
+        - name: inicio
+          in: query
+          required: true
+          description: Data inicial (YYYY-MM-DD, UTC).
+          schema: { type: string, format: date, example: "2026-08-01" }
+        - name: fim
+          in: query
+          required: true
+          description: Data final (YYYY-MM-DD, UTC).
+          schema: { type: string, format: date, example: "2026-08-30" }
+      responses:
+        "200":
+          description: Lançamentos do período.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Statement" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Token de API escopado por empresa-cliente.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Chave estável por intenção de negócio. Reenvio com a mesma chave não duplica o efeito.
+      schema: { type: string, minLength: 1 }
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    PathTxid:
+      name: txid
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Validação falhou, JSON malformado, campo desconhecido ou header obrigatório ausente.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            invalid: { value: { error: "invalid request" } }
+            idem: { value: { error: "missing Idempotency-Key header" } }
+    Unauthorized:
+      description: Token ausente ou inválido.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "unauthorized" }
+    NotFound:
+      description: Recurso inexistente ou pertencente a outra empresa (mesma resposta, para não vazar existência).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "not found" }
+    Conflict:
+      description: Conflito de estado.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "conflict" }
+    TooManyRequests:
+      description: Rate limit excedido (burst 20, 10 req/s por empresa). Faça backoff.
+    InternalError:
+      description: Erro interno (transitório).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "internal error" }
+
+  schemas:
+    Error:
+      type: object
+      description: Envelope de erro uniforme (não é RFC 7807).
+      required: [error]
+      properties:
+        error: { type: string, description: Mensagem curta e segura (sem detalhe interno). }
+
+    Devedor:
+      type: object
+      description: Dados do devedor/pagador (opcional).
+      properties:
+        tax_id: { type: string, description: CPF/CNPJ. }
+        name: { type: string }
+
+    CreateChargeRequest:
+      type: object
+      required: [endpoint, amount_cents, currency]
+      properties:
+        endpoint: { type: string }
+        amount_cents: { type: integer, format: int64, description: Valor em centavos. }
+        currency: { type: string, example: BRL }
+    Charge:
+      type: object
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        endpoint: { type: string }
+        amount_cents: { type: integer, format: int64 }
+        currency: { type: string }
+        status: { type: string }
+        tx_id: { type: string }
+
+    CreatePixRequest:
+      type: object
+      required: [amount_cents, currency, expires_in_seconds]
+      properties:
+        amount_cents: { type: integer, format: int64, description: Valor em centavos. }
+        currency: { type: string, example: BRL }
+        expires_in_seconds: { type: integer, format: int64 }
+        devedor: { $ref: "#/components/schemas/Devedor" }
+    PixCharge:
+      type: object
+      properties:
+        txid: { type: string }
+        status: { type: string }
+        qr_code: { type: string, description: Payload EMV copia-e-cola. }
+        qr_code_location: { type: string }
+        expires_at: { type: string, format: date-time }
+        amount_cents: { type: integer, format: int64 }
+        received_amount_cents: { type: integer, format: int64 }
+    PixList:
+      type: object
+      properties:
+        charges:
+          type: array
+          items: { $ref: "#/components/schemas/PixCharge" }
+        page: { type: integer }
+        page_size: { type: integer }
+        total_items: { type: integer }
+        total_pages: { type: integer }
+
+    CobVRequest:
+      type: object
+      required: [amount_cents, currency, due_date, validity_days, fine_bps, monthly_interest_bps, creditor_key]
+      properties:
+        amount_cents: { type: integer, format: int64, description: Valor em centavos. }
+        currency: { type: string, example: BRL }
+        due_date: { type: string, format: date-time }
+        validity_days: { type: integer }
+        fine_bps: { type: integer, format: int64, description: Multa por atraso em pontos-base. }
+        monthly_interest_bps: { type: integer, format: int64, description: Juros mensais por atraso em pontos-base. }
+        discount_bps: { type: integer, format: int64, description: Desconto por antecipação em pontos-base. }
+        discount_fixed_cents: { type: integer, format: int64, description: Desconto fixo em centavos. }
+        devedor: { $ref: "#/components/schemas/Devedor" }
+        creditor_key: { type: string, description: Chave PIX do recebedor. }
+    CobV:
+      type: object
+      properties:
+        txid: { type: string }
+        status: { type: string }
+        qr_code: { type: string }
+        qr_code_location: { type: string }
+        due_date: { type: string, format: date-time }
+        validity_days: { type: integer }
+        fine_bps: { type: integer, format: int64 }
+        monthly_interest_bps: { type: integer, format: int64 }
+        discount_bps: { type: integer, format: int64 }
+        discount_fixed_cents: { type: integer, format: int64 }
+        amount_cents: { type: integer, format: int64 }
+        received_amount_cents: { type: integer, format: int64 }
+
+    CheckoutItem:
+      type: object
+      properties:
+        description: { type: string }
+        amount_cents: { type: integer, format: int64, description: Valor do item em centavos. }
+    CreateCheckoutRequest:
+      type: object
+      required: [currency, items]
+      description: Informe `expires_at` OU `expires_in_seconds`.
+      properties:
+        currency: { type: string, example: BRL }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CheckoutItem" }
+        expires_at: { type: string, format: date-time }
+        expires_in_seconds: { type: integer, format: int64 }
+        card_type: { type: string }
+        require_authentication: { type: boolean }
+    CheckoutSession:
+      type: object
+      properties:
+        session_id: { type: string }
+        status: { type: string }
+        redirect_url: { type: string, description: URL hospedada para redirecionar o comprador. }
+        amount_cents: { type: integer, format: int64 }
+        card_type: { type: string }
+        require_authentication: { type: boolean }
+
+    Address:
+      type: object
+      properties:
+        street: { type: string }
+        number: { type: integer }
+        city: { type: string }
+        state: { type: string }
+        zip_code: { type: string }
+    Payer:
+      type: object
+      required: [address]
+      properties:
+        name: { type: string }
+        tax_id: { type: string, description: CPF/CNPJ. }
+        address: { $ref: "#/components/schemas/Address" }
+    DiscountTier:
+      type: object
+      description: Faixa de desconto por antecipação; informe exatamente um de bps ou fixed_cents.
+      properties:
+        days_before_due: { type: integer }
+        bps: { type: integer, format: int64 }
+        fixed_cents: { type: integer, format: int64 }
+    CreateBoletoRequest:
+      type: object
+      required: [amount_cents, currency, due_date, fine_bps, monthly_interest_bps, payer]
+      properties:
+        amount_cents: { type: integer, format: int64, description: Valor em centavos. }
+        currency: { type: string, example: BRL }
+        due_date: { type: string, format: date-time }
+        fine_bps: { type: integer, format: int64, description: Multa por atraso em pontos-base. }
+        fine_fixed_cents: { type: integer, format: int64, description: Multa fixa em centavos. }
+        monthly_interest_bps: { type: integer, format: int64, description: Juros mensais por atraso em pontos-base. }
+        discounts:
+          type: array
+          items: { $ref: "#/components/schemas/DiscountTier" }
+        payer: { $ref: "#/components/schemas/Payer" }
+    UpdateBoletoRequest:
+      type: object
+      required: [due_date]
+      description: Alteração de vencimento/validade/valor/multa/juros/desconto (grupo 5).
+      properties:
+        amount_cents: { type: integer, format: int64 }
+        currency: { type: string, example: BRL }
+        due_date: { type: string, format: date-time }
+        valid_until: { type: string, format: date-time }
+        fine_bps: { type: integer, format: int64 }
+        fine_fixed_cents: { type: integer, format: int64 }
+        monthly_interest_bps: { type: integer, format: int64 }
+        discounts:
+          type: array
+          items: { $ref: "#/components/schemas/DiscountTier" }
+    Boleto:
+      type: object
+      properties:
+        boleto_id: { type: string }
+        txid: { type: string }
+        status: { type: string }
+        qr_code: { type: string, description: Payload BolePix EMV copia-e-cola. }
+        barcode: { type: string, description: Linha digitável. }
+        our_number: { type: string, description: Nosso número. }
+        digitable_line: { type: string }
+        amount_cents: { type: integer, format: int64 }
+        due_date: { type: string, format: date-time }
+        valid_until: { type: string, format: date-time }
+        fine_bps: { type: integer, format: int64 }
+        fine_fixed_cents: { type: integer, format: int64 }
+        monthly_interest_bps: { type: integer, format: int64 }
+        discounts:
+          type: array
+          items: { $ref: "#/components/schemas/DiscountTier" }
+
+    DDABoleto:
+      type: object
+      properties:
+        id: { type: string }
+        barcode: { type: string, description: Linha digitável. }
+        amount_cents: { type: integer, format: int64 }
+        due_date: { type: string, format: date-time }
+        beneficiary_name: { type: string }
+    DDABoletoList:
+      type: object
+      properties:
+        boletos:
+          type: array
+          items: { $ref: "#/components/schemas/DDABoleto" }
+    DDAItem:
+      type: object
+      properties:
+        id: { type: string }
+        barcode: { type: string, description: Linha digitável. }
+        amount_cents: { type: integer, format: int64 }
+        due_date: { type: string, format: date-time }
+    CreateDDAGroupRequest:
+      type: object
+      required: [barcodes]
+      properties:
+        barcodes:
+          type: array
+          items: { type: string, description: Linha digitável. }
+    DDAGroup:
+      type: object
+      properties:
+        txid: { type: string, description: Identificador do grupo para operações seguintes. }
+        status: { type: string }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/DDAItem" }
+    DDAItemList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/DDAItem" }
+    RemoveDDAItemsRequest:
+      type: object
+      required: [item_ids]
+      properties:
+        item_ids:
+          type: array
+          items: { type: string }
+
+    StatementEntry:
+      type: object
+      properties:
+        id: { type: string }
+        date: { type: string, format: date, description: YYYY-MM-DD. }
+        amount_cents: { type: integer, format: int64 }
+        kind: { type: string, description: Tipo do lançamento. }
+        description: { type: string }
+    Statement:
+      type: object
+      properties:
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/StatementEntry" }

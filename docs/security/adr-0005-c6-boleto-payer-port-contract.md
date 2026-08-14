@@ -185,3 +185,17 @@ httptest cobrindo o novo shape `bank_slips` (request body + 201 mapeado) ·
 coverage >85% · `-race` · `go vet` + `staticcheck` limpos · stub intacto · PR no
 fork `ia-dev-sindireceita/payment`, **CTO mergeia** (ver memória _go-mei-das/payment
 fork = CTO merges_).
+
+---
+
+## Addendum (SIN-65953) — 201 real capturado: correções de wire confirmadas
+
+Status: Aceito — CTO. Origem: [SIN-65953](/SIN/issues/SIN-65953) (split de [SIN-65882](/SIN/issues/SIN-65882)); 201 real em [SIN-65888](/SIN/issues/SIN-65888). O 201 capturado ao vivo no sandbox C6 corrigiu três suposições best-effort deste ADR:
+
+- **`amount` é DECIMAL REAIS no wire (ex. `12.34`), não centavos.** O exemplo `"amount": 1234` no corpo acima estava errado (cobraria 100× a mais). **Decisão de port (não negociável): o port continua em centavos inteiros (`AmountCents int64`); decimais são detalhe de transporte CONFINADO ao adapter C6.** A conversão centavos↔decimal é por **aritmética inteira** (`fmt.Sprintf("%d.%02d", c/100, c%100)`), **nunca `float64`** (float em dinheiro = drift de centavo). Implementado pelo tipo `brlDecimal` (Marshal/Unmarshal sem `ParseFloat`), test-locked contra float drift.
+- **Taxas são objetos `{value, type}`, não `fine_bps`/etc.** O schema estrito do C6 dá 400 em `fine_bps`/`fine_fixed_cents`/`monthly_interest_bps`/`discounts`. Wire real: `fine`/`interest` = `{value:<decimal>, type:"PERCENTAGE"|"FIXED"}`, **omitempty** (taxa zero omite a chave — senão 400). Mapeamento: `FineBps→fine{bps/100,PERCENTAGE}`, `FineFixedCents→fine{reais,FIXED}` (mutuamente exclusivos, percentual vence), `MonthlyInterestBps→interest{...}`. Strings de `type` best-effort até um 201 ecoar uma fee criada.
+- **Response 201 é shape novo:** `id`, `our_number`, `originator_id`, `bar_code`, `digitable_line`, `amount`(decimal), `billing_scheme`, `billing_type`. **Sem `status`/`txid`/`qr_code` na criação.** DTO dedicado `bankSlipResponseBody` (o legado `boletoResponseBody` fica nos paths id-addressed `/boletos/{id}`, contrato não capturado). Port aditivo: `+OurNumber`, `+DigitableLine`.
+- **Invariante financeiro (CTO):** `id → BoletoResult.TxID`. `TxID` não-vazio é o marcador de *billing-finalizado* (`app/boleto.go`); deixá-lo vazio reexecutaria `SavePayment`+`AppendLedgerEntry` num retry → ledger duplicado. Test-locked (`TestCreateBoleto201Mapped` exige `TxID` não-vazio = `id`).
+- **`discount` portal-gated:** inner schema não descoberto por probing cego → **omitido** do create até captura via portal. Follow-up filho de SIN-65953. `CreateBoleto` não emite a chave (test-locked).
+
+Reversibilidade: mudança aditiva no port + adapter-confined; rollback = reverter o commit (sem migração).

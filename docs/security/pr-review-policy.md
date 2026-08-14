@@ -114,6 +114,25 @@ Aplicar os itens da(s) categoria(s) disparada(s). Citar a lente por nome no come
 - [ ] Dependência nova justificada; `govulncheck` limpo; `go.sum` atualizado.
 - [ ] Logging sem PII; retenção/expurgo conforme LGPD se tocou dados pessoais.
 
+### 4.7 Registro de acesso a PII / art.13 (G) — LGPD/B10-v, ADR-0008
+Dispara quando o PR **adiciona ou altera uma leitura que resolve/retorna PII de
+titular pessoa natural** — hoje o devedor da recorrência (`pix_rec.devedor_doc`/
+`devedor_nome`), qualquer campo `Devedor*`/`Payer{Name,TaxID,Address}`/sacado, ou um
+novo endpoint/tela que os exponha.
+- [ ] A leitura tier-1 de PII passa pelo choke-point `app.PIIAccessService` (ou
+      equivalente que emita `ports.PIIAccessRecorder` na **mesma** transação da
+      leitura de PII local). Uma leitura de PII que **não** registra acesso é
+      **block** (Complete Mediation, ADR-0008 §5).
+- [ ] O `subject_ref` é pseudônimo (`access.Pseudonymizer` / HMAC) ou id opaco —
+      **nunca** `devedor_doc`/`devedor_nome`/nome/endereço em claro (minimização,
+      ADR-0008 §4). Grep de teste garante que nenhuma coluna do `pii_access_log`
+      recebe PII em claro.
+- [ ] Responsável derivado **server-side** (`tenant_id` + `client_id`; `operator_id`
+      quando via admin/console) — nunca identidade fornecida pelo cliente.
+- [ ] Duração medida no choke-point; ação no vocabulário fechado `access.Action`.
+- [ ] Se tocou o `pii_access_log`: append-only, o **único** DELETE é o expurgo por
+      retenção (`PIIAccessRetentionService`).
+
 ## 5. Severidade e disposição
 
 - **Crítica / Alta** (exploitável; cross-tenant; fraude financeira; vazamento de
@@ -134,6 +153,11 @@ O CTO deve codificar como gate de CI o que for mecanizável:
 - Lint/regra que falha em SQL concatenado e em `InsecureSkipVerify`.
 - Scanner de segredo (`gitleaks`) no PR.
 - **Teste de isolamento de tenant** rodando no CI como suíte obrigatória.
+- **Gate anti-bypass do registro de PII (ADR-0008 §5):** grep que falha o build se um
+  handler/serviço fora do choke-point `access`/`PIIAccessService` retornar campos
+  `Devedor*`/`Payer` de titular sem passar pelo `ports.PIIAccessRecorder`. Ex.:
+  `grep -rnE '\.Devedor\(\)\.(Doc|Nome)\(\)' internal/ --include='*.go' | grep -v -E '(_test\.go|domain/access|app/pii_access|persistence/.*recurrence)'`
+  deve retornar vazio (revisar cada novo hit manualmente até o gate existir).
 - Checagem de que PRs que tocam arquivos sensíveis (paths de auth/webhook/repo/
   bank/billing) exigem label/aprovação de segurança (CODEOWNERS apontando o
   SecurityEngineer para esses paths).

@@ -1,0 +1,27 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/accounts/{{.Account.ID}}" hx-get="/console/accounts/{{.Account.ID}}" hx-target="#main" hx-push-url="true">‹ {{.Account.Name}}</a> / Faturas</p>
+<div class="topbar"><h1>Faturas por Conta</h1></div>
+
+<nav class="tabs" aria-label="Seções da Conta">
+  <a href="/console/accounts/{{.Account.ID}}" hx-get="/console/accounts/{{.Account.ID}}" hx-target="#main" hx-push-url="true">Visão geral</a>
+  <a href="/console/accounts/{{.Account.ID}}/consumption" hx-get="/console/accounts/{{.Account.ID}}/consumption" hx-target="#main" hx-push-url="true">Uso</a>
+  <a href="/console/accounts/{{.Account.ID}}/invoices" aria-current="page">Faturas</a>
+</nav>
+
+<p class="muted">Faturas por empresa-cliente, agrupadas na Conta. Gerar o lote produz uma fatura por empresa-cliente com consumo no período (recorte imutável do ledger; nunca sobrescreve).</p>
+
+<form class="toolbar" method="post" action="/console/accounts/{{.Account.ID}}/invoices"
+      hx-post="/console/accounts/{{.Account.ID}}/invoices" hx-target="#main" hx-push-url="true">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <input type="hidden" name="idempotency_key" value="{{.IdempotencyToken}}">
+  <label for="start_date">De</label>
+  <input id="start_date" type="date" name="start_date" value="{{.StartDate}}" required>
+  <label for="end_date">Até</label>
+  <input id="end_date" type="date" name="end_date" value="{{.EndDate}}" required>
+  <button class="btn btn--primary" type="submit">Gerar faturas do período</button>
+</form>
+
+<div class="table-wrap" id="account-invoices-list">
+  {{template "account_invoice_rows" .}}
+</div>
+{{end}}

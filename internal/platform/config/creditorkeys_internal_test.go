@@ -23,8 +23,8 @@ func TestMergeCreditorKeys(t *testing.T) {
 
 	base := func() map[string]ports.BankCredential {
 		return map[string]ports.BankCredential{
-			"tenantA": {TenantID: "tenantA", ClientID: "cidA", Secret: "secA"},
-			"tenantB": {TenantID: "tenantB", ClientID: "cidB", Secret: "secB"},
+			bankCredKey("tenantA", "c6"): {TenantID: "tenantA", BankID: "c6", ClientID: "cidA", Secret: "secA"},
+			bankCredKey("tenantB", "c6"): {TenantID: "tenantB", BankID: "c6", ClientID: "cidB", Secret: "secB"},
 		}
 	}
 
@@ -93,7 +93,7 @@ func TestMergeCreditorKeys(t *testing.T) {
 			got := mergeCreditorKeys(base(), tc.in, logger)
 
 			for tenant, wantKey := range tc.want {
-				cred, ok := got[tenant]
+				cred, ok := got[bankCredKey(tenant, "c6")]
 				if !ok {
 					t.Fatalf("tenant %q dropped from credential map", tenant)
 				}
@@ -109,6 +109,37 @@ func TestMergeCreditorKeys(t *testing.T) {
 				t.Fatalf("creditor key %q leaked into log: %q", tc.noLeak, buf.String())
 			}
 		})
+	}
+}
+
+// TestMergeCreditorKeysMultiBank pins the 3-field "tenant:bank:creditorKey" form
+// (ADR-0007): the key is folded into the credential at the SAME (tenant, bank)
+// pair, the legacy 2-field form still targets c6, and a key for a bank the tenant
+// did not configure is skipped (no half-credential, no cross-bank leak).
+func TestMergeCreditorKeysMultiBank(t *testing.T) {
+	creds := map[string]ports.BankCredential{
+		bankCredKey("t1", "c6"):   {TenantID: "t1", BankID: "c6", ClientID: "c6-cid", Secret: "c6-sec"},
+		bankCredKey("t1", "itau"): {TenantID: "t1", BankID: "itau", ClientID: "itau-cid", Secret: "itau-sec"},
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// 3-field targets itau; 2-field legacy targets c6; the bradesco key has no
+	// matching credential and is dropped.
+	got := mergeCreditorKeys(creds, "t1:itau:itau@pix.example, t1:c6@pix.example, t1:bradesco:ghost@pix.example", logger)
+
+	if k := got[bankCredKey("t1", "itau")].CreditorKey; k != "itau@pix.example" {
+		t.Fatalf("itau creditor key = %q, want itau@pix.example", k)
+	}
+	if k := got[bankCredKey("t1", "c6")].CreditorKey; k != "c6@pix.example" {
+		t.Fatalf("c6 creditor key = %q, want c6@pix.example", k)
+	}
+	if _, ok := got[bankCredKey("t1", "bradesco")]; ok {
+		t.Fatal("a creditor key for an unconfigured bank must not synthesize a credential")
+	}
+	// The routing-sensitive key value never reaches the log.
+	if strings.Contains(buf.String(), "ghost@pix.example") {
+		t.Fatalf("creditor key leaked into log: %q", buf.String())
 	}
 }
 

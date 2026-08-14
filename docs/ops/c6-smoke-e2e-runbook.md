@@ -112,9 +112,12 @@ PAYMENT_C6_BASE_URL= PAYMENT_SECURE_COOKIES=false \
 until curl -s http://127.0.0.1:18080/healthz >/dev/null; do sleep 0.1; done
 ```
 
-> A URL a registrar no portal C6 é `https://<dominio>/webhooks/c6/$REF`. **Nunca**
-> logue `$REF` nem a URL completa — o edge mascara o path `/webhooks/c6/*`
-> (ver [`ingress-runbook.md`](./ingress-runbook.md) §6/§7).
+> A URL `https://<dominio>/webhooks/c6/$REF` é registrada no C6 **via API**, não
+> pelo portal: `PUT /v2/pix/webhook/{chave}` (a `chave` do recebedor vai no path,
+> a URL no corpo `{"webhookUrl":"…"}`) — ver §9 e `cmd/register-webhook`
+> ([SIN-65908](/SIN/issues/SIN-65908)). **Nunca** logue `$REF` nem a URL completa —
+> o edge mascara o path `/webhooks/c6/*` (ver
+> [`ingress-runbook.md`](./ingress-runbook.md) §6/§7).
 
 ### 5.1 Criar cobrança PIX (bearer do tenant + Idempotency-Key obrigatório)
 
@@ -122,7 +125,7 @@ until curl -s http://127.0.0.1:18080/healthz >/dev/null; do sleep 0.1; done
 RESP=$(curl -s -X POST http://127.0.0.1:18080/v1/charges \
   -H "Authorization: Bearer $TNT" -H "Idempotency-Key: smoke-key-001" \
   -H "Content-Type: application/json" \
-  -d "{\"endpoint\":\"$ENDPOINT\",\"amount_cents\":1500,\"currency\":\"BRL\"}")
+  -d "{\"endpoint\":\"$ENDPOINT\",\"amount_cents\":500,\"currency\":\"BRL\"}")
 echo "$RESP"
 PID=$(echo "$RESP"  | sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p')
 TXID=$(echo "$RESP" | sed -n 's/.*"tx_id":"\([^"]*\)".*/\1/p')
@@ -131,8 +134,15 @@ TXID=$(echo "$RESP" | sed -n 's/.*"tx_id":"\([^"]*\)".*/\1/p')
 `HTTP 201`, saída verificada (`status=pending`, `tx_id=tx_<paymentID>`):
 
 ```json
-{"id":"37a544d0dec05baaa117cea15f319bd8","tenant_id":"f156fd81fafedf9cfc4c7828fdb56cdb","endpoint":"/v1/notify","amount_cents":1500,"currency":"BRL","status":"pending","tx_id":"tx_37a544d0dec05baaa117cea15f319bd8"}
+{"id":"37a544d0dec05baaa117cea15f319bd8","tenant_id":"f156fd81fafedf9cfc4c7828fdb56cdb","endpoint":"/v1/notify","amount_cents":500,"currency":"BRL","status":"pending","tx_id":"tx_37a544d0dec05baaa117cea15f319bd8"}
 ```
+
+> 💡 **Valor ≤ R$ 10,00 no sandbox.** Mantenha o exemplo em R$ 5,00
+> (`amount_cents: 500`). No stub o valor é arbitrário (nunca liquida sozinho — §2),
+> mas no **sandbox real do C6** a auto-confirmação de PIX só dispara para cobranças
+> **≤ R$ 10,00** — usar um valor acima da faixa (ex.: R$ 15,00) é uma pegadinha que
+> custou um smoke ao vivo na [SIN-65917](/SIN/issues/SIN-65917). O exemplo nunca
+> deve sugerir um valor fora da faixa.
 
 ### 5.2 Ler a cobrança
 
@@ -148,7 +158,7 @@ curl -s http://127.0.0.1:18080/v1/charges/$PID -H "Authorization: Bearer $TNT"
 curl -s -X POST http://127.0.0.1:18080/v1/charges \
   -H "Authorization: Bearer $TNT" -H "Idempotency-Key: smoke-key-001" \
   -H "Content-Type: application/json" \
-  -d "{\"endpoint\":\"$ENDPOINT\",\"amount_cents\":1500,\"currency\":\"BRL\"}"
+  -d "{\"endpoint\":\"$ENDPOINT\",\"amount_cents\":500,\"currency\":\"BRL\"}"
 ```
 
 → retorna o **mesmo `id`/`tx_id`** da 5.1 (nenhuma cobrança nova).
@@ -238,14 +248,27 @@ go test ./internal/adapters/bank/ -run 'Consent|Boleto|Checkout' -v
 
 Quando as credenciais chegarem ([SIN-65344](/SIN/issues/SIN-65344)):
 
-1. Preencha `PAYMENT_C6_BASE_URL`, `PAYMENT_C6_TOKEN_URL`, `PAYMENT_C6_SCOPE`
-   (HTTPS; URL `http://` falha o startup por design).
+1. Preencha `PAYMENT_C6_BASE_URL` e `PAYMENT_C6_TOKEN_URL` (HTTPS; URL `http://`
+   falha o startup por design). **Deixe `PAYMENT_C6_SCOPE` VAZIO** — ver o aviso
+   abaixo.
+
+   > ⚠️ **`PAYMENT_C6_SCOPE` deve ficar VAZIO.** Setar um `scope` explícito faz o
+   > endpoint OAuth2 do C6 (`/v1/auth/`) responder **400 / `invalid_request`**;
+   > **omitir** o parâmetro retorna **200** já com os escopos completos da
+   > credencial. Não inventar valor. (`.env.example` traz `PAYMENT_C6_SCOPE=`
+   > vazio de propósito — descoberto ao vivo na [SIN-65917](/SIN/issues/SIN-65917).)
 2. Forneça o **certificado de cliente mTLS** (ver §8): `PAYMENT_C6_CLIENT_CERT` e
    `PAYMENT_C6_CLIENT_KEY` apontando para os arquivos PEM montados pelo secret
    manager.
 3. Forneça `PAYMENT_BANK_CREDS` com o `client_id`/`secret` reais do tenant (via
-   secret manager), ou escreva via `PUT /admin/tenants/{id}/bank-credential`.
-4. Registre a URL `https://<dominio>/webhooks/c6/$REF` no portal C6.
+   secret manager), ou escreva via `PUT /admin/tenants/{id}/bank-credential`. A
+   **chave PIX do recebedor** vai numa var **separada**, `PAYMENT_BANK_CREDITOR_KEYS`
+   (formato `tenant:creditorKey,…`) — **não** em `PAYMENT_BANK_CREDS` (ver §9.1).
+4. Registre a URL `https://<dominio>/webhooks/c6/$REF` no C6 **via API** —
+   `PUT /v2/pix/webhook/{chave}` (`chave` no path, `{"webhookUrl":"…"}` no corpo).
+   Use `cmd/register-webhook` ([SIN-65908](/SIN/issues/SIN-65908)), que resolve a
+   `chave` por-tenant de `PAYMENT_BANK_CREDITOR_KEYS`, faz o PUT e confirma com um
+   GET. **Não** é registro pelo portal.
 5. Rode a §5 idêntica: agora o caminho **positivo** de liquidação fecha por HTTP
    (o C6 reporta `paid` na reconciliação) e a §5.4 vira o caso de liquidação real.
 
@@ -277,7 +300,77 @@ Comportamento (`cmd/api/main.go` `newBankProvider` → `c6.MTLSHTTPClient`):
   cert quando ele foi pedido, em vez de degradar silenciosamente para sem-mTLS.
 
 Em homologação/produção os arquivos vêm do secret manager, montados read-only no
-FS do processo (não do repositório). Permissões `0600`; nunca commitar PEM.
+FS do processo (não do repositório). Nunca commitar PEM.
+
+> ⚠️ **Permissão obrigatória: `0600`, NUNCA `0644`.** A chave privada mTLS é o
+> segredo C1. World-readable (`0644`) é violação de **least privilege** + OWASP
+> **A02 (cryptographic failures)** — já encontrada ao vivo no ingress
+> (`/etc/payment/c6/client.key` em `0644`, [SIN-65913](/SIN/issues/SIN-65913)).
+> O `umask` default dos operadores deposita `0644`; por isso a provisão **não**
+> pode depender de prosa — use os blocos `install`/`stat` abaixo, que cravam
+> owner + modo de forma idempotente e auto-verificável.
+
+### 8.1.1 Provisão do PEM — dois perfis de host (copiar-colar)
+
+Não há IaC/deploy/compose que provisione estes arquivos (`cd-stg.yml` só envia o
+binário por SSH e **não** injeta nenhum segredo de cert C6). A provisão é
+**manual por operador**, então este runbook é a fonte da verdade — os blocos
+abaixo são a forma canônica. `install` aplica owner + modo na escrita (não herda
+o `umask`), então o arquivo **nunca** existe em `0644`, nem por um instante.
+
+**Perfil A — host ingress one-shot (`143.198.66.140`).** O único consumidor é o
+agente runtime **não-root `paperclip`** que roda os one-shots `curl --cert` do
+mTLS C6 (§8/§9). **Nenhum payment-api roda aqui** — owner = `paperclip`.
+
+```bash
+# diretório dono do paperclip, 0700 (só o dono entra)
+sudo install -d -m 0700 -o paperclip -g paperclip /etc/payment/c6
+
+# chave privada — 0600, dono paperclip; heredoc com PLACEHOLDER (nunca commitar PEM real)
+sudo install -m 0600 -o paperclip -g paperclip /dev/stdin /etc/payment/c6/client.key <<'PEM'
+<PEM da chave privada — NUNCA commitar>
+PEM
+
+# certificado — 0600, dono paperclip
+sudo install -m 0600 -o paperclip -g paperclip /dev/stdin /etc/payment/c6/client.crt <<'PEM'
+<PEM do certificado>
+PEM
+
+# VERIFICAR — DEVE imprimir exatamente: 600 paperclip:paperclip ...
+sudo stat -c '%a %U:%G %n' /etc/payment/c6/client.key
+sudo stat -c '%a %U:%G %n' /etc/payment/c6/client.crt
+```
+
+> 🔥 **Forte recomendação (ingress = box internet-facing): PEM transiente.**
+> Não há consumidor permanente entre one-shots. Materialize → rode o one-shot →
+> `rm` imediatamente, em vez de deixar a chave privada parada num host exposto:
+>
+> ```bash
+> # ... bloco install acima ...
+> curl --cert /etc/payment/c6/client.crt --key /etc/payment/c6/client.key ...   # o one-shot (§8.2/§9)
+> shred -u /etc/payment/c6/client.key /etc/payment/c6/client.crt 2>/dev/null || rm -f /etc/payment/c6/client.{key,crt}
+> ```
+
+**Perfil B — host de serviço backend (`payment.someu.com.br`).** Owner = o
+usuário de serviço do **payment-api** (não `paperclip`), `0600`, montado
+**read-only** a partir do secret manager (não do repositório). Também é
+provisionado por operador (sem code path), então o estado final exigido é:
+
+```bash
+# substitua <payment-svc-user> pelo usuário/grupo de serviço do payment-api
+sudo install -d -m 0700 -o <payment-svc-user> -g <payment-svc-user> /etc/payment/c6
+# (chave/cert montados read-only pelo secret manager; se materializados em disco, use -m 0600 -o <payment-svc-user>)
+
+# VERIFICAR — DEVE imprimir: 600 <payment-svc-user>:<payment-svc-user> ...
+sudo stat -c '%a %U:%G %n' /etc/payment/c6/client.key
+sudo stat -c '%a %U:%G %n' /etc/payment/c6/client.crt
+```
+
+Em ambos os perfis: se `stat -c %a` imprimir qualquer coisa **diferente de
+`600`**, a provisão está errada — refaça pelo bloco `install` (nunca `chmod`
+pós-fato deixa janela `0644`). Grant de leitura é para o **único consumidor**,
+nunca para `world`/`group` amplo (defesa em profundidade: perms + ownership +
+lifetime transiente no ingress).
 
 ### 8.2 Endpoints do sandbox — status (BLOQUEADO no portal, NÃO bloqueia o cert)
 
@@ -293,7 +386,7 @@ existe (busca aberta não retorna os hosts).
 > ```
 > PAYMENT_C6_BASE_URL=https://<sandbox-base-host-do-portal>      # ex.: baseapi homologação
 > PAYMENT_C6_TOKEN_URL=https://<sandbox-token-host-do-portal>/oauth/token
-> PAYMENT_C6_SCOPE=<scope-se-exigido-pelo-portal>
+> PAYMENT_C6_SCOPE=                                   # DEIXE VAZIO — scope explícito ⇒ 400/invalid_request (§7 passo 1)
 > PAYMENT_C6_CLIENT_CERT=/etc/payment/c6/client.crt   # PEM emitido/registrado no portal
 > PAYMENT_C6_CLIENT_KEY=/etc/payment/c6/client.key
 > ```
@@ -321,7 +414,8 @@ Janela: seg–sex 7h–23h BRT. Erros = **RFC7807 problem+json** (BACEN PIX:
 | Extrato | `GET /v1/statement?start_date=&end_date=` (yyyy-MM-dd) | ✅ params remapeados |
 | Boleto | `POST /v1/bank_slips` | ⏳ path descoberto; DTO real pendente (follow-up) |
 | Checkout | `POST /v1/checkouts` | ⏳ path descoberto; schema `payment` portal-gated (follow-up) |
-| Webhook mgmt | `/v1/webhooks` (req: `service`,`url`) | ⏳ follow-up |
+| Webhook PIX (registro) | `PUT`/`GET /v2/pix/webhook/{chave}` (`chave` no path; corpo `{"webhookUrl":"…"}`) | ✅ implementado (`internal/adapters/bank/c6/webhook.go` + `cmd/register-webhook`) |
+| Webhook C6-próprio (boleto/checkout) | `/v1/webhooks` (req: `service`∈{BANK_SLIP,CHECKOUT,BANK_SLIP_PIX}, `url`) | ⏳ follow-up (superfície distinta do registro PIX acima) |
 
 ### 9.1 PIX cob — caminho positivo confirmado (HTTP 200)
 
@@ -342,7 +436,14 @@ Notas de DTO já aplicadas no adapter (este PR): o `location` vem **top-level**
 encaminhado como `chave` omitempty). Detalhes completos no documento
 **"Descoberta ao vivo — contrato real C6 sandbox"** da SIN-65856.
 
-> **Pendente (follow-ups da SIN-65856):** fonte da `chave` no app (por-tenant vs
-> request — decisão de design), DTO real de cobv (spec BACEN pública), DTO de
-> boleto `/v1/bank_slips` (resposta 201 não capturada) e schema `payment` do
+> 🔑 **Fonte da `chave` (decisão resolvida): por-tenant via env, var SEPARADA.**
+> A `chave` do recebedor é configurada em **`PAYMENT_BANK_CREDITOR_KEYS`** (formato
+> `tenant:creditorKey,…`) — **não** em `PAYMENT_BANK_CREDS`. As duas são
+> deliberadamente separadas para não colidir no split por `:` (uma chave PIX pode
+> conter caracteres que confundiriam o parser de credenciais). O adapter resolve a
+> `chave` do tenant a partir dessa var tanto na cob (`PUT /v2/pix/cob/{txid}`)
+> quanto no registro de webhook (`cmd/register-webhook`).
+
+> **Pendente (follow-ups da SIN-65856):** DTO real de cobv (spec BACEN pública),
+> DTO de boleto `/v1/bank_slips` (resposta 201 não capturada) e schema `payment` do
 > checkout `/v1/checkouts` (portal login-walled).

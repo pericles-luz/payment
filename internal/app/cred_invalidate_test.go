@@ -53,7 +53,7 @@ func TestAdminSetBankCredentialEvictsTokenCache(t *testing.T) {
 		t.Fatalf("seed tenant: %v", err)
 	}
 
-	if err := admin.SetBankCredential(context.Background(), tn.ID(), "client-1", "s3cr3t"); err != nil {
+	if err := admin.SetBankCredential(context.Background(), tn.ID(), ports.BankIDC6, "client-1", "s3cr3t"); err != nil {
 		t.Fatalf("set credential: %v", err)
 	}
 	if got := inv.calls(); len(got) != 1 || got[0] != tn.ID() {
@@ -82,7 +82,7 @@ func TestAdminSetBankCredentialNoEvictOnWriteFailure(t *testing.T) {
 		t.Fatalf("seed tenant: %v", err)
 	}
 
-	if err := admin.SetBankCredential(context.Background(), tn.ID(), "client-1", "s3cr3t"); err == nil {
+	if err := admin.SetBankCredential(context.Background(), tn.ID(), ports.BankIDC6, "client-1", "s3cr3t"); err == nil {
 		t.Fatal("want error from writer")
 	}
 	if got := inv.calls(); len(got) != 0 {
@@ -106,7 +106,7 @@ func TestAdminSetBankCredentialNoEvictForUnknownTenant(t *testing.T) {
 	}
 	admin := app.NewAdminService(deps)
 
-	if err := admin.SetBankCredential(context.Background(), "ghost", "c", "s"); !errors.Is(err, shared.ErrNotFound) {
+	if err := admin.SetBankCredential(context.Background(), "ghost", ports.BankIDC6, "c", "s"); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	if got := inv.calls(); len(got) != 0 {
@@ -131,7 +131,7 @@ func TestAdminSetBankCredentialNilInvalidatorIsSafe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed tenant: %v", err)
 	}
-	if err := admin.SetBankCredential(context.Background(), tn.ID(), "c", "s"); err != nil {
+	if err := admin.SetBankCredential(context.Background(), tn.ID(), ports.BankIDC6, "c", "s"); err != nil {
 		t.Fatalf("nil invalidator must be safe, got %v", err)
 	}
 }

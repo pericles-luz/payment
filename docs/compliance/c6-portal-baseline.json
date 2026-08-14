@@ -1,0 +1,49 @@
+{
+  "_comment": "Baseline snapshot of the C6 PUBLIC developer portal, used by the monthly monitor routine (SIN-68746, Termo C6 clausulas 2.8/2.9/11.5 - F21). The routine diffs a fresh fetch against this file. On a material change it opens a triage issue and updates this baseline + docs/compliance/c6-termo-apis-regras.md. See docs/compliance/c6-termo-apis-monitoring.md for the procedure. This file is DATA, not a secret: it holds only public URLs and content hashes.",
+  "source": "https://developers.c6bank.com.br",
+  "captured_at": "2026-08-06",
+  "captured_by": "CTO (agent ed9d8370) via SIN-68746",
+  "signals": {
+    "sitemap": {
+      "url": "https://developers.c6bank.com.br/sitemap.xml",
+      "url_count": 17,
+      "url_set_sha256": "96eac7528ab376399ce74db148d5ebdc73dbb62754e4127c0b1c54beb920278d",
+      "urls": [
+        "https://developers.c6bank.com.br/",
+        "https://developers.c6bank.com.br/apis",
+        "https://developers.c6bank.com.br/apis/auth",
+        "https://developers.c6bank.com.br/apis/bankslip",
+        "https://developers.c6bank.com.br/apis/bolepix",
+        "https://developers.c6bank.com.br/apis/c6pay-statements",
+        "https://developers.c6bank.com.br/apis/checkout",
+        "https://developers.c6bank.com.br/apis/errors",
+        "https://developers.c6bank.com.br/apis/pix",
+        "https://developers.c6bank.com.br/apis/pix-automatico",
+        "https://developers.c6bank.com.br/apis/release-notes",
+        "https://developers.c6bank.com.br/apis/schedule-payments",
+        "https://developers.c6bank.com.br/apis/statement",
+        "https://developers.c6bank.com.br/apis/webhook",
+        "https://developers.c6bank.com.br/create-access",
+        "https://developers.c6bank.com.br/faq",
+        "https://developers.c6bank.com.br/get-started"
+      ]
+    },
+    "static_assets": {
+      "_comment": "Content-hashed bundle filenames from index.html. They change on every portal redeploy (Scalar/React build). A change here means 'portal republished' -> review release-notes manually.",
+      "index_url": "https://developers.c6bank.com.br",
+      "assets": [
+        "static/css/main.1ffe4ddc.css",
+        "static/js/main.a57cadac.js"
+      ]
+    },
+    "release_notes": {
+      "_comment": "The changelog page. JS-rendered (Scalar/OpenAPI), so its prose is NOT diffable via curl. Treated as manual-review target when any automatable signal above fires.",
+      "url": "https://developers.c6bank.com.br/apis/release-notes"
+    }
+  },
+  "termo_de_uso": {
+    "_comment": "The signed 'Termo de Uso de APIs' PDF (clausulas 2.8/2.9/11.5) is NOT published on the public portal - it is delivered by C6 to the account holder via the authenticated account/email channel. Its changes are OPERATOR-GATED (non-agent-doable). Owner: CTO (technical impact) + CEO (commercial relationship). The routine emits a monthly manual-review reminder for this.",
+    "reference_doc": "docs/compliance/c6-termo-apis-regras.md",
+    "known_version_in_repo": "v.10/03/2025 (SIN-68738)"
+  }
+}

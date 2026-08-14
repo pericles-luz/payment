@@ -52,6 +52,10 @@ type ddaGroupView struct {
 // consult. Unknown fields are rejected by decodeJSON.
 type createDDAGroupRequest struct {
 	Barcodes []string `json:"barcodes"`
+	// Bank optionally selects which configured bank schedules this DDA group
+	// (multi-bank, SIN-66022); empty keeps header/default routing, overrides
+	// X-Bank-Id (ADR-0007).
+	Bank string `json:"bank"`
 }
 
 // removeDDAItemsRequest is the boundary body for DELETE /v1/dda/payment-groups/{id}/items
@@ -102,6 +106,11 @@ func (s *Server) handleCreateDDAGroup(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	nr, ok := s.rebindBank(w, r, req.Bank)
+	if !ok {
+		return
+	}
+	r = nr
 	group, err := s.dda.CreatePaymentGroup(r.Context(), app.CreateGroupInput{
 		TenantID:       tenantID,
 		Barcodes:       req.Barcodes,

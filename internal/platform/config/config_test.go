@@ -47,6 +47,31 @@ func TestFromEnvSecureCookies(t *testing.T) {
 	}
 }
 
+func TestFromEnvTrustedProxyHops(t *testing.T) {
+	cases := []struct {
+		name string
+		val  string
+		want int
+	}{
+		{"empty defaults to zero (spoof-proof)", "", 0},
+		{"explicit zero", "0", 0},
+		{"single hop", "1", 1},
+		{"multiple hops", "3", 3},
+		{"negative falls back to zero", "-1", 0},
+		{"unparseable falls back to zero", "two", 0},
+		{"float falls back to zero", "1.5", 0},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PAYMENT_TRUSTED_PROXY_HOPS", tc.val)
+			if got := config.FromEnv().TrustedProxyHops; got != tc.want {
+				t.Fatalf("TrustedProxyHops(%q) = %d, want %d", tc.val, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFromEnvParsing(t *testing.T) {
 	t.Setenv("PAYMENT_HTTP_ADDR", ":9090")
 	t.Setenv("PAYMENT_DB_PATH", "/tmp/x.db")
@@ -72,8 +97,10 @@ func TestFromEnvParsing(t *testing.T) {
 	if cfg.WebhookRefs["refAAA"] != "tenantA" || cfg.WebhookRefs["refBBB"] != "tenantB" || cfg.RabbitURL != "amqp://localhost" {
 		t.Fatalf("webhook refs/rabbit mismatch: %+v", cfg.WebhookRefs)
 	}
-	cred, ok := cfg.BankCreds["tenantA"]
-	if !ok || cred.ClientID != "cidA" || cred.Secret != "secA" {
+	// BankCreds is now keyed by the composite (tenant, bank) pair; a legacy 3-field
+	// entry defaults to bank "c6" (ADR-0007 / SIN-66021).
+	cred, ok := cfg.BankCreds["tenantA\x00c6"]
+	if !ok || cred.ClientID != "cidA" || cred.Secret != "secA" || cred.BankID != "c6" {
 		t.Fatalf("bank creds: %+v", cfg.BankCreds)
 	}
 	if len(cfg.BankCreds) != 1 {

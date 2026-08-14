@@ -17,7 +17,9 @@ import (
 	// Pure-Go SQLite driver (no cgo) for simple, portable CI builds.
 	_ "modernc.org/sqlite"
 
+	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/billing"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/invoice"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/payment"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
@@ -40,8 +42,25 @@ func Open(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-// Migrate applies all *.up.sql files from the given filesystem in lexical order.
+// Migrate applies every *.up.sql file from the given filesystem in lexical order,
+// each exactly once, recording applied files in a schema_migrations ledger.
+//
+// The ledger is what makes Migrate safe to call on every boot. Earlier migrations
+// were all CREATE ... IF NOT EXISTS (re-runnable), but additive migrations such as
+// ALTER TABLE ... ADD COLUMN are NOT idempotent in SQLite (it has no ADD COLUMN IF
+// NOT EXISTS) — re-running one crashes with "duplicate column". The ledger skips a
+// file once applied, so any migration shape is safe across restarts (SIN-66044).
+//
+// Backward compatible: on an existing database whose tables were created by the
+// previous ledger-less runner, the ledger starts empty, so 0001/0002 are re-applied
+// once — harmlessly, since they are IF NOT EXISTS — then recorded and skipped
+// thereafter. Each file's apply and its ledger insert share one transaction, so a
+// failure leaves neither the schema half-changed nor the file marked applied.
 func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+	if _, err := db.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		return fmt.Errorf("ensure schema_migrations: %w", err)
+	}
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)
@@ -54,12 +73,34 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 	}
 	sort.Strings(ups)
 	for _, name := range ups {
+		var applied bool
+		if err := db.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = ?)`, name).Scan(&applied); err != nil {
+			return fmt.Errorf("check migration %s: %w", name, err)
+		}
+		if applied {
+			continue
+		}
 		b, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
-		if _, err := db.ExecContext(ctx, string(b)); err != nil {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", name, err)
+		}
+		if _, err := tx.ExecContext(ctx, string(b)); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)`,
+			name, time.Now().UTC().Format(tsLayout)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %s: %w", name, err)
 		}
 	}
 	return nil
@@ -90,6 +131,7 @@ func NewStore(db *sql.DB) *Store { return &Store{db: db, repo: repo{q: db}} }
 var (
 	_ ports.PaymentRepository   = (*Store)(nil)
 	_ ports.TenantRepository    = (*Store)(nil)
+	_ ports.AccountRepository   = (*Store)(nil)
 	_ ports.PricingRepository   = (*Store)(nil)
 	_ ports.LedgerRepository    = (*Store)(nil)
 	_ ports.ProcessedEventStore = (*Store)(nil)
@@ -119,37 +161,43 @@ func (s *Store) WithinTx(ctx context.Context, fn func(ports.Repository) error) e
 
 // --- Tenants ---
 
-// SaveTenant inserts or updates a tenant.
+// SaveTenant inserts or updates a tenant. account_id is written on INSERT but is
+// deliberately NOT in the DO UPDATE SET clause: the owning account is IMMUTABLE
+// once assigned (ADR-0009 §3.2), so an admin activate/suspend upsert must never
+// clobber a backfilled owner. An empty AccountID persists as SQL NULL — the
+// NULL-safe "self-account" legacy semantics (ADR-0009 §4).
 func (r repo) SaveTenant(ctx context.Context, t *tenant.Tenant) error {
 	_, err := r.q.ExecContext(ctx,
-		`INSERT INTO tenants (id, name, active, created_at) VALUES (?, ?, ?, ?)
+		`INSERT INTO tenants (id, name, active, created_at, account_id) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET name = excluded.name, active = excluded.active`,
-		t.ID(), t.Name(), boolToInt(t.Active()), t.CreatedAt().Format(tsLayout))
+		t.ID(), t.Name(), boolToInt(t.Active()), t.CreatedAt().Format(tsLayout), nullIfEmpty(t.AccountID()))
 	if err != nil {
 		return fmt.Errorf("save tenant: %w", err)
 	}
 	return nil
 }
 
-// FindTenantByID returns a tenant or ErrNotFound.
+// FindTenantByID returns a tenant or ErrNotFound. A NULL account_id (legacy
+// self-account) reads back as an empty owner.
 func (r repo) FindTenantByID(ctx context.Context, id string) (*tenant.Tenant, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT id, name, active, created_at FROM tenants WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT id, name, active, created_at, account_id FROM tenants WHERE id = ?`, id)
 	var gotID, name, createdAt string
+	var accountID sql.NullString
 	var active int
-	if err := row.Scan(&gotID, &name, &active, &createdAt); err != nil {
+	if err := row.Scan(&gotID, &name, &active, &createdAt, &accountID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, shared.ErrNotFound
 		}
 		return nil, fmt.Errorf("scan tenant: %w", err)
 	}
-	return tenant.Rehydrate(gotID, name, active != 0, parseTime(createdAt)), nil
+	return tenant.RehydrateWithAccount(gotID, name, active != 0, parseTime(createdAt), accountID.String), nil
 }
 
 // ListTenants returns every tenant, newest-first (created_at desc, id desc as a
 // deterministic tie-break). Used by the admin console listing.
 func (s *Store) ListTenants(ctx context.Context) ([]*tenant.Tenant, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, active, created_at FROM tenants ORDER BY created_at DESC, id DESC`)
+		`SELECT id, name, active, created_at, account_id FROM tenants ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("query tenants: %w", err)
 	}
@@ -157,14 +205,71 @@ func (s *Store) ListTenants(ctx context.Context) ([]*tenant.Tenant, error) {
 	var out []*tenant.Tenant
 	for rows.Next() {
 		var id, name, createdAt string
+		var accountID sql.NullString
 		var active int
-		if err := rows.Scan(&id, &name, &active, &createdAt); err != nil {
+		if err := rows.Scan(&id, &name, &active, &createdAt, &accountID); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
 		}
-		out = append(out, tenant.Rehydrate(id, name, active != 0, parseTime(createdAt)))
+		out = append(out, tenant.RehydrateWithAccount(id, name, active != 0, parseTime(createdAt), accountID.String))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate tenants: %w", err)
+	}
+	return out, nil
+}
+
+// --- Accounts (two-level tenancy, ADR-0009) ---
+
+// SaveAccount inserts or updates an account (the API user / reseller that owns
+// tenants). Upsert on id so admin rename/activate is retry-safe, mirroring
+// SaveTenant. An account holds no bank credential and no money.
+func (r repo) SaveAccount(ctx context.Context, a *account.Account) error {
+	_, err := r.q.ExecContext(ctx,
+		`INSERT INTO accounts (id, name, active, created_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET name = excluded.name, active = excluded.active`,
+		a.ID(), a.Name(), boolToInt(a.Active()), a.CreatedAt().Format(tsLayout))
+	if err != nil {
+		return fmt.Errorf("save account: %w", err)
+	}
+	return nil
+}
+
+// FindAccountByID returns an account or ErrNotFound.
+func (r repo) FindAccountByID(ctx context.Context, id string) (*account.Account, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT id, name, active, created_at FROM accounts WHERE id = ?`, id)
+	var gotID, name, createdAt string
+	var active int
+	if err := row.Scan(&gotID, &name, &active, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, shared.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan account: %w", err)
+	}
+	return account.Rehydrate(gotID, name, active != 0, parseTime(createdAt)), nil
+}
+
+// ListAccounts returns every account, newest-first (created_at desc, id desc as a
+// deterministic tie-break), mirroring ListTenants. Used by the admin console Contas
+// listing (SIN-69157). The per-tenant self-accounts backfilled by migration 0007 are
+// returned too; the app layer filters them out by default.
+func (s *Store) ListAccounts(ctx context.Context) ([]*account.Account, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, active, created_at FROM accounts ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("query accounts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*account.Account
+	for rows.Next() {
+		var id, name, createdAt string
+		var active int
+		if err := rows.Scan(&id, &name, &active, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		out = append(out, account.Rehydrate(id, name, active != 0, parseTime(createdAt)))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate accounts: %w", err)
 	}
 	return out, nil
 }
@@ -288,11 +393,13 @@ func (s *Store) ListEndpointPrices(ctx context.Context, tenantID string) ([]bill
 
 // --- Ledger ---
 
-// AppendLedgerEntry appends a billable event (append-only).
+// AppendLedgerEntry appends a billable event (append-only). account_id carries the
+// charged tenant's owning account (two-level tenancy metering, SIN-69127); a
+// self-account is stored as NULL (NULL-safe, matching migration 0007's backfill).
 func (r repo) AppendLedgerEntry(ctx context.Context, e billing.LedgerEntry) error {
 	_, err := r.q.ExecContext(ctx,
-		`INSERT INTO billing_ledger (id, tenant_id, endpoint, price_cents, reference, at) VALUES (?, ?, ?, ?, ?, ?)`,
-		e.ID(), e.TenantID(), e.Endpoint(), e.PriceCents(), e.Reference(), e.At().Format(tsLayout))
+		`INSERT INTO billing_ledger (id, tenant_id, endpoint, price_cents, reference, at, account_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		e.ID(), e.TenantID(), e.Endpoint(), e.PriceCents(), e.Reference(), e.At().Format(tsLayout), nullIfEmpty(e.AccountID()))
 	if err != nil {
 		return fmt.Errorf("append ledger: %w", err)
 	}
@@ -302,9 +409,29 @@ func (r repo) AppendLedgerEntry(ctx context.Context, e billing.LedgerEntry) erro
 // ListLedgerEntries returns one tenant's ledger entries, newest-first (at desc,
 // id desc tie-break). Tenant-scoped (threat P1).
 func (s *Store) ListLedgerEntries(ctx context.Context, tenantID string) ([]billing.LedgerEntry, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, tenant_id, endpoint, price_cents, reference, at FROM billing_ledger
+	return s.scanLedger(ctx,
+		`SELECT id, tenant_id, endpoint, price_cents, reference, at, account_id FROM billing_ledger
 		 WHERE tenant_id = ? ORDER BY at DESC, id DESC`, tenantID)
+}
+
+// ListLedgerEntriesByAccount returns every ledger entry owned by one account,
+// across all of its tenants, newest-first. It is the read side of the
+// account→tenant→endpoint metering rollup (SIN-69127) — the app layer groups the
+// returned entries by tenant then endpoint. The scan is served by the
+// ix_ledger_account_at index (migration 0007). Account-scoped: an account only
+// ever sees its own tenants' entries.
+func (s *Store) ListLedgerEntriesByAccount(ctx context.Context, accountID string) ([]billing.LedgerEntry, error) {
+	return s.scanLedger(ctx,
+		`SELECT id, tenant_id, endpoint, price_cents, reference, at, account_id FROM billing_ledger
+		 WHERE account_id = ? ORDER BY at DESC, id DESC`, accountID)
+}
+
+// scanLedger runs a ledger SELECT (whose column order is id, tenant_id, endpoint,
+// price_cents, reference, at, account_id) and rehydrates each row into a
+// billing.LedgerEntry. A NULL account_id (a self-account, or a row written before
+// the account dimension existed) rehydrates to the empty account — NULL-safe.
+func (s *Store) scanLedger(ctx context.Context, query string, args ...any) ([]billing.LedgerEntry, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query ledger: %w", err)
 	}
@@ -312,11 +439,13 @@ func (s *Store) ListLedgerEntries(ctx context.Context, tenantID string) ([]billi
 	var out []billing.LedgerEntry
 	for rows.Next() {
 		var id, gotTenant, endpoint, reference, at string
+		var account sql.NullString
 		var price int64
-		if err := rows.Scan(&id, &gotTenant, &endpoint, &price, &reference, &at); err != nil {
+		if err := rows.Scan(&id, &gotTenant, &endpoint, &price, &reference, &at, &account); err != nil {
 			return nil, fmt.Errorf("scan ledger: %w", err)
 		}
-		e, err := billing.NewLedgerEntry(id, gotTenant, endpoint, reference, price, parseTime(at))
+		e, err := billing.NewLedgerEntry(id, gotTenant, endpoint, reference, price, parseTime(at),
+			billing.WithAccount(account.String))
 		if err != nil {
 			return nil, fmt.Errorf("rehydrate ledger: %w", err)
 		}
@@ -362,10 +491,137 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+// nullIfEmpty maps an empty string to a SQL NULL and any other value to itself,
+// so an unset optional column (e.g. a self-account tenant's account_id) is stored
+// as NULL rather than ” — preserving the NULL-safe semantics of migration 0007.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 func parseTime(s string) time.Time {
 	t, err := time.Parse(tsLayout, s)
 	if err != nil {
 		return time.Time{}
 	}
 	return t.UTC()
+}
+
+// --- Invoices (Faturas, SIN-69121) ---
+
+// SaveInvoice persists a generated invoice append-only: the header and its line
+// items are written together in ONE transaction so a reader never sees a header
+// without its body (and a mid-write failure leaves nothing behind). There is no
+// UPDATE/DELETE path — regenerating a period inserts a new invoice id.
+func (s *Store) SaveInvoice(ctx context.Context, inv invoice.Invoice) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin invoice tx: %w", err)
+	}
+	// Roll back on any early return; the successful path commits and this is a no-op.
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO invoices (id, tenant_id, account_id, period_start, period_end, total_calls, total_cents, generated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		inv.ID(), inv.TenantID(), inv.AccountID(),
+		inv.PeriodStart().UTC().Format(tsLayout), inv.PeriodEnd().UTC().Format(tsLayout),
+		inv.TotalCalls(), inv.TotalCents(), inv.GeneratedAt().UTC().Format(tsLayout)); err != nil {
+		return fmt.Errorf("insert invoice: %w", err)
+	}
+	for i, l := range inv.Lines() {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO invoice_items (invoice_id, seq, endpoint, calls, subtotal_cents) VALUES (?, ?, ?, ?, ?)`,
+			inv.ID(), i, l.Endpoint(), l.Calls(), l.SubtotalCents()); err != nil {
+			return fmt.Errorf("insert invoice item: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit invoice tx: %w", err)
+	}
+	return nil
+}
+
+// FindInvoiceByID returns one invoice with its line items, tenant-scoped (threat
+// P1: the tenant comes from the authenticated console session, never client
+// input). Returns shared.ErrNotFound when the id is unknown for the tenant.
+func (s *Store) FindInvoiceByID(ctx context.Context, tenantID, id string) (invoice.Invoice, error) {
+	var accountID, ps, pe, gen string
+	var totalCalls int
+	var totalCents int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT account_id, period_start, period_end, total_calls, total_cents, generated_at
+		 FROM invoices WHERE tenant_id = ? AND id = ?`, tenantID, id).
+		Scan(&accountID, &ps, &pe, &totalCalls, &totalCents, &gen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return invoice.Invoice{}, shared.ErrNotFound
+	}
+	if err != nil {
+		return invoice.Invoice{}, fmt.Errorf("query invoice: %w", err)
+	}
+	lines, err := s.invoiceItems(ctx, id)
+	if err != nil {
+		return invoice.Invoice{}, err
+	}
+	return invoice.Rehydrate(id, tenantID, accountID, parseTime(ps), parseTime(pe), parseTime(gen), lines, totalCalls, totalCents), nil
+}
+
+// ListInvoices returns a tenant's invoices, newest-first (generated_at desc, id
+// desc tie-break), each with its line items. Tenant-scoped (threat P1).
+func (s *Store) ListInvoices(ctx context.Context, tenantID string) ([]invoice.Invoice, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, account_id, period_start, period_end, total_calls, total_cents, generated_at
+		 FROM invoices WHERE tenant_id = ? ORDER BY generated_at DESC, id DESC`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("query invoices: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []invoice.Invoice
+	for rows.Next() {
+		var id, accountID, ps, pe, gen string
+		var totalCalls int
+		var totalCents int64
+		if err := rows.Scan(&id, &accountID, &ps, &pe, &totalCalls, &totalCents, &gen); err != nil {
+			return nil, fmt.Errorf("scan invoice: %w", err)
+		}
+		lines, err := s.invoiceItems(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, invoice.Rehydrate(id, tenantID, accountID, parseTime(ps), parseTime(pe), parseTime(gen), lines, totalCalls, totalCents))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate invoices: %w", err)
+	}
+	return out, nil
+}
+
+// invoiceItems reads one invoice's line items in stored document order (seq asc).
+func (s *Store) invoiceItems(ctx context.Context, invoiceID string) ([]invoice.LineItem, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT endpoint, calls, subtotal_cents FROM invoice_items WHERE invoice_id = ? ORDER BY seq ASC`, invoiceID)
+	if err != nil {
+		return nil, fmt.Errorf("query invoice items: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []invoice.LineItem
+	for rows.Next() {
+		var endpoint string
+		var calls int
+		var subtotal int64
+		if err := rows.Scan(&endpoint, &calls, &subtotal); err != nil {
+			return nil, fmt.Errorf("scan invoice item: %w", err)
+		}
+		l, err := invoice.NewLineItem(endpoint, calls, subtotal)
+		if err != nil {
+			return nil, fmt.Errorf("rehydrate invoice item: %w", err)
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate invoice items: %w", err)
+	}
+	return out, nil
 }

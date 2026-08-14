@@ -79,3 +79,33 @@ func TestInMemoryListLedgerEntries(t *testing.T) {
 		t.Fatalf("order = %s, want e2 first", got[0].ID())
 	}
 }
+
+// TestInMemoryListLedgerEntriesByAccount checks the account rollup read (SIN-69127):
+// an account's entries are returned across all its tenants, newest-first, with no
+// cross-account leakage — parity with the SQLite adapter.
+func TestInMemoryListLedgerEntriesByAccount(t *testing.T) {
+	t.Parallel()
+	s := inmemory.NewStore()
+	ctx := context.Background()
+	add := func(id, accountID, tenantID, endpoint string, at int64) {
+		e, _ := billing.NewLedgerEntry(id, tenantID, endpoint, "ref", 100, time.Unix(at, 0).UTC(),
+			billing.WithAccount(accountID))
+		_ = s.AppendLedgerEntry(ctx, e)
+	}
+	add("e1", "acct-A", "t1", "POST", 100)
+	add("e2", "acct-A", "t2", "GET", 300)  // newest, different tenant, same account
+	add("e3", "acct-B", "t3", "POST", 200) // other account: excluded
+
+	got, err := s.ListLedgerEntriesByAccount(ctx, "acct-A")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("by account = %d (%v), want 2 (across t1+t2, no acct-B)", len(got), err)
+	}
+	if got[0].ID() != "e2" { // newest-first
+		t.Fatalf("order = %s, want e2 first", got[0].ID())
+	}
+	for _, e := range got {
+		if e.AccountID() != "acct-A" {
+			t.Fatalf("entry %s account = %q, want acct-A", e.ID(), e.AccountID())
+		}
+	}
+}

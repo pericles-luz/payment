@@ -22,6 +22,9 @@ type createCheckoutRequest struct {
 	ExpiresInSeconds      int64                 `json:"expires_in_seconds"`
 	CardType              string                `json:"card_type"`
 	RequireAuthentication bool                  `json:"require_authentication"`
+	// Bank optionally selects which configured bank hosts this checkout (multi-bank,
+	// SIN-66022); empty keeps header/default routing, overrides X-Bank-Id (ADR-0007).
+	Bank string `json:"bank"`
 }
 
 type checkoutItemRequest struct {
@@ -52,9 +55,15 @@ func (s *Server) handleCreateCheckout(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	nr, ok := s.rebindBank(w, r, req.Bank)
+	if !ok {
+		return
+	}
+	r = nr
 
 	in := app.CreateCheckoutSessionInput{
 		TenantID:              tenantID,
+		AccountID:             accountFromContext(r.Context()),
 		Currency:              req.Currency,
 		ExpiresInSeconds:      req.ExpiresInSeconds,
 		CardType:              req.CardType,

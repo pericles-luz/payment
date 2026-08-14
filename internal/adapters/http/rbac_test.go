@@ -140,7 +140,7 @@ func TestSetBankCredentialEndpoint(t *testing.T) {
 		t.Fatalf("response leaked the secret: %s", rec.Body.String())
 	}
 
-	got, err := f.creds.GetBankCredential(context.Background(), f.tenantID)
+	got, err := f.creds.GetBankCredential(context.Background(), f.tenantID, "")
 	if err != nil {
 		t.Fatalf("read stored credential: %v", err)
 	}

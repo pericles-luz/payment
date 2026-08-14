@@ -57,7 +57,11 @@ func NewPixService(d Deps) *PixService {
 // immediate PIX charge. TenantID is the authenticated tenant. Devedor (DebtorTaxID
 // + DebtorName) is optional (roteiro 7.2).
 type CreateImmediateChargeInput struct {
-	TenantID         string
+	TenantID string
+	// AccountID is the owning account resolved at the auth choke-point (SIN-69126),
+	// stamped on the ledger for account→tenant→endpoint metering (SIN-69127).
+	// Attribution-only; empty = self-account. See CreateChargeInput.AccountID.
+	AccountID        string
 	AmountCents      int64
 	Currency         string
 	IdempotencyKey   string
@@ -126,7 +130,7 @@ func (s *PixService) CreateImmediateCharge(ctx context.Context, in CreateImmedia
 	}
 	p.SetTxID(qr.TxID)
 
-	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, PixCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now())
+	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, PixCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now(), billing.WithAccount(in.AccountID))
 	if err != nil {
 		return nil, ports.PixChargeResult{}, err
 	}

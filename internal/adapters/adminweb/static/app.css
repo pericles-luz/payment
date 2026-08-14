@@ -288,6 +288,11 @@ table.data th.num {
   background: var(--color-bg);
 }
 
+.badge--danger {
+  color: var(--color-danger);
+  background: var(--color-danger-bg);
+}
+
 /* --- FormField --- */
 .form {
   display: flex;

@@ -44,7 +44,11 @@ type tokenState struct {
 // client secret is sent only in the token request's Basic auth header — never
 // logged, never stored, never placed in a URL (threat C1/C4).
 type tokenManager struct {
-	creds    ports.CredentialStore
+	creds ports.CredentialStore
+	// bankID binds this token manager to a single bank's credential slot (ADR-0007
+	// §3): the OAuth2 credential is resolved for the (tenant, bankID) pair, so a
+	// token is never minted under another bank's secret.
+	bankID   string
 	tokenURL string
 	scope    string
 	httpc    *http.Client
@@ -55,9 +59,10 @@ type tokenManager struct {
 	entries map[string]*tokenState
 }
 
-func newTokenManager(creds ports.CredentialStore, tokenURL, scope string, httpc *http.Client, now func() time.Time) *tokenManager {
+func newTokenManager(creds ports.CredentialStore, bankID, tokenURL, scope string, httpc *http.Client, now func() time.Time) *tokenManager {
 	return &tokenManager{
 		creds:    creds,
+		bankID:   bankID,
 		tokenURL: tokenURL,
 		scope:    scope,
 		httpc:    httpc,
@@ -93,7 +98,7 @@ func (m *tokenManager) token(ctx context.Context, tenantID string) (string, erro
 	}
 
 	// Resolve the tenant's credential lazily and only when a (re)fetch is needed.
-	cred, err := m.creds.GetBankCredential(ctx, tenantID)
+	cred, err := m.creds.GetBankCredential(ctx, tenantID, m.bankID)
 	if err != nil {
 		return "", err
 	}

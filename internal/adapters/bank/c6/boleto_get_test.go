@@ -11,9 +11,15 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
-// --- Boleto: register carries discount tiers, read reconciles them (roteiro 3/6.a) ---
+// --- Boleto: register OMITS the portal-gated discount, read reconciles legacy tiers ---
 
-func TestCreateBoletoCarriesDiscounts(t *testing.T) {
+// The real /v1/bank_slips discount object has a portal-gated inner schema (undiscovered by
+// blind probing — SIN-65888), so CreateBoleto intentionally OMITS it until captured (CTO
+// decision on SIN-65953; tracked as a child follow-up). Even when the port request carries
+// discount tiers, the bank_slips body must not emit a `discount`/`discounts` key (the
+// strict C6 schema would 400). Fine/interest/amount still transport. (This replaces the
+// prior "carries discounts on create" assertion, obsoleted by the DTO split — CTO §4.)
+func TestCreateBoletoOmitsPortalGatedDiscount(t *testing.T) {
 	t.Parallel()
 	ps := newProductServer(t)
 	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
@@ -29,18 +35,18 @@ func TestCreateBoletoCarriesDiscounts(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
 	}
-	var sent struct {
-		Discounts []struct {
-			DaysBeforeDue int   `json:"days_before_due"`
-			Bps           int64 `json:"bps"`
-			FixedCents    int64 `json:"fixed_cents"`
-		} `json:"discounts"`
-	}
-	if err := json.Unmarshal(ps.body(), &sent); err != nil {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(ps.body(), &raw); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	if len(sent.Discounts) != 2 || sent.Discounts[0].Bps != 1000 || sent.Discounts[1].FixedCents != 500 {
-		t.Fatalf("discounts not transported: body=%s", ps.body())
+	for _, gone := range []string{"discount", "discounts"} {
+		if _, ok := raw[gone]; ok {
+			t.Fatalf("portal-gated %q must be omitted from the bank_slips body: %s", gone, ps.body())
+		}
+	}
+	// Sanity: the rest of the rate set still transports (the omission is discount-specific).
+	if _, ok := raw["fine"]; !ok {
+		t.Fatalf("fine must still transport alongside the discount omission: %s", ps.body())
 	}
 }
 

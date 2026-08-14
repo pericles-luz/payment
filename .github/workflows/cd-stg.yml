@@ -37,6 +37,14 @@ on:
 permissions:
   contents: read
 
+# Pin the Go toolchain deterministically to go1.26.6 (SIN-69227) so the SHIPPED
+# binary is compiled against the patched go1.26.6 stdlib (GO-2026-6218/6091/6090),
+# independent of what the setup-go `1.26.x` selector resolves to under manifest
+# lag. The `go build` step below re-execs into go1.26.6 via GOTOOLCHAIN.
+# Reversible: drop this block to fall back to the setup-go resolution.
+env:
+  GOTOOLCHAIN: go1.26.6
+
 concurrency:
   # Serialize deploys; never cancel a deploy mid-flight (a half-applied restart
   # is worse than waiting).

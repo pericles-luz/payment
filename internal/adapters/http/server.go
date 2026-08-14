@@ -27,10 +27,27 @@ type Server struct {
 	console     *app.ConsoleService
 	ui          *adminweb.Renderer
 	webhooks    *app.WebhookService
-	tenantAuth  TenantAuthenticator
+	tenantAuth  TenantPrincipalAuthenticator
 	adminAuth   AdminPrincipalAuthenticator
 	webhookAuth WebhookAuthenticator
-	csrf        CSRFGuard
+	// accountResolver upgrades the account id stamped at the tenant choke-point
+	// from the derived self-account to the tenant's REAL owning Account, read from
+	// the tenant store (SIN-69222). When nil the choke-point keeps the self-account
+	// default (retrocompat / single-tier deployments and tests).
+	accountResolver AccountResolver
+	csrf            CSRFGuard
+	// bankResolver resolves and validates which bank a tenant request routes to
+	// (multi-bank selector, SIN-66022). When nil the tenant plane runs single-bank:
+	// no selector is read and every request resolves to the default bank.
+	bankResolver *BankResolver
+	// trustedProxyHops selects the spoof-resistant client-IP middleware installed
+	// by Router (replaces chi middleware.RealIP). See Config.TrustedProxyHops.
+	trustedProxyHops int
+	// selfServeCredIntake gates the self-serve credential intake route
+	// (PUT /v1/bank-credential, SIN-69196). Default false: the route is NOT
+	// registered and the handler is inert unless this is explicitly enabled, so a
+	// rollback is a config flip. See Config.SelfServeCredIntake.
+	selfServeCredIntake bool
 }
 
 // Config wires a Server's dependencies. Console and UI back the HTML admin
@@ -66,34 +83,83 @@ type Config struct {
 	Console     *app.ConsoleService
 	UI          *adminweb.Renderer
 	Webhooks    *app.WebhookService
-	TenantAuth  TenantAuthenticator
+	TenantAuth  TenantPrincipalAuthenticator
 	AdminAuth   AdminPrincipalAuthenticator
 	WebhookAuth WebhookAuthenticator
+	// AccountResolver resolves a tenant's REAL owning Account at the tenant auth
+	// choke-point so ledger.account_id reflects the admin grouping (two-level
+	// tenancy "Uso por Conta", SIN-69222). Built over the tenant read store
+	// (NewStoreAccountResolver). When nil the choke-point keeps the self-account
+	// default (acct-<tid>) — used by tests and single-tier deployments; behaviour
+	// is then identical to before this port existed.
+	AccountResolver AccountResolver
+	// BankResolver resolves and validates the per-request bank selector for the
+	// tenant plane (multi-bank routing, SIN-66022). It is built from the wired bank
+	// registry and the credential store. When nil, the tenant plane runs single-bank
+	// (every request routes to the default bank) — used by tests that exercise a
+	// single provider directly.
+	BankResolver *BankResolver
 	// SecureCookies sets the Secure attribute on cookies this adapter issues
 	// (CSRF token; the admin-UI session cookie via Server.CSRF). Driven by config
 	// because TLS is terminated at a proxy — see config.Config.SecureCookies.
 	SecureCookies bool
+	// TrustedProxyHops is the number of trusted reverse proxies in front of this
+	// service; it selects how the client IP (rate-limit key, IP attribution) is
+	// derived. 0 (default) trusts only the TCP peer and ignores forwarding
+	// headers (spoof-proof); N≥1 trusts exactly N proxy hops of X-Forwarded-For.
+	// See config.Config.TrustedProxyHops — this replaces the spoofable
+	// middleware.RealIP (GO-2026-5775).
+	TrustedProxyHops int
+	// SelfServeCredIntake enables the self-serve credential intake route
+	// (PUT /v1/bank-credential, SIN-69196 / trilha E2). Default false (secure /
+	// dark-ship): when off the route is not registered at all — the feature is
+	// inert and rollback is a config flip. Wired from PAYMENT_SELFSERVE_CRED_INTAKE.
+	// It does NOT block the go-live (go-live provisions credentials via the admin
+	// intake); it is a fast-follow tenant convenience.
+	SelfServeCredIntake bool
 }
 
 // NewServer builds a Server from its config.
 func NewServer(c Config) *Server {
 	return &Server{
-		charges:     c.Charges,
-		pix:         c.Pix,
-		pixCobV:     c.PixCobV,
-		checkout:    c.Checkout,
-		boleto:      c.Boleto,
-		dda:         c.DDA,
-		statement:   c.Statement,
-		admin:       c.Admin,
-		console:     c.Console,
-		ui:          c.UI,
-		webhooks:    c.Webhooks,
-		tenantAuth:  c.TenantAuth,
-		adminAuth:   c.AdminAuth,
-		webhookAuth: c.WebhookAuth,
-		csrf:        NewCSRFGuard(c.SecureCookies),
+		charges:             c.Charges,
+		pix:                 c.Pix,
+		pixCobV:             c.PixCobV,
+		checkout:            c.Checkout,
+		boleto:              c.Boleto,
+		dda:                 c.DDA,
+		statement:           c.Statement,
+		admin:               c.Admin,
+		console:             c.Console,
+		ui:                  c.UI,
+		webhooks:            c.Webhooks,
+		tenantAuth:          c.TenantAuth,
+		adminAuth:           c.AdminAuth,
+		webhookAuth:         c.WebhookAuth,
+		accountResolver:     c.AccountResolver,
+		csrf:                NewCSRFGuard(c.SecureCookies),
+		bankResolver:        c.BankResolver,
+		trustedProxyHops:    c.TrustedProxyHops,
+		selfServeCredIntake: c.SelfServeCredIntake,
 	}
+}
+
+// clientIPMiddleware returns the spoof-resistant client-IP middleware for the
+// configured trusted-proxy depth. It replaces chi's middleware.RealIP, which
+// blindly trusted the leftmost X-Forwarded-For value and was spoofable
+// (GO-2026-5775). Both variants store the resolved IP on the request context;
+// clientIP reads it via middleware.GetClientIP.
+//
+//   - hops == 0: ClientIPFromRemoteAddr — ignore all forwarding headers and use
+//     the TCP peer. Spoof-proof; the secure default.
+//   - hops >= 1: ClientIPFromXFFTrustedProxies(hops) — read the entry the
+//     outermost trusted proxy added to X-Forwarded-For, the only entry a client
+//     cannot forge past our own proxies.
+func clientIPMiddleware(hops int) func(http.Handler) http.Handler {
+	if hops < 1 {
+		return middleware.ClientIPFromRemoteAddr
+	}
+	return middleware.ClientIPFromXFFTrustedProxies(hops)
 }
 
 // CSRF returns the server's CSRF guard so the admin-UI child can wrap its live
@@ -105,7 +171,10 @@ func (s *Server) CSRF() CSRFGuard { return s.csrf }
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	// Spoof-resistant client IP (replaces the deprecated, spoofable
+	// middleware.RealIP — GO-2026-5775). Installed before the rate limiters so
+	// clientIP keys on a value a client cannot forge. See clientIPMiddleware.
+	r.Use(clientIPMiddleware(s.trustedProxyHops))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(15 * time.Second))
 
@@ -138,7 +207,15 @@ func (s *Server) Router() http.Handler {
 
 	// Tenant API (TB1) — authenticated, tenant-scoped, rate-limited.
 	r.Route("/v1", func(r chi.Router) {
-		r.Use(tenantAuthMiddleware(s.tenantAuth))
+		r.Use(tenantAuthMiddleware(s.tenantAuth, s.accountResolver))
+		// Multi-bank routing (SIN-66022): resolve and validate the per-request bank
+		// selector right after the tenant is authenticated, so the resolved bank is
+		// stamped on the context for the output-port routers. Runs before the limiter
+		// so an unknown/unconfigured explicit bank is rejected with the uniform
+		// not-found error. Omitted in single-bank deployments (nil resolver).
+		if s.bankResolver != nil {
+			r.Use(bankRouteMiddleware(s.bankResolver))
+		}
 		r.Use(tenantLimiter.middleware(tenantOrIPKey))
 		r.Post("/charges", s.handleCreateCharge)
 		r.Get("/charges/{id}", s.handleGetCharge)
@@ -187,6 +264,28 @@ func (s *Server) Router() http.Handler {
 		// The tenant is derived from the credential, never the query — no parameter
 		// selects which tenant's extrato is read (threat H1/P1).
 		r.Get("/statement", s.handleGetStatement)
+
+		// Self-serve credential intake (SIN-69196 / trilha E2, flag-gated). An
+		// empresa-cliente rotates its OWN bank credential with its tenant token; the
+		// tenant is the authenticated caller (no selector → A01 designed out). It is
+		// registered ONLY when the flag is on, so with the flag off the route does not
+		// exist (rollback = config flip). It carries its OWN dedicated inbound limiter
+		// (Q1): a tight per-tenant bucket (burst 5, ~1 req/min) that emits Retry-After
+		// on a 429 and fails open on an internal fault — deliberately separate from the
+		// tenant-plane limiter above and from the outbound C6 limiter (SIN-68742), so a
+		// rare high-value credential write cannot be masked by ordinary traffic and
+		// vice versa.
+		if s.selfServeCredIntake {
+			r.Group(func(r chi.Router) {
+				const (
+					selfServeBurst      = 5          // ≤5 rotations in a burst
+					selfServeRefillPS   = 1.0 / 60.0 // ~1 token/minute sustained
+					selfServeRetryAfter = 60         // seconds advertised on a 429
+				)
+				r.Use(newRateLimiter(selfServeBurst, selfServeRefillPS, nil).middlewareSelfServeCred(selfServeRetryAfter))
+				r.Put("/bank-credential", s.handleTenantSetBankCredential)
+			})
+		}
 	})
 
 	// Admin plane (TB6) — admin auth, segregated from tenant plane. Every route
@@ -206,6 +305,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/tenants", s.handleCreateTenant)
 			r.Post("/tenants/{tenantID}/pricing", s.handleSetPrice)
 			r.Put("/tenants/{tenantID}/bank-credential", s.handleSetBankCredential)
+			r.Put("/tenants/{tenantID}/bank-certificate", s.handleSetBankCertificate)
 		})
 	})
 
@@ -228,21 +328,60 @@ func (s *Server) Router() http.Handler {
 			r.Group(func(r chi.Router) {
 				r.Use(requireRole(RoleAdmin, RoleOperator))
 				r.Get("/", s.consoleRedirect)
+				// Contas (two-level tenancy admin, SIN-69157 / spec SIN-69122). Reads
+				// admit Operator+Admin; the account rollup and Faturas never leak another
+				// account's tenants (resolved server-side, account-scoped).
+				r.Get("/accounts", s.consoleListAccounts)
+				r.Get("/accounts/rows", s.consoleAccountRows)
+				r.Get("/accounts/new", s.consoleNewAccountForm)
+				r.Get("/accounts/{acctId}", s.consoleAccountDetail)
+				r.Get("/accounts/{acctId}/tenants/new", s.consoleNewAccountTenantForm)
+				r.Get("/accounts/{acctId}/consumption", s.consoleAccountConsumption)
+				r.Get("/accounts/{acctId}/consumption/rows", s.consoleAccountConsumptionRows)
+				r.Get("/accounts/{acctId}/consumption.csv", s.consoleAccountConsumptionCSV)
+				r.Get("/accounts/{acctId}/invoices", s.consoleAccountInvoices)
 				r.Get("/tenants", s.consoleListTenants)
 				r.Get("/tenants/rows", s.consoleTenantRows)
 				r.Get("/tenants/new", s.consoleNewTenantForm)
 				r.Get("/tenants/{id}", s.consoleTenantDetail)
 				r.Get("/tenants/{id}/credentials", s.consoleCredentialsForm)
+				r.Get("/tenants/{id}/banks", s.consoleBankList)
+				r.Get("/tenants/{id}/banks/{bankId}", s.consoleBankDetail)
 				r.Get("/tenants/{id}/pricing", s.consolePricing)
 				r.Get("/tenants/{id}/consumption", s.consoleConsumption)
+				r.Get("/tenants/{id}/consumption/rows", s.consoleConsumptionRows)
+				r.Get("/tenants/{id}/consumption.csv", s.consoleConsumptionCSV)
+				// Faturas (SIN-69121): list + per-invoice CSV download (read side).
+				r.Get("/tenants/{id}/invoices", s.consoleInvoices)
+				r.Get("/tenants/{id}/invoices/{invId}.csv", s.consoleInvoiceCSV)
 			})
 
 			r.Group(func(r chi.Router) {
 				r.Use(requireRole(RoleAdmin))
+				// Contas mutations (SIN-69157): create/suspend/activate a Conta, create an
+				// empresa-cliente already-linked, and batch-generate the account's Faturas.
+				// Reassignment of an existing tenant across Contas (C5) is intentionally
+				// NOT here — it mutates the tenant on a new axis and is CTO-gated (spec §7).
+				r.Post("/accounts", s.consoleCreateAccount)
+				r.Post("/accounts/{acctId}/suspend", s.consoleSuspendAccount)
+				r.Post("/accounts/{acctId}/activate", s.consoleActivateAccount)
+				r.Post("/accounts/{acctId}/tenants", s.consoleCreateAccountTenant)
+				r.Post("/accounts/{acctId}/invoices", s.consoleGenerateAccountInvoices)
 				r.Post("/tenants", s.consoleCreateTenant)
 				r.Post("/tenants/{id}/suspend", s.consoleSuspendTenant)
 				r.Post("/tenants/{id}/activate", s.consoleActivateTenant)
 				r.Post("/tenants/{id}/credentials", s.consoleSetCredential)
+				r.Post("/tenants/{id}/banks", s.consoleAddBank)
+				r.Post("/tenants/{id}/banks/{bankId}/credential", s.consoleSetBankCredential)
+				// Per-bank mTLS certificate upload/rotation (multipart, write-only key;
+				// SIN-66088). RBAC + CSRF inherited from this admin mutation group.
+				r.Post("/tenants/{id}/banks/{bankId}/certificate", s.consoleSetBankCertificate)
+				// Creditor PIX key write — bankless per the binding port-shape decision
+				// (SIN-66017 / ADR-0008); writes the tenant's default-bank credential.
+				r.Post("/tenants/{id}/creditor-key", s.consoleSetCreditorKey)
+				// Fatura generation freezes a consumption window into a durable invoice
+				// (append-only). Admin-only write; CSRF inherited from this group.
+				r.Post("/tenants/{id}/invoices", s.consoleGenerateInvoice)
 				r.Post("/tenants/{id}/pricing", s.consoleSetPrice)
 			})
 		})

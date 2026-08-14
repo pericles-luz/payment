@@ -1,0 +1,30 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/accounts/{{.Account.ID}}" hx-get="/console/accounts/{{.Account.ID}}" hx-target="#main" hx-push-url="true">‹ {{.Account.Name}}</a> / Uso</p>
+<div class="topbar"><h1>Uso por Conta</h1></div>
+
+<nav class="tabs" aria-label="Seções da Conta">
+  <a href="/console/accounts/{{.Account.ID}}" hx-get="/console/accounts/{{.Account.ID}}" hx-target="#main" hx-push-url="true">Visão geral</a>
+  <a href="/console/accounts/{{.Account.ID}}/consumption" aria-current="page">Uso</a>
+  <a href="/console/accounts/{{.Account.ID}}/invoices" hx-get="/console/accounts/{{.Account.ID}}/invoices" hx-target="#main" hx-push-url="true">Faturas</a>
+</nav>
+
+<p class="muted">Rollup do ledger append-only por empresa-cliente da Conta (autoritativo para faturamento). Somente leitura.</p>
+
+<form class="toolbar" method="get" action="/console/accounts/{{.Account.ID}}/consumption" role="search">
+  <label for="start_date">De</label>
+  <input id="start_date" type="date" name="start_date" value="{{.StartDate}}"
+         hx-get="/console/accounts/{{.Account.ID}}/consumption/rows" hx-trigger="change"
+         hx-target="#account-consumption-rows" hx-include="closest form" hx-indicator="#rows-indicator">
+  <label for="end_date">Até</label>
+  <input id="end_date" type="date" name="end_date" value="{{.EndDate}}"
+         hx-get="/console/accounts/{{.Account.ID}}/consumption/rows" hx-trigger="change"
+         hx-target="#account-consumption-rows" hx-include="closest form" hx-indicator="#rows-indicator">
+  <noscript><button class="btn btn--secondary" type="submit">Filtrar</button></noscript>
+  <span id="rows-indicator" class="htmx-indicator muted" role="status">Carregando…</span>
+  <a class="btn btn--secondary" href="{{.CSVHref}}" download>Exportar CSV</a>
+</form>
+
+<div class="table-wrap" id="account-consumption-rows">
+  {{template "account_consumption_rows" .}}
+</div>
+{{end}}

@@ -53,6 +53,9 @@ type createBoletoRequest struct {
 	MonthlyInterestBps int64               `json:"monthly_interest_bps"`
 	Discounts          []boletoDiscountReq `json:"discounts"`
 	Payer              boletoPayerReq      `json:"payer"`
+	// Bank optionally selects which configured bank registers this boleto (multi-bank,
+	// SIN-66022); empty keeps header/default routing, overrides X-Bank-Id (ADR-0007).
+	Bank string `json:"bank"`
 }
 
 // toPayerInput maps the nested payer request block to the use-case input.
@@ -109,6 +112,8 @@ type boletoView struct {
 	Status             string               `json:"status"`
 	QRCode             string               `json:"qr_code"`
 	Barcode            string               `json:"barcode"`
+	OurNumber          string               `json:"our_number,omitempty"`
+	DigitableLine      string               `json:"digitable_line,omitempty"`
 	AmountCents        int64                `json:"amount_cents"`
 	DueDate            string               `json:"due_date,omitempty"`
 	ValidUntil         string               `json:"valid_until,omitempty"`
@@ -127,6 +132,8 @@ func toBoletoView(r ports.BoletoResult, amountCents int64) boletoView {
 		Status:             r.Status,
 		QRCode:             r.QRCode,
 		Barcode:            r.Barcode,
+		OurNumber:          r.OurNumber,
+		DigitableLine:      r.DigitableLine,
 		AmountCents:        amountCents,
 		FineBps:            r.FineBps,
 		FineFixedCents:     r.FineFixedCents,
@@ -164,9 +171,15 @@ func (s *Server) handleCreateBoleto(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid or missing due_date (RFC3339)")
 		return
 	}
+	nr, okBank := s.rebindBank(w, r, req.Bank)
+	if !okBank {
+		return
+	}
+	r = nr
 
 	in := app.RegisterBoletoInput{
 		TenantID:           tenantID,
+		AccountID:          accountFromContext(r.Context()),
 		AmountCents:        req.AmountCents,
 		Currency:           req.Currency,
 		DueDate:            due,

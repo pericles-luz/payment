@@ -1,0 +1,50 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/accounts" hx-get="/console/accounts" hx-target="#main" hx-push-url="true">‹ Contas</a> / {{.Account.Name}}</p>
+<div class="topbar">
+  <div>
+    <h1>{{.Account.Name}} <span id="account-status">{{template "account_badge" .Account}}</span></h1>
+    <p class="muted">criada {{.Account.CreatedAtBR}}</p>
+  </div>
+  <span id="account-status-action">{{template "account_status_action" .Account}}</span>
+</div>
+
+<nav class="tabs" aria-label="Seções da Conta">
+  <a href="/console/accounts/{{.Account.ID}}" aria-current="page">Visão geral</a>
+  <a href="/console/accounts/{{.Account.ID}}/consumption"
+     hx-get="/console/accounts/{{.Account.ID}}/consumption" hx-target="#main" hx-push-url="true">Uso</a>
+  <a href="/console/accounts/{{.Account.ID}}/invoices"
+     hx-get="/console/accounts/{{.Account.ID}}/invoices" hx-target="#main" hx-push-url="true">Faturas</a>
+</nav>
+
+<div class="card">
+  <h2>Dados</h2>
+  <dl class="dl">
+    <dt>Nome</dt><dd>{{.Account.Name}}</dd>
+    <dt>Identificador</dt><dd><code>{{.Account.ID}}</code></dd>
+    <dt>Status</dt><dd>{{template "account_badge" .Account}}</dd>
+    <dt>Criada em</dt><dd>{{.Account.CreatedAtBR}}</dd>
+  </dl>
+</div>
+
+<div class="topbar">
+  <h2>Empresas-clientes</h2>
+  <a class="btn btn--primary" href="/console/accounts/{{.Account.ID}}/tenants/new"
+     hx-get="/console/accounts/{{.Account.ID}}/tenants/new" hx-target="#main" hx-push-url="true">+ Nova empresa-cliente</a>
+</div>
+
+<div class="table-wrap">
+  <table class="data">
+    <caption class="sr-only">Empresas-clientes da Conta {{.Account.Name}}</caption>
+    <thead>
+      <tr>
+        <th scope="col">Empresa</th>
+        <th scope="col">Status</th>
+        <th scope="col">Criada em</th>
+      </tr>
+    </thead>
+    <tbody id="account-tenant-rows">
+      {{template "account_tenant_rows" .}}
+    </tbody>
+  </table>
+</div>
+{{end}}

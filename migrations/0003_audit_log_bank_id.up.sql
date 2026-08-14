@@ -1,0 +1,19 @@
+-- 0003_audit_log_bank_id.up.sql — record WHICH bank a credential.set targeted
+-- (SIN-66044 / R1 of SIN-66043).
+--
+-- In a multi-bank world (ADR-0007: credentials keyed by (tenantID, bankID)) the
+-- highest-value admin action — ActionSetBankCredential — must record not just the
+-- tenant but which bank's credential was (re)written, or the durable forensic trail
+-- has a gap (OWASP A09). The application already carries this via audit.Entry.BankID(),
+-- but the 0002 schema had no column to hold it, so the persistent adapter silently
+-- dropped it. This adds the column.
+--
+-- SECURITY: bank_id is the non-secret bank slug (e.g. 'c6'), never the credential
+-- secret or client id (ADR-0007 / threat C1/C4). The trail still records only
+-- who/what/which-bank/tenant/when; no secret-bearing column is introduced.
+--
+-- Additive & backward-compatible (reversibility): an ADD COLUMN with a NOT NULL
+-- DEFAULT '' so pre-existing rows and legacy non-credential entries (NewEntry /
+-- settlement-mismatch) read back as the empty slug without a data backfill. Portable
+-- to Postgres unchanged.
+ALTER TABLE audit_log ADD COLUMN bank_id TEXT NOT NULL DEFAULT '';

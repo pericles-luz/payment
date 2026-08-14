@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,6 +51,24 @@ type Config struct {
 	HTTPClient *http.Client
 	// Now overrides the clock (token expiry). Defaults to time.Now.
 	Now func() time.Time
+	// RecurrenceVerifier verifies the JWS-signed Recorrência reads (rec/solicrec/
+	// cobr GETs return Accept: application/jose). When nil, those reads fail secure
+	// (ErrUnavailable) rather than trusting an unverified mandate document. The
+	// concrete verifier (JOSE lib + JWKS) is a dependency decision pending CTO
+	// sign-off (SIN-66034 F0); the create/cancel paths do not need it.
+	RecurrenceVerifier RecurrenceVerifier
+
+	// RateLimitPerSecond is the steady-state outbound request rate (tokens/sec) to
+	// C6, capping the load this adapter can generate (Termo A5, no DoS-shaped
+	// traffic). Zero or negative ⇒ defaultRatePerSecond.
+	RateLimitPerSecond float64
+	// RateLimitBurst is the token-bucket capacity — the largest burst allowed
+	// before RateLimitPerSecond applies. Zero or negative ⇒ defaultBurst.
+	RateLimitBurst int
+	// MaxRetries is the number of RETRIES on a retryable status (429/503). Zero ⇒
+	// defaultMaxRetries; negative ⇒ no retries (single-shot). The ceiling is
+	// deliberately small so a degraded PSP is never hammered (Termo A5).
+	MaxRetries int
 }
 
 // Provider implements ports.BankProvider (and ports.PixProvider) against C6.
@@ -63,9 +82,27 @@ type Provider struct {
 	// SIN-65862). It is the same per-tenant store the token manager uses, so a
 	// charge can never route funds under another tenant's identity (threat H1/P1).
 	creds ports.CredentialStore
+	// bankID is the slug this adapter instance is bound to ("c6"). The bank is fixed
+	// in the adapter's identity, NOT carried on a business request, so the credential
+	// lookup always resolves the (tenant, "c6") pair (ADR-0007 §3). This keeps the
+	// multi-bank dimension confined to the credential boundary.
+	bankID string
 	// now is the clock used for PIX QR-expiry computation when the PSP omits the
 	// charge creation timestamp. Defaults to time.Now (overridable for tests).
 	now func() time.Time
+	// recVerifier verifies JWS-signed Recorrência reads. Optional (nil ⇒ reads fail
+	// secure); see Config.RecurrenceVerifier.
+	recVerifier RecurrenceVerifier
+	// limiter paces outbound requests to C6 (proactive token bucket, Termo A5). Non-nil.
+	limiter *tokenBucket
+	// maxRetries bounds retries on a retryable status (429/503); see Config.MaxRetries.
+	maxRetries int
+	// sleep waits between the limiter/backoff gates and the next attempt. Injected
+	// so tests drive timing deterministically; defaults to realSleep.
+	sleep sleepFunc
+	// randFloat sources the backoff jitter in [0,1). Injectable for deterministic
+	// tests; defaults to math/rand.Float64.
+	randFloat func() float64
 }
 
 // compile-time assertion that Provider satisfies the port.
@@ -111,12 +148,39 @@ func New(cfg Config, creds ports.CredentialStore) (*Provider, error) {
 		httpc = defaultHTTPClient(timeout)
 	}
 
+	rate := cfg.RateLimitPerSecond
+	if rate <= 0 {
+		rate = defaultRatePerSecond
+	}
+	burst := cfg.RateLimitBurst
+	if burst <= 0 {
+		burst = defaultBurst
+	}
+	maxRetries := cfg.MaxRetries
+	switch {
+	case maxRetries == 0:
+		maxRetries = defaultMaxRetries
+	case maxRetries < 0:
+		maxRetries = 0
+	}
+
 	return &Provider{
-		baseURL: trimTrailingSlash(cfg.BaseURL),
-		httpc:   httpc,
-		tokens:  newTokenManager(creds, cfg.TokenURL, cfg.Scope, httpc, now),
-		creds:   creds,
-		now:     now,
+		baseURL:     trimTrailingSlash(cfg.BaseURL),
+		httpc:       httpc,
+		tokens:      newTokenManager(creds, ports.BankIDC6, cfg.TokenURL, cfg.Scope, httpc, now),
+		creds:       creds,
+		bankID:      ports.BankIDC6,
+		now:         now,
+		recVerifier: cfg.RecurrenceVerifier,
+		limiter: &tokenBucket{
+			tokens:       float64(burst),
+			capacity:     float64(burst),
+			refillPerSec: rate,
+			now:          now,
+		},
+		maxRetries: maxRetries,
+		sleep:      realSleep,
+		randFloat:  rand.Float64,
 	}, nil
 }
 
@@ -139,7 +203,7 @@ func (p *Provider) resolveCreditorKey(ctx context.Context, tenantID, reqKey stri
 	if k := strings.TrimSpace(reqKey); k != "" {
 		return k, nil
 	}
-	cred, err := p.creds.GetBankCredential(ctx, tenantID)
+	cred, err := p.creds.GetBankCredential(ctx, tenantID, p.bankID)
 	if err != nil {
 		return "", err
 	}
@@ -318,19 +382,58 @@ func (p *Provider) authedJSONRequest(ctx context.Context, tenantID, op, method, 
 // do executes an authenticated request, maps a non-2xx into a domain error, and
 // decodes a 2xx body into dst. The response body is always drained and closed and
 // read under a size cap; raw body bytes never escape into an error.
+//
+// Two outbound-traffic controls wrap each attempt (defense in depth, Termo A5/B11):
+//   - a proactive token-bucket limiter paces steady-state load to C6;
+//   - a small, bounded retry on 429/503 with exponential backoff + jitter that
+//     honors a server-sent Retry-After. Transport failures are NOT retried
+//     (single-shot), preserving the adapter's no-retry-storm posture; only the two
+//     explicit overload statuses are retried, up to p.maxRetries.
+//
+// The request carries the same Idempotency-Key on every attempt (set by
+// authedJSONRequest), so a retried write collapses to a single effect at C6 and
+// can never double-charge. The body is rewound via req.GetBody between attempts.
 func (p *Provider) do(req *http.Request, op string, dst any) error {
-	resp, err := p.httpc.Do(req)
-	if err != nil {
-		return transportError(op)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	ctx := req.Context()
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 && req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return transportError(op)
+			}
+			req.Body = body
+		}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if resp.StatusCode/100 != 2 {
-		return mapError(op, resp.StatusCode, body)
+		if p.limiter != nil {
+			if err := p.limiter.wait(ctx, p.sleep); err != nil {
+				return transportError(op)
+			}
+		}
+
+		resp, err := p.httpc.Do(req)
+		if err != nil {
+			return transportError(op)
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+		status := resp.StatusCode
+		retryAfter, hasRetryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), p.now())
+		_ = resp.Body.Close()
+
+		if status/100 == 2 {
+			if err := json.Unmarshal(body, dst); err != nil {
+				return &Error{Op: op, StatusCode: status, sentinel: shared.ErrUnavailable}
+			}
+			return nil
+		}
+
+		if isRetryableStatus(status) && attempt < p.maxRetries {
+			if delay, ok := p.retryDelay(attempt, retryAfter, hasRetryAfter); ok {
+				if err := p.sleep(ctx, delay); err != nil {
+					return transportError(op)
+				}
+				continue
+			}
+		}
+		return mapError(op, status, body)
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		return &Error{Op: op, StatusCode: resp.StatusCode, sentinel: shared.ErrUnavailable}
-	}
-	return nil
 }

@@ -46,6 +46,13 @@ func (p EndpointPricing) PriceCents() int64 { return p.priceCents }
 // LedgerEntry is an immutable, append-only record that a tenant was charged the
 // resolved price for a billable endpoint call. The ledger is authoritative for
 // billing — never a value derived from mutable state.
+//
+// accountID is the owning API-user/reseller account of the charged tenant
+// (two-level tenancy, SIN-69127). It is attribution-only — the rollup target for
+// account→tenant→endpoint invoicing — and never touches money. It is resolved at
+// the auth choke-point (Principal.AccountID, SIN-69126) and stamped here so the
+// ledger is authoritative for the billing dimension too. Empty means the tenant's
+// self-account (NULL-safe legacy semantics, matching migration 0007's backfill).
 type LedgerEntry struct {
 	id         string
 	tenantID   string
@@ -53,11 +60,26 @@ type LedgerEntry struct {
 	priceCents int64
 	reference  string // e.g. the payment id / idempotency key that triggered the charge
 	at         time.Time
+	accountID  string
+}
+
+// LedgerEntryOption customises a LedgerEntry at construction. It is a variadic
+// option (rather than a wider constructor signature) so the account dimension
+// could be added without breaking any existing NewLedgerEntry call site.
+type LedgerEntryOption func(*LedgerEntry)
+
+// WithAccount stamps the owning API-user/reseller account id on the ledger entry
+// (two-level tenancy metering, SIN-69127). The id is resolved server-side at the
+// auth choke-point (Principal.AccountID, SIN-69126); an empty value is allowed and
+// stored as the self-account (NULL in the ledger, NULL-safe legacy semantics).
+func WithAccount(accountID string) LedgerEntryOption {
+	return func(e *LedgerEntry) { e.accountID = strings.TrimSpace(accountID) }
 }
 
 // NewLedgerEntry records a billable event for a tenant × endpoint at the resolved
 // price. reference ties the charge to the triggering operation for auditability.
-func NewLedgerEntry(id, tenantID, endpoint, reference string, priceCents int64, at time.Time) (LedgerEntry, error) {
+// Optional LedgerEntryOptions carry additional attribution (e.g. WithAccount).
+func NewLedgerEntry(id, tenantID, endpoint, reference string, priceCents int64, at time.Time, opts ...LedgerEntryOption) (LedgerEntry, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return LedgerEntry{}, shared.NewValidationError("id", "ledger entry id is required")
@@ -73,14 +95,18 @@ func NewLedgerEntry(id, tenantID, endpoint, reference string, priceCents int64, 
 	if priceCents < 0 {
 		return LedgerEntry{}, shared.NewValidationError("price_cents", "price must be non-negative")
 	}
-	return LedgerEntry{
+	e := LedgerEntry{
 		id:         id,
 		tenantID:   tenantID,
 		endpoint:   endpoint,
 		priceCents: priceCents,
 		reference:  strings.TrimSpace(reference),
 		at:         at,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(&e)
+	}
+	return e, nil
 }
 
 // ID returns the ledger entry identifier.
@@ -97,6 +123,10 @@ func (e LedgerEntry) PriceCents() int64 { return e.priceCents }
 
 // Reference returns the triggering operation reference.
 func (e LedgerEntry) Reference() string { return e.reference }
+
+// AccountID returns the owning API-user/reseller account of the charged tenant,
+// or "" for the tenant's self-account (attribution-only, SIN-69127).
+func (e LedgerEntry) AccountID() string { return e.accountID }
 
 // At returns the time of the charge.
 func (e LedgerEntry) At() time.Time { return e.at }

@@ -22,7 +22,7 @@ type fakeCreds struct {
 	creds map[string]ports.BankCredential
 }
 
-func (f *fakeCreds) GetBankCredential(_ context.Context, tenantID string) (ports.BankCredential, error) {
+func (f *fakeCreds) GetBankCredential(_ context.Context, tenantID string, _ string) (ports.BankCredential, error) {
 	if f.err != nil {
 		return ports.BankCredential{}, f.err
 	}

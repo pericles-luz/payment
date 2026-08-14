@@ -42,7 +42,12 @@ func NewChargeService(d Deps) *ChargeService {
 // CreateChargeInput is the validated boundary input for creating a charge. The
 // TenantID is the authenticated tenant, never a client-supplied field.
 type CreateChargeInput struct {
-	TenantID       string
+	TenantID string
+	// AccountID is the owning API-user/reseller account resolved at the auth
+	// choke-point (Principal.AccountID, SIN-69126). Attribution-only: it is stamped
+	// on the ledger entry for account→tenant→endpoint metering (SIN-69127) and never
+	// affects routing or authorization. Empty = the tenant's self-account.
+	AccountID      string
 	Endpoint       string
 	AmountCents    int64
 	Currency       string
@@ -112,7 +117,7 @@ func (s *ChargeService) CreateCharge(ctx context.Context, in CreateChargeInput) 
 	// (or an earlier crash/retry) must not append the ledger twice. We re-read the
 	// payment inside the tx: if it already carries a tx id it was finalized and
 	// billed, so we adopt it and skip the second append.
-	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, in.Endpoint, p.ID(), price.PriceCents(), s.clock.Now())
+	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, in.Endpoint, p.ID(), price.PriceCents(), s.clock.Now(), billing.WithAccount(in.AccountID))
 	if err != nil {
 		return nil, err
 	}

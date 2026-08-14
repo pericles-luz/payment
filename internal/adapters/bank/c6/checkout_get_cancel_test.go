@@ -11,16 +11,17 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
-// checkoutRWServer is a minimal C6 double for the checkout reconcile (GET) and cancel
-// (DELETE) operations plus the OAuth2 token endpoint, backed by httptest TLS. Each
-// operation defaults to a happy path overridable per test. It is intentionally
-// separate from productServer so these tests do not touch shared scaffolding.
+// checkoutRWServer is a minimal C6 double for the checkout reconcile (GET
+// /v1/checkouts/{id}) and cancel (PUT /v1/checkouts/{id}/cancel) operations plus the
+// OAuth2 token endpoint, backed by httptest TLS. Each operation defaults to a happy
+// path overridable per test. It is intentionally separate from productServer so these
+// tests do not touch shared scaffolding.
 type checkoutRWServer struct {
 	*httptest.Server
 	tokenHits int
 	lastAuth  string
 	get       http.HandlerFunc
-	del       http.HandlerFunc
+	cancel    http.HandlerFunc
 }
 
 func newCheckoutRWServer(t *testing.T) *checkoutRWServer {
@@ -33,23 +34,26 @@ func newCheckoutRWServer(t *testing.T) *checkoutRWServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
-	mux.HandleFunc("GET /checkout/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/checkouts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		cs.lastAuth = r.Header.Get("Authorization")
 		if cs.get != nil {
 			cs.get(w, r)
 			return
 		}
+		// Real reconcile (GET 200): the full `checkout` schema — id, status, decimal
+		// amount (reais) and url. No captured/received amount (captured_amount is
+		// "EM BREVE"), so the read cannot reconcile by captured value.
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"session_id":"sess_1","status":"paid","redirect_url":"https://pay.c6/sess_1","amount_cents":1500,"received_amount_cents":1500}`))
+		_, _ = w.Write([]byte(`{"id":"chk_1","status":"PAID","amount":15.00,"url":"https://checkout.c6bank.info/chk_1"}`))
 	})
-	mux.HandleFunc("DELETE /checkout/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PUT /v1/checkouts/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		cs.lastAuth = r.Header.Get("Authorization")
-		if cs.del != nil {
-			cs.del(w, r)
+		if cs.cancel != nil {
+			cs.cancel(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"session_id":"sess_1","status":"CANCELLED","amount_cents":1500}`))
+		// Real cancel: 204 No Content, no body.
+		w.WriteHeader(http.StatusNoContent)
 	})
 	cs.Server = httptest.NewTLSServer(mux)
 	t.Cleanup(cs.Close)
@@ -65,22 +69,26 @@ func (cs *checkoutRWServer) provider(t *testing.T, creds ports.CredentialStore) 
 	return p
 }
 
-// TestGetCheckoutSessionSuccess asserts the reconcile read maps status + money
-// (authorized total and captured amount) and attaches the per-tenant bearer.
+// TestGetCheckoutSessionSuccess asserts the reconcile read maps id/status/amount from
+// the real `checkout` schema and attaches the per-tenant bearer. C6 does not yet
+// return a captured amount (captured_amount is "EM BREVE"), so ReceivedAmountCents is
+// zero and AmountReconciled() is false — fail-safe for threat W3 (a checkout is never
+// settled for an unverified captured amount). Settlement-by-captured-amount is a
+// follow-up once C6 GA's captured_amount (settlement path, SIN-65726).
 func TestGetCheckoutSessionSuccess(t *testing.T) {
 	t.Parallel()
 	cs := newCheckoutRWServer(t)
 	p := cs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
-	res, err := p.GetCheckoutSession(context.Background(), "t1", "sess_1")
+	res, err := p.GetCheckoutSession(context.Background(), "t1", "chk_1")
 	if err != nil {
 		t.Fatalf("GetCheckoutSession: %v", err)
 	}
-	if res.SessionID != "sess_1" || res.Status != "paid" || res.AmountCents != 1500 || res.ReceivedAmountCents != 1500 {
+	if res.SessionID != "chk_1" || res.Status != "PAID" || res.AmountCents != 1500 || res.ReceivedAmountCents != 0 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if !res.AmountReconciled() {
-		t.Fatalf("a full capture should reconcile: %+v", res)
+	if res.AmountReconciled() {
+		t.Fatalf("no captured amount is available yet — reconcile must stay false (fail-safe): %+v", res)
 	}
 	if cs.lastAuth != "Bearer tok-client-1" {
 		t.Fatalf("bearer not attached: %q", cs.lastAuth)
@@ -109,10 +117,10 @@ func TestGetCheckoutSessionRejectsUntrustedRedirect(t *testing.T) {
 	cs := newCheckoutRWServer(t)
 	cs.get = func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"session_id":"sess_1","status":"OPEN","redirect_url":"http://evil/sess_1","amount_cents":1500}`))
+		_, _ = w.Write([]byte(`{"id":"chk_1","status":"IN PROGRESS","url":"http://evil/chk_1","amount":15.00}`))
 	}
 	p := cs.provider(t, oneTenant("t1", "c", "s"))
-	res, err := p.GetCheckoutSession(context.Background(), "t1", "sess_1")
+	res, err := p.GetCheckoutSession(context.Background(), "t1", "chk_1")
 	if !errors.Is(err, shared.ErrUnavailable) {
 		t.Fatalf("untrusted redirect must map to ErrUnavailable, got %v", err)
 	}
@@ -128,11 +136,12 @@ func TestCancelCheckoutSessionSuccess(t *testing.T) {
 	cs := newCheckoutRWServer(t)
 	p := cs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
-	res, err := p.CancelCheckoutSession(context.Background(), "t1", "sess_1")
+	res, err := p.CancelCheckoutSession(context.Background(), "t1", "chk_1")
 	if err != nil {
 		t.Fatalf("CancelCheckoutSession: %v", err)
 	}
-	if res.Status != "CANCELLED" || res.RedirectURL != "" {
+	// Cancel returns 204 (no body); the adapter synthesizes the cancelled state.
+	if res.SessionID != "chk_1" || res.Status != "CANCELLED" || res.RedirectURL != "" {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 	if cs.lastAuth != "Bearer tok-client-1" {
@@ -144,12 +153,12 @@ func TestCancelCheckoutSessionSuccess(t *testing.T) {
 func TestCancelCheckoutSessionError(t *testing.T) {
 	t.Parallel()
 	cs := newCheckoutRWServer(t)
-	cs.del = func(w http.ResponseWriter, _ *http.Request) {
+	cs.cancel = func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte(`{"code":"X"}`))
 	}
 	p := cs.provider(t, oneTenant("t1", "c", "s"))
-	if _, err := p.CancelCheckoutSession(context.Background(), "t1", "sess_1"); !errors.Is(err, shared.ErrConflict) {
+	if _, err := p.CancelCheckoutSession(context.Background(), "t1", "chk_1"); !errors.Is(err, shared.ErrConflict) {
 		t.Fatalf("want ErrConflict, got %v", err)
 	}
 }

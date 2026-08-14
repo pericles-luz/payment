@@ -18,6 +18,11 @@ import (
 // (GetCharge) can be driven in tests.
 type StubProvider struct {
 	creds ports.CredentialStore
+	// bankID is the slug this stub instance is bound to ("c6"), mirroring how the
+	// real C6 adapter fixes its bank in its identity (ADR-0007 §3): every credential
+	// lookup resolves the (tenant, "c6") pair, never carrying the bank on a business
+	// request.
+	bankID string
 	// now is the clock for PIX QR-expiry computation. Defaults to time.Now;
 	// overridable (SetClock) so tests can pin the immediate-charge window/listing.
 	now func() time.Time
@@ -25,7 +30,6 @@ type StubProvider struct {
 	mu         sync.Mutex
 	charges    map[string]ports.ChargeResult   // keyed by tenantID+"\x00"+txID
 	byIdem     map[string]ports.ChargeResult   // keyed by tenantID+"\x00"+idempotencyKey
-	consents   map[string]ports.ConsentResult  // keyed by tenantID+"\x00"+consentID (C6-C)
 	pixCharges map[string]stubPixCharge        // keyed by tenantID+"\x00"+txID (PIX cobrança imediata)
 	pixByIdem  map[string]string               // keyed by tenantID+"\x00"+idempotencyKey -> txID
 	boletos    map[string]ports.BoletoResult   // keyed by tenantID+"\x00"+boletoID (BolePix)
@@ -46,6 +50,17 @@ type StubProvider struct {
 	// tenant's account, keyed by tenantID. GetStatement filters them by the requested
 	// date window.
 	stmtEntries map[string][]ports.StatementEntry
+	// PIX Automático (Recorrência) in-memory state (SIN-66035): recs keyed by
+	// tenantID+"\x00"+idRec, solicRecs by tenantID+"\x00"+idSolicRec, cobrs by
+	// tenantID+"\x00"+txid. Lets wiring and use-cases run end-to-end without C6.
+	recs      map[string]ports.RecResult
+	solicRecs map[string]ports.SolicRecResult
+	cobrs     map[string]ports.CobRResult
+	// recWebhooks / cobrWebhooks hold the singleton recurrence callback URLs
+	// registered per tenant (PIX Automático, SIN-66036), keyed by tenantID. Unlike
+	// the immediate-PIX webhook (per chave), these are one-per-recebedor.
+	recWebhooks  map[string]ports.WebhookRegistration
+	cobrWebhooks map[string]ports.WebhookRegistration
 }
 
 // stubPixCharge is the in-memory record for an immediate PIX charge: the port
@@ -60,10 +75,10 @@ type stubPixCharge struct {
 func NewStubProvider(creds ports.CredentialStore) *StubProvider {
 	return &StubProvider{
 		creds:          creds,
+		bankID:         ports.BankIDC6,
 		now:            time.Now,
 		charges:        make(map[string]ports.ChargeResult),
 		byIdem:         make(map[string]ports.ChargeResult),
-		consents:       make(map[string]ports.ConsentResult),
 		pixCharges:     make(map[string]stubPixCharge),
 		pixByIdem:      make(map[string]string),
 		boletos:        make(map[string]ports.BoletoResult),
@@ -74,6 +89,11 @@ func NewStubProvider(creds ports.CredentialStore) *StubProvider {
 		ddaGroups:      make(map[string]*stubDDAGroup),
 		ddaGroupByIdem: make(map[string]string),
 		stmtEntries:    make(map[string][]ports.StatementEntry),
+		recs:           make(map[string]ports.RecResult),
+		solicRecs:      make(map[string]ports.SolicRecResult),
+		cobrs:          make(map[string]ports.CobRResult),
+		recWebhooks:    make(map[string]ports.WebhookRegistration),
+		cobrWebhooks:   make(map[string]ports.WebhookRegistration),
 	}
 }
 
@@ -100,7 +120,7 @@ func key(tenantID, txID string) string { return tenantID + "\x00" + txID }
 // bank, so a retry that races the local reservation cannot double-charge. The key
 // is tenant-scoped, so one tenant's key can never collide with another's.
 func (s *StubProvider) CreateCharge(ctx context.Context, tenantID string, req ports.ChargeRequest) (ports.ChargeResult, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.ChargeResult{}, err
 	}
 	s.mu.Lock()

@@ -21,6 +21,10 @@ type createPixRequest struct {
 	Currency         string         `json:"currency"`
 	ExpiresInSeconds int64          `json:"expires_in_seconds"`
 	Devedor          *pixDevedorReq `json:"devedor"`
+	// Bank optionally selects which configured bank handles this charge (multi-bank,
+	// SIN-66022); empty keeps header/default routing, and it overrides X-Bank-Id when
+	// both are present (ADR-0007).
+	Bank string `json:"bank"`
 }
 
 type pixDevedorReq struct {
@@ -71,8 +75,14 @@ func (s *Server) handleCreatePix(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	nr, ok := s.rebindBank(w, r, req.Bank)
+	if !ok {
+		return
+	}
+	r = nr
 	in := app.CreateImmediateChargeInput{
 		TenantID:         tenantID,
+		AccountID:        accountFromContext(r.Context()),
 		AmountCents:      req.AmountCents,
 		Currency:         req.Currency,
 		IdempotencyKey:   idemKey,

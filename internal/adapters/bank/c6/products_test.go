@@ -16,12 +16,12 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
-// productServer is a configurable C6 double for the C6-C products (consent,
-// boleto, checkout) plus the OAuth2 token endpoint, backed by httptest TLS. It
-// uses Go's method+path routing so each product/operation has its own handler,
-// defaulting to a happy path that can be overridden per test. It records the last
-// Authorization / Idempotency-Key / request body so tests can assert plumbing
-// without races.
+// productServer is a configurable C6 double for the C6-C products (boleto,
+// checkout) plus the OAuth2 token endpoint, backed by httptest TLS. It uses
+// Go's method+path routing so each product/operation has its own handler,
+// defaulting to a happy path that can be overridden per test. It records the
+// last Authorization / Idempotency-Key / request body so tests can assert
+// plumbing without races.
 type productServer struct {
 	*httptest.Server
 
@@ -31,14 +31,11 @@ type productServer struct {
 	lastIdemKey    string
 	lastBody       []byte
 
-	consentCreate http.HandlerFunc
-	consentGet    http.HandlerFunc
-	consentCancel http.HandlerFunc
-	boletoCreate  http.HandlerFunc
-	boletoGet     http.HandlerFunc
-	boletoCancel  http.HandlerFunc
-	boletoUpdate  http.HandlerFunc
-	checkout      http.HandlerFunc
+	boletoCreate http.HandlerFunc
+	boletoGet    http.HandlerFunc
+	boletoCancel http.HandlerFunc
+	boletoUpdate http.HandlerFunc
+	checkout     http.HandlerFunc
 	// cobvPut backs both create and amend (both PUT /v2/pix/cobv/{txid}); cobvGet
 	// backs the reconcile read (roteiro 7.5–7.7).
 	cobvPut http.HandlerFunc
@@ -66,33 +63,6 @@ func newProductServer(t *testing.T) *productServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
-	mux.HandleFunc("POST /consents", func(w http.ResponseWriter, r *http.Request) {
-		record(r)
-		if ps.consentCreate != nil {
-			ps.consentCreate(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"consent_id":"con_1","status":"PENDING"}`))
-	})
-	mux.HandleFunc("GET /consents/{id}", func(w http.ResponseWriter, r *http.Request) {
-		record(r)
-		if ps.consentGet != nil {
-			ps.consentGet(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"consent_id":"con_1","status":"ACTIVE"}`))
-	})
-	mux.HandleFunc("POST /consents/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
-		record(r)
-		if ps.consentCancel != nil {
-			ps.consentCancel(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"consent_id":"con_1","status":"CANCELLED"}`))
-	})
 	mux.HandleFunc("POST /v1/bank_slips", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		if ps.boletoCreate != nil {
@@ -100,7 +70,8 @@ func newProductServer(t *testing.T) *productServer {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"REGISTERED","qr_code":"pix-emv","barcode":"123","amount_cents":1000}`))
+		// Real C6 201 shape (SIN-65888): id/our_number/bar_code/digitable_line/amount(decimal).
+		_, _ = w.Write([]byte(`{"id":"01HBANKSLIP0000000000000001","our_number":"55501","originator_id":"000000000001","bar_code":"bc-1","digitable_line":"dl-1","amount":10.00,"billing_scheme":"21","billing_type":"3","due_date":"2027-01-15"}`))
 	})
 	mux.HandleFunc("GET /boletos/{id}", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
@@ -129,14 +100,16 @@ func newProductServer(t *testing.T) *productServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"REGISTERED","qr_code":"pix-emv","barcode":"123","amount_cents":2000,"fine_bps":150,"monthly_interest_bps":80}`))
 	})
-	mux.HandleFunc("POST /checkout/sessions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/checkouts/", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		if ps.checkout != nil {
 			ps.checkout(w, r)
 			return
 		}
+		// Real C6 create (201) response is {id, url} — no status/amount echoed.
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"session_id":"sess_1","status":"OPEN","redirect_url":"https://pay.c6/sess_1","amount_cents":1500}`))
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"chk_1","url":"https://checkout.c6bank.info/chk_1"}`))
 	})
 
 	// Real BACEN cobv wire (SIN-65860): calendario.dataDeVencimento/validadeApos-
@@ -197,156 +170,6 @@ func (ps *productServer) tokenCount() int {
 	return ps.tokenHits
 }
 
-// --- Consent ---
-
-func TestCreateConsentSuccess(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
-
-	res, err := p.CreateConsent(context.Background(), "t1", ports.ConsentRequest{
-		TenantID: "t1", ConsentID: "con_1", DebtorTaxID: "12345678901",
-		MaxAmountCents: 50000, Currency: "BRL", Frequency: "MONTHLY",
-		StartAt: time.Unix(1_700_000_000, 0),
-	})
-	if err != nil {
-		t.Fatalf("CreateConsent: %v", err)
-	}
-	if res.ConsentID != "con_1" || res.Status != "PENDING" {
-		t.Fatalf("unexpected result: %+v", res)
-	}
-	if ps.lastAuthHeader != "Bearer tok-client-1" {
-		t.Fatalf("bearer not attached: %q", ps.lastAuthHeader)
-	}
-	if ps.idemKey() != "con_1" {
-		t.Fatalf("idempotency key should fall back to consent id, got %q", ps.idemKey())
-	}
-}
-
-func TestCreateConsentForwardsIdempotencyKeyAndOmitsZeroEnd(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "c", "s"))
-
-	_, err := p.CreateConsent(context.Background(), "t1", ports.ConsentRequest{
-		TenantID: "t1", ConsentID: "con_1", DebtorTaxID: "12345678901",
-		MaxAmountCents: 50000, Currency: "BRL", Frequency: "MONTHLY",
-		StartAt: time.Unix(1_700_000_000, 0), IdempotencyKey: "idem-xyz",
-	})
-	if err != nil {
-		t.Fatalf("CreateConsent: %v", err)
-	}
-	if ps.idemKey() != "idem-xyz" {
-		t.Fatalf("explicit idempotency key should win, got %q", ps.idemKey())
-	}
-	// Open-ended consent: end_at must be omitted from the JSON body entirely.
-	var got map[string]json.RawMessage
-	if err := json.Unmarshal(ps.body(), &got); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if _, present := got["end_at"]; present {
-		t.Fatalf("end_at must be omitted when zero, body=%s", ps.body())
-	}
-}
-
-func TestCreateConsentSendsBoundedEnd(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "c", "s"))
-
-	_, err := p.CreateConsent(context.Background(), "t1", ports.ConsentRequest{
-		TenantID: "t1", ConsentID: "con_1", DebtorTaxID: "12345678901",
-		MaxAmountCents: 50000, Currency: "BRL", Frequency: "MONTHLY",
-		StartAt: time.Unix(1_700_000_000, 0), EndAt: time.Unix(1_800_000_000, 0),
-	})
-	if err != nil {
-		t.Fatalf("CreateConsent: %v", err)
-	}
-	var got map[string]json.RawMessage
-	if err := json.Unmarshal(ps.body(), &got); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if _, present := got["end_at"]; !present {
-		t.Fatalf("end_at must be present when bounded, body=%s", ps.body())
-	}
-}
-
-func TestGetConsentSuccess(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
-
-	res, err := p.GetConsent(context.Background(), "t1", "con_1")
-	if err != nil {
-		t.Fatalf("GetConsent: %v", err)
-	}
-	if res.Status != "ACTIVE" {
-		t.Fatalf("unexpected result: %+v", res)
-	}
-	if ps.lastAuthHeader != "Bearer tok-client-1" {
-		t.Fatalf("bearer not attached: %q", ps.lastAuthHeader)
-	}
-}
-
-func TestGetConsentNotFound(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	ps.consentGet = func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"code":"NOT_FOUND"}`))
-	}
-	p := ps.provider(t, oneTenant("t1", "c", "s"))
-	if _, err := p.GetConsent(context.Background(), "t1", "missing"); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("want ErrNotFound, got %v", err)
-	}
-}
-
-func TestCancelConsentSuccess(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "c", "s"))
-
-	res, err := p.CancelConsent(context.Background(), "t1", "con_1")
-	if err != nil {
-		t.Fatalf("CancelConsent: %v", err)
-	}
-	if res.Status != "CANCELLED" {
-		t.Fatalf("unexpected result: %+v", res)
-	}
-	if ps.idemKey() != "con_1" {
-		t.Fatalf("cancel should carry consent id as idempotency key, got %q", ps.idemKey())
-	}
-}
-
-func TestCancelConsentError(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	ps.consentCancel = func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"code":"X"}`))
-	}
-	p := ps.provider(t, oneTenant("t1", "c", "s"))
-	if _, err := p.CancelConsent(context.Background(), "t1", "con_1"); !errors.Is(err, shared.ErrConflict) {
-		t.Fatalf("want ErrConflict, got %v", err)
-	}
-}
-
-func TestConsentMissingCredential(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, &fakeCreds{creds: map[string]ports.BankCredential{}})
-
-	if _, err := p.CreateConsent(context.Background(), "unknown", ports.ConsentRequest{
-		TenantID: "unknown", ConsentID: "c", DebtorTaxID: "12345678901",
-		MaxAmountCents: 1, Currency: "BRL", Frequency: "MONTHLY", StartAt: time.Unix(1, 0),
-	}); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("missing credential should propagate ErrNotFound, got %v", err)
-	}
-	if ps.tokenCount() != 0 {
-		t.Fatalf("token endpoint must not be hit without a credential, hits=%d", ps.tokenCount())
-	}
-}
-
 // --- Boleto ---
 
 func TestCreateBoletoSuccess(t *testing.T) {
@@ -362,8 +185,16 @@ func TestCreateBoletoSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
 	}
-	if res.TxID != "tx_1" || res.Status != "REGISTERED" || res.QRCode != "pix-emv" || res.Barcode != "123" {
-		t.Fatalf("unexpected result: %+v", res)
+	// Real 201 maps id→TxID (non-empty: billing-finalized marker), our_number, bar_code,
+	// digitable_line and amount(decimal 10.00)→1000 centavos. No status/qr_code on create.
+	if res.TxID != "01HBANKSLIP0000000000000001" || res.BoletoID != "01HBANKSLIP0000000000000001" {
+		t.Fatalf("id must map to BoletoID and TxID, got %+v", res)
+	}
+	if res.OurNumber != "55501" || res.Barcode != "bc-1" || res.DigitableLine != "dl-1" {
+		t.Fatalf("our_number/bar_code/digitable_line not mapped: %+v", res)
+	}
+	if res.AmountCents != 1000 {
+		t.Fatalf("amount 10.00 must parse to 1000 centavos, got %d", res.AmountCents)
 	}
 	if ps.lastAuthHeader != "Bearer tok-client-1" {
 		t.Fatalf("bearer not attached: %q", ps.lastAuthHeader)
@@ -371,12 +202,13 @@ func TestCreateBoletoSuccess(t *testing.T) {
 	if ps.idemKey() != "bol_1" {
 		t.Fatalf("idempotency key should fall back to boleto id, got %q", ps.idemKey())
 	}
-	// The adapter transports the fine/interest RATES (the domain computes amounts).
+	// The adapter transports the fine/interest RATES as the real {value,type} objects and
+	// the decimal amount (the domain still computes amounts owed).
 	var sent map[string]json.RawMessage
 	if err := json.Unmarshal(ps.body(), &sent); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	for _, f := range []string{"fine_bps", "monthly_interest_bps", "due_date"} {
+	for _, f := range []string{"fine", "interest", "due_date", "amount"} {
 		if _, ok := sent[f]; !ok {
 			t.Fatalf("boleto request must carry %q, body=%s", f, ps.body())
 		}
@@ -422,27 +254,45 @@ func TestCreateCheckoutSessionSuccess(t *testing.T) {
 	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.CreateCheckoutSession(context.Background(), "t1", ports.CheckoutRequest{
-		TenantID: "t1", SessionID: "sess_1", Currency: "BRL",
+		TenantID: "t1", SessionID: "sess_1", Currency: "BRL", CardType: "credit",
 		Items:     []ports.CheckoutItem{{Description: "a", AmountCents: 1000}, {Description: "b", AmountCents: 500}},
 		ExpiresAt: time.Unix(1_800_000_000, 0),
 	})
 	if err != nil {
 		t.Fatalf("CreateCheckoutSession: %v", err)
 	}
-	if res.SessionID != "sess_1" || res.Status != "OPEN" || res.RedirectURL != "https://pay.c6/sess_1" || res.AmountCents != 1500 {
+	// Create maps the real {id,url} response: id->SessionID, url->RedirectURL, a fresh
+	// checkout is CREATED, and AmountCents echoes the authorized total we sent.
+	if res.SessionID != "chk_1" || res.Status != "CREATED" || res.RedirectURL != "https://checkout.c6bank.info/chk_1" || res.AmountCents != 1500 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 	if ps.idemKey() != "sess_1" {
 		t.Fatalf("idempotency key should fall back to session id, got %q", ps.idemKey())
 	}
+	// Real wire: a single decimal amount in reais (items summed, never cents) +
+	// payment.card{type,installments}; there is no items[] array.
 	var sent struct {
-		Items []json.RawMessage `json:"items"`
+		Amount  json.RawMessage   `json:"amount"`
+		Items   []json.RawMessage `json:"items"`
+		Payment struct {
+			Card struct {
+				Type         string `json:"type"`
+				Installments int    `json:"installments"`
+				Authenticate string `json:"authenticate"`
+			} `json:"card"`
+		} `json:"payment"`
 	}
 	if err := json.Unmarshal(ps.body(), &sent); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	if len(sent.Items) != 2 {
-		t.Fatalf("checkout request should carry 2 items, got %d", len(sent.Items))
+	if len(sent.Items) != 0 {
+		t.Fatalf("real contract has no items[], got %d", len(sent.Items))
+	}
+	if string(sent.Amount) != "15.00" {
+		t.Fatalf("amount must be decimal reais 15.00 (1500 cents summed), got %s", sent.Amount)
+	}
+	if sent.Payment.Card.Type != "CREDIT" || sent.Payment.Card.Installments != 1 || sent.Payment.Card.Authenticate != "NOT_REQUIRED" {
+		t.Fatalf("unexpected payment.card: %+v", sent.Payment.Card)
 	}
 }
 
@@ -455,8 +305,8 @@ func TestCreateCheckoutSessionErrorMapping(t *testing.T) {
 	}
 	p := ps.provider(t, oneTenant("t1", "c", "s"))
 	if _, err := p.CreateCheckoutSession(context.Background(), "t1", ports.CheckoutRequest{
-		TenantID: "t1", SessionID: "s", Currency: "BRL",
-		Items:     []ports.CheckoutItem{{Description: "a", AmountCents: 1}},
+		TenantID: "t1", SessionID: "s", Currency: "BRL", CardType: "credit",
+		Items:     []ports.CheckoutItem{{Description: "a", AmountCents: 600}},
 		ExpiresAt: time.Unix(1, 0),
 	}); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("422 should map to ErrValidation, got %v", err)
@@ -468,8 +318,8 @@ func TestCheckoutMissingCredential(t *testing.T) {
 	ps := newProductServer(t)
 	p := ps.provider(t, &fakeCreds{creds: map[string]ports.BankCredential{}})
 	if _, err := p.CreateCheckoutSession(context.Background(), "unknown", ports.CheckoutRequest{
-		TenantID: "unknown", SessionID: "s", Currency: "BRL",
-		Items:     []ports.CheckoutItem{{Description: "a", AmountCents: 1}},
+		TenantID: "unknown", SessionID: "s", Currency: "BRL", CardType: "credit",
+		Items:     []ports.CheckoutItem{{Description: "a", AmountCents: 600}},
 		ExpiresAt: time.Unix(1, 0),
 	}); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("missing credential should propagate ErrNotFound, got %v", err)
@@ -500,15 +350,16 @@ func TestCreateCheckoutSessionRejectsUntrustedRedirectURL(t *testing.T) {
 			ps := newProductServer(t)
 			ps.checkout = func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
 				body, _ := json.Marshal(checkoutResponseBody{
-					SessionID: "sess_1", Status: "OPEN", RedirectURL: tc.redirect, AmountCents: 1500,
+					ID: "chk_1", Status: "CREATED", URL: tc.redirect, Amount: 1500,
 				})
 				_, _ = w.Write(body)
 			}
 			p := ps.provider(t, oneTenant("t1", "c", "s"))
 
 			res, err := p.CreateCheckoutSession(context.Background(), "t1", ports.CheckoutRequest{
-				TenantID: "t1", SessionID: "sess_1", Currency: "BRL",
+				TenantID: "t1", SessionID: "sess_1", Currency: "BRL", CardType: "credit",
 				Items:     []ports.CheckoutItem{{Description: "a", AmountCents: 1500}},
 				ExpiresAt: time.Unix(1_800_000_000, 0),
 			})

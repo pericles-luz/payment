@@ -25,7 +25,7 @@ func TestSetBankCredentialValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := store.SetBankCredential(ctx, tc.tenantID, tc.clientID, tc.secret)
+			err := store.SetBankCredential(ctx, tc.tenantID, ports.BankIDC6, tc.clientID, tc.secret)
 			if !errors.Is(err, shared.ErrValidation) {
 				t.Fatalf("want ErrValidation, got %v", err)
 			}
@@ -38,10 +38,10 @@ func TestSetBankCredentialStoresAndOverwrites(t *testing.T) {
 	store := secret.NewStore(nil)
 	ctx := context.Background()
 
-	if err := store.SetBankCredential(ctx, "t1", "cid", "shh"); err != nil {
+	if err := store.SetBankCredential(ctx, "t1", ports.BankIDC6, "cid", "shh"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	got, err := store.GetBankCredential(ctx, "t1")
+	got, err := store.GetBankCredential(ctx, "t1", ports.BankIDC6)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -50,16 +50,16 @@ func TestSetBankCredentialStoresAndOverwrites(t *testing.T) {
 	}
 
 	// Overwrite replaces both client id and secret.
-	if err := store.SetBankCredential(ctx, "t1", "cid2", "shh2"); err != nil {
+	if err := store.SetBankCredential(ctx, "t1", ports.BankIDC6, "cid2", "shh2"); err != nil {
 		t.Fatalf("overwrite: %v", err)
 	}
-	got, _ = store.GetBankCredential(ctx, "t1")
+	got, _ = store.GetBankCredential(ctx, "t1", ports.BankIDC6)
 	if got.ClientID != "cid2" || got.Secret != "shh2" {
 		t.Fatalf("overwrite not applied: %+v", got)
 	}
 
 	// Isolation: another tenant remains absent.
-	if _, err := store.GetBankCredential(ctx, "t2"); !errors.Is(err, shared.ErrNotFound) {
+	if _, err := store.GetBankCredential(ctx, "t2", ports.BankIDC6); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("want not found for t2, got %v", err)
 	}
 }

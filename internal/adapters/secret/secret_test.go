@@ -17,7 +17,7 @@ func TestStoreIsolatesPerTenant(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	got, err := store.GetBankCredential(ctx, "t1")
+	got, err := store.GetBankCredential(ctx, "t1", ports.BankIDC6)
 	if err != nil {
 		t.Fatalf("t1: %v", err)
 	}
@@ -26,13 +26,13 @@ func TestStoreIsolatesPerTenant(t *testing.T) {
 	}
 
 	// A different tenant has no credential (isolation).
-	if _, err := store.GetBankCredential(ctx, "t2"); !errors.Is(err, shared.ErrNotFound) {
+	if _, err := store.GetBankCredential(ctx, "t2", ports.BankIDC6); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("want not found, got %v", err)
 	}
 
 	// Set assigns per tenant and stamps the tenant id.
 	store.Set("t2", ports.BankCredential{ClientID: "c2", Secret: "s2"})
-	got2, err := store.GetBankCredential(ctx, "t2")
+	got2, err := store.GetBankCredential(ctx, "t2", ports.BankIDC6)
 	if err != nil {
 		t.Fatalf("t2: %v", err)
 	}

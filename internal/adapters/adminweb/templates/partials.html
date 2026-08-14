@@ -28,15 +28,298 @@
 {{- end -}}
 {{end}}
 
+{{define "consumption_rows"}}
+<table class="data">
+  <caption class="sr-only">Consumo por endpoint para {{.Tenant.Name}}</caption>
+  <thead><tr><th scope="col">Endpoint</th><th scope="col">Chamadas</th><th scope="col">Total</th></tr></thead>
+  <tbody>
+  {{- if .Rows -}}
+  {{range .Rows}}<tr><td><code>{{.Endpoint}}</code></td><td>{{.Calls}}</td><td>{{.TotalReais}}</td></tr>{{end}}
+  {{- else -}}
+  <tr class="empty-row"><td colspan="3"><div class="empty"><p class="muted">Sem consumo registrado neste período.</p></div></td></tr>
+  {{- end -}}
+  </tbody>
+  {{if .Rows}}<tfoot><tr><th scope="row">Total</th><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td></tr></tfoot>{{end}}
+</table>
+{{end}}
+
+{{define "invoice_rows"}}
+<table class="data">
+  <caption class="sr-only">Faturas de {{.Tenant.Name}}</caption>
+  <thead><tr><th scope="col">Período</th><th scope="col">Gerada em</th><th scope="col">Chamadas</th><th scope="col">Total</th><th scope="col">Documento</th></tr></thead>
+  <tbody>
+  {{- if .Rows -}}
+  {{range .Rows}}<tr><td>{{.PeriodFrom}} — {{.PeriodTo}}</td><td>{{.Generated}}</td><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td><td><a class="btn btn--secondary" href="{{.CSVHref $.Tenant.ID}}" download>Baixar CSV</a></td></tr>{{end}}
+  {{- else -}}
+  <tr class="empty-row"><td colspan="5"><div class="empty"><p class="muted">Nenhuma fatura gerada. Escolha um período e clique em “Gerar fatura”.</p></div></td></tr>
+  {{- end -}}
+  </tbody>
+</table>
+{{end}}
+
+{{/* account_badge marks a self-account (legacy 1:1) vs a real reseller account.
+     Data is an AccountView. */}}
+{{define "account_badge"}}
+{{- if .IsSelf -}}
+<span class="badge badge--muted"><span class="dot" aria-hidden="true"></span>Conta própria (legado)</span>
+{{- else -}}
+{{template "status_badge" .}}
+{{- end -}}
+{{end}}
+
+{{/* account_row renders one account in the Contas list table. Data is an AccountView. */}}
+{{define "account_row"}}
+<tr id="account-{{.ID}}">
+  <td><a class="row-link" href="/console/accounts/{{.ID}}" hx-get="/console/accounts/{{.ID}}" hx-target="#main" hx-push-url="true">{{.Name}}</a></td>
+  <td>{{template "account_badge" .}}</td>
+  <td>{{.TenantCount}}</td>
+  <td>{{.CreatedAtBR}}</td>
+</tr>
+{{end}}
+
+{{/* account_rows renders the Contas list body or its empty state. Data is an
+     AccountListView / AccountRowsView (both carry Accounts + Search). */}}
+{{define "account_rows"}}
+{{- if .Accounts -}}
+{{- range .Accounts}}{{template "account_row" .}}{{end -}}
+{{- else -}}
+<tr class="empty-row"><td colspan="4">
+  {{- if .Search -}}
+  <div class="empty"><h2>Nada encontrado para «{{.Search}}»</h2><p><a class="btn btn--ghost" href="/console/accounts" hx-get="/console/accounts" hx-target="#main" hx-push-url="true">Limpar filtro</a></p></div>
+  {{- else -}}
+  <div class="empty"><h2>Nenhuma conta ainda</h2><p class="muted">Cadastre a primeira Conta (usuário-API / revenda) para aninhar suas empresas-clientes.</p><p><a class="btn btn--primary" href="/console/accounts/new" hx-get="/console/accounts/new" hx-target="#main" hx-push-url="true">+ Nova conta</a></p></div>
+  {{- end -}}
+</td></tr>
+{{- end -}}
+{{end}}
+
+{{/* account_tenant_rows renders the empresas-clientes nested in an account detail.
+     Data is an AccountDetailView (Account + Tenants). */}}
+{{define "account_tenant_rows"}}
+{{- if .Tenants -}}
+{{- range .Tenants}}{{template "tenant_row" .}}{{end -}}
+{{- else -}}
+<tr class="empty-row"><td colspan="3">
+  <div class="empty"><h2>Nenhuma empresa-cliente nesta Conta</h2><p class="muted">Provisione a primeira empresa-cliente sob esta Conta.</p><p><a class="btn btn--primary" href="/console/accounts/{{.Account.ID}}/tenants/new" hx-get="/console/accounts/{{.Account.ID}}/tenants/new" hx-target="#main" hx-push-url="true">+ Nova empresa-cliente</a></p></div>
+</td></tr>
+{{- end -}}
+{{end}}
+
+{{/* account_consumption_rows renders the account usage rollup (one row per
+     empresa-cliente). Data is an AccountConsumptionView. */}}
+{{define "account_consumption_rows"}}
+<table class="data">
+  <caption class="sr-only">Uso por empresa-cliente da Conta {{.Account.Name}}</caption>
+  <thead><tr><th scope="col">Empresa-cliente</th><th scope="col">Chamadas</th><th scope="col">Total</th></tr></thead>
+  <tbody>
+  {{- if .Rows -}}
+  {{range .Rows}}<tr><td><a class="row-link" href="/console/tenants/{{.TenantID}}/consumption" hx-get="/console/tenants/{{.TenantID}}/consumption" hx-target="#main" hx-push-url="true">{{.TenantName}}</a></td><td>{{.Calls}}</td><td>{{.TotalReais}}</td></tr>{{end}}
+  {{- else -}}
+  <tr class="empty-row"><td colspan="3"><div class="empty"><p class="muted">Sem consumo registrado para as empresas-clientes desta Conta no período.</p></div></td></tr>
+  {{- end -}}
+  </tbody>
+  {{if .Rows}}<tfoot><tr><th scope="row">Total da Conta</th><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td></tr></tfoot>{{end}}
+</table>
+{{end}}
+
+{{/* account_invoice_rows renders the account Faturas list (per empresa-cliente,
+     grouped under the Conta). Data is an AccountInvoicesView. */}}
+{{define "account_invoice_rows"}}
+<table class="data">
+  <caption class="sr-only">Faturas das empresas-clientes da Conta {{.Account.Name}}</caption>
+  <thead><tr><th scope="col">Empresa-cliente</th><th scope="col">Período</th><th scope="col">Gerada em</th><th scope="col">Chamadas</th><th scope="col">Total</th><th scope="col">Documento</th></tr></thead>
+  <tbody>
+  {{- if .Rows -}}
+  {{range .Rows}}<tr><td>{{.TenantName}}</td><td>{{.PeriodFrom}} — {{.PeriodTo}}</td><td>{{.Generated}}</td><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td><td><a class="btn btn--secondary" href="{{.CSVHref}}" download>Baixar CSV</a></td></tr>{{end}}
+  {{- else -}}
+  <tr class="empty-row"><td colspan="6"><div class="empty"><p class="muted">Nenhuma fatura nas empresas-clientes desta Conta. Escolha um período e gere o lote.</p></div></td></tr>
+  {{- end -}}
+  </tbody>
+  {{if .Rows}}<tfoot><tr><th scope="row" colspan="4">Total da Conta</th><td>{{.TotalReais}}</td><td></td></tr></tfoot>{{end}}
+</table>
+{{end}}
+
 {{define "toast_oob"}}
 <div id="toasts" hx-swap-oob="afterbegin">
   <div class="toast toast--{{.Kind}}" role="status">{{.Message}}</div>
 </div>
 {{end}}
 
+{{/* cred_status_badge maps a credential-presence bool to a badge. Never the value
+     — only whether a credential is configured (✓) or pending (—). Data is a bool. */}}
+{{define "cred_status_badge"}}
+{{- if . -}}
+<span class="badge badge--success"><span class="dot" aria-hidden="true"></span>configurada</span>
+{{- else -}}
+<span class="badge badge--warning"><span class="dot" aria-hidden="true"></span>pendente</span>
+{{- end -}}
+{{end}}
+
+{{/* bank_row renders one bank in the list table. Data is a BankRow. */}}
+{{define "bank_row"}}
+<tr id="bank-{{.Slug}}">
+  <td><a class="row-link" href="/console/tenants/{{.TenantID}}/banks/{{.Slug}}"
+         hx-get="/console/tenants/{{.TenantID}}/banks/{{.Slug}}" hx-target="#main" hx-push-url="true">{{.DisplayName}}</a></td>
+  <td><code>{{.Slug}}</code></td>
+  <td>{{template "cred_status_badge" .CredentialSet}}</td>
+  <td>{{template "cert_status_badge" .Cert}}</td>
+  <td>{{template "status_badge" .}}</td>
+</tr>
+{{end}}
+
+{{/* bank_rows renders the bank list body or its empty state. Data is a BankListView. */}}
+{{define "bank_rows"}}
+{{- if .Banks -}}
+{{- range .Banks}}{{template "bank_row" .}}{{end -}}
+{{- else -}}
+<tr class="empty-row"><td colspan="5">
+  <div class="empty"><h2>Nenhum banco configurado</h2><p class="muted">Adicione o primeiro banco para o tenant começar a transacionar.</p></div>
+</td></tr>
+{{- end -}}
+{{end}}
+
+{{/* cert_status_badge maps a bank's mTLS certificate metadata to a lifecycle
+     badge. Data is a *CertMeta (nil → "sem certificado"). It carries only public
+     metadata; the private key is never available here (threat C1/C4). */}}
+{{define "cert_status_badge"}}
+{{- if . -}}
+  {{- if .StatusExpired -}}
+  <span class="badge badge--danger"><span class="dot" aria-hidden="true"></span>✕ Expirado</span>
+  {{- else if .StatusExpiring -}}
+  <span class="badge badge--warning"><span class="dot" aria-hidden="true"></span>⚠ Expira em {{.DaysToExpiry}} {{.DaysUnit}}</span>
+  {{- else if .StatusNotYetValid -}}
+  <span class="badge badge--muted"><span class="dot" aria-hidden="true"></span>Entra em vigor em {{.NotBeforeBR}}</span>
+  {{- else -}}
+  <span class="badge badge--success"><span class="dot" aria-hidden="true"></span>Válido</span>
+  {{- end -}}
+{{- else -}}
+<span class="badge badge--muted"><span class="dot" aria-hidden="true"></span>sem certificado</span>
+{{- end -}}
+{{end}}
+
+{{/* cert_status_oob updates the detail header's cert badge out-of-band after an
+     upload/rotation, so the title reflects the new validity band immediately.
+     Data is a BankRow. */}}
+{{define "cert_status_oob"}}
+<span id="cert-status" hx-swap-oob="true">{{template "cert_status_badge" .Cert}}</span>
+{{end}}
+
+{{/* cert_card renders the per-bank mTLS certificate card. Data is a BankDetailView.
+     The form is multipart (file uploads) and posts to itself, swapping only
+     #cert-card (outerHTML) so a rotation never disturbs the rest of the detail
+     screen. The private key is write-only: it is uploaded, validated server-side,
+     stored in the vault, and NEVER re-rendered. Only public metadata is shown back.
+     No inline JS (CSP): the input is a native file control with a label + aria. */}}
+{{define "cert_card"}}
+<form id="cert-card" class="form card" method="post" enctype="multipart/form-data"
+      action="/console/tenants/{{.Tenant.ID}}/banks/{{.Bank.Slug}}/certificate"
+      hx-post="/console/tenants/{{.Tenant.ID}}/banks/{{.Bank.Slug}}/certificate"
+      hx-encoding="multipart/form-data" hx-target="#cert-card" hx-swap="outerHTML"
+      {{if .Bank.Cert}}hx-confirm="Substituir o certificado mTLS atual do {{.Bank.DisplayName}}? As novas conexões ao banco passam a apresentar o certificado novo."{{end}}>
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <h2>Certificado mTLS — {{.Bank.DisplayName}} {{template "cert_status_badge" .Bank.Cert}}</h2>
+  {{if .CertSaved}}<div class="banner banner--success" role="status">Certificado salvo. A chave privada foi gravada no cofre (write-only) e não é exibida novamente.</div>{{end}}
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+
+  {{with .Bank.Cert}}
+  <dl class="dl">
+    <dt>Emitido para</dt>
+    <dd>{{if .SubjectCN}}{{.SubjectCN}}{{else}}<span class="muted">— sem CN</span>{{end}}</dd>
+    <dt>Emissor</dt>
+    <dd>{{if .Issuer}}{{.Issuer}}{{else}}<span class="muted">—</span>{{end}}</dd>
+    <dt>Validade</dt>
+    <dd>{{.NotBeforeBR}} – {{.NotAfterBR}}</dd>
+    <dt>Fingerprint SHA-256</dt>
+    <dd><code>{{.FingerprintSHA256}}</code></dd>
+  </dl>
+  {{else}}
+  <p class="muted">Nenhum certificado configurado para este banco.</p>
+  {{end}}
+
+  <p class="muted">A chave privada é gravada uma única vez no cofre (write-only); esta tela nunca a reexibe. Envie o certificado e a chave em formato PEM.</p>
+
+  <div class="field{{if .Errors.cert_pem}} has-error{{end}}">
+    <label for="f-cert">Certificado (PEM) *</label>
+    <input id="f-cert" name="cert_pem" type="file" accept=".pem,.crt,.cer,application/x-pem-file" required
+           {{if .Errors.cert_pem}}aria-invalid="true" aria-describedby="e-cert"{{else}}aria-describedby="h-cert"{{end}}>
+    {{if .Errors.cert_pem}}<span class="error" id="e-cert" role="alert">{{.Errors.cert_pem}}</span>{{else}}<span class="help" id="h-cert">Certificado de cliente público (folha) em PEM.</span>{{end}}
+  </div>
+
+  <div class="field{{if .Errors.key_pem}} has-error{{end}}">
+    <label for="f-key">Chave privada (PEM) *</label>
+    <input id="f-key" name="key_pem" type="file" accept=".pem,.key" required
+           {{if .Errors.key_pem}}aria-invalid="true" aria-describedby="e-key"{{else}}aria-describedby="h-key"{{end}}>
+    {{if .Errors.key_pem}}<span class="error" id="e-key" role="alert">{{.Errors.key_pem}}</span>{{else}}<span class="help" id="h-key">Não é armazenada em texto na aplicação; vai direto ao cofre.</span>{{end}}
+  </div>
+
+  <div class="form-actions">
+    <button class="btn btn--primary" type="submit">{{if .Bank.Cert}}Rotacionar certificado{{else}}Enviar certificado{{end}}</button>
+  </div>
+</form>
+{{end}}
+
+{{/* cred_card renders the write-only credential card. Data is a BankDetailView.
+     Posts to itself and swaps only #cred-card (outerHTML), so saving a credential
+     never disturbs the rest of the detail screen. The secret is never re-rendered. */}}
+{{define "cred_card"}}
+<form id="cred-card" class="form card" method="post"
+      action="/console/tenants/{{.Tenant.ID}}/banks/{{.Bank.Slug}}/credential"
+      hx-post="/console/tenants/{{.Tenant.ID}}/banks/{{.Bank.Slug}}/credential"
+      hx-target="#cred-card" hx-swap="outerHTML"
+      {{if .Bank.CredentialSet}}hx-confirm="Substituir a credencial atual do {{.Bank.DisplayName}}? As chamadas em andamento passam a usar a credencial nova a partir de agora."{{end}}>
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <h2>Credencial de API — {{.Bank.DisplayName}} {{template "cred_status_badge" .Bank.CredentialSet}}</h2>
+  {{if .CredSaved}}<div class="banner banner--success" role="status">Credencial salva. O segredo foi gravado no cofre e não é exibido novamente.</div>{{end}}
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+
+  <p class="muted">O segredo é gravado uma única vez no cofre (write-only). Esta tela nunca reexibe um segredo já configurado.</p>
+
+  <div class="field{{if .Errors.client_id}} has-error{{end}}">
+    <label for="f-client">Client ID *</label>
+    <input id="f-client" name="client_id" value="{{.Form.client_id}}" required maxlength="200" autocomplete="off"
+           {{if .Errors.client_id}}aria-invalid="true" aria-describedby="e-client"{{end}}>
+    {{if .Errors.client_id}}<span class="error" id="e-client" role="alert">{{.Errors.client_id}}</span>{{end}}
+  </div>
+
+  <div class="field{{if .Errors.secret}} has-error{{end}}">
+    <label for="f-secret">Secret *</label>
+    <input id="f-secret" name="secret" type="password" required autocomplete="off"
+           {{if .Errors.secret}}aria-invalid="true" aria-describedby="e-secret"{{else}}aria-describedby="h-secret"{{end}}>
+    {{if .Errors.secret}}<span class="error" id="e-secret" role="alert">{{.Errors.secret}}</span>{{else}}<span class="help" id="h-secret">Não é armazenado em texto na aplicação; vai direto ao cofre.</span>{{end}}
+  </div>
+
+  <div class="form-actions">
+    <button class="btn btn--primary" type="submit">Salvar credencial</button>
+  </div>
+</form>
+{{end}}
+
 {{define "status_header_oob"}}
 <span id="tenant-status" hx-swap-oob="true">{{template "status_badge" .}}</span>
 <span id="tenant-status-action" hx-swap-oob="true">{{template "status_action" .}}</span>
+{{end}}
+
+{{/* account_status_header_oob updates the account detail header (badge + toggle)
+     out-of-band after a suspend/activate. Data is an AccountView. */}}
+{{define "account_status_header_oob"}}
+<span id="account-status" hx-swap-oob="true">{{template "account_badge" .}}</span>
+<span id="account-status-action" hx-swap-oob="true">{{template "account_status_action" .}}</span>
+{{end}}
+
+{{/* account_status_action is the suspend/activate toggle on the account detail. v1:
+     suspending a Conta is an administrative label with no effect on the
+     empresas-clientes' auth/tokens (spec §7). A self-account has no lifecycle toggle. */}}
+{{define "account_status_action"}}
+{{- if .IsSelf -}}
+{{- else if .Active -}}
+<button class="btn btn--secondary" type="button"
+  hx-post="/console/accounts/{{.ID}}/suspend" hx-target="#main" hx-swap="none"
+  hx-confirm="Suspender a Conta {{.Name}}? (rótulo administrativo; não afeta a autenticação das empresas-clientes na v1)">Suspender</button>
+{{- else -}}
+<button class="btn btn--primary" type="button"
+  hx-post="/console/accounts/{{.ID}}/activate" hx-target="#main" hx-swap="none"
+  hx-confirm="Reativar a Conta {{.Name}}?">Reativar</button>
+{{- end -}}
 {{end}}
 
 {{define "status_action"}}
@@ -49,4 +332,46 @@
   hx-post="/console/tenants/{{.ID}}/activate" hx-target="#main" hx-swap="none"
   hx-confirm="Reativar {{.Name}}? As chamadas de API do tenant voltam a ser aceitas.">Reativar</button>
 {{- end -}}
+{{end}}
+
+{{define "creditor_card"}}
+{{if .CreditorEditable}}
+<form id="creditor-card" class="form card" method="post"
+      action="/console/tenants/{{.Tenant.ID}}/creditor-key"
+      hx-post="/console/tenants/{{.Tenant.ID}}/creditor-key"
+      hx-target="#creditor-card" hx-swap="outerHTML"
+      {{if .Bank.CreditorKeySet}}hx-confirm="Substituir a chave do recebedor atual? As novas cobranças PIX passam a ser registradas sob a chave nova."{{end}}>
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <h2>Chave PIX do recebedor</h2>
+  {{if .CreditorSaved}}<div class="banner banner--success" role="status">Chave do recebedor salva. Novas cobranças PIX serão registradas sob esta chave.</div>{{end}}
+  {{if .Errors.form}}<div class="banner banner--danger" role="alert">{{.Errors.form}}</div>{{end}}
+
+  <dl class="dl">
+    <dt>Chave registrada</dt>
+    <dd>{{if .Bank.CreditorKeySet}}<code>{{.Bank.CreditorKey}}</code>{{else}}<span class="muted">— não configurada</span>{{end}}</dd>
+  </dl>
+  <p class="muted">A chave do recebedor fixa o destino dos fundos do tenant. Não é um segredo, mas é sensível ao roteamento.</p>
+
+  <div class="field{{if .Errors.creditor_key}} has-error{{end}}">
+    <label for="f-creditor">Nova chave PIX *</label>
+    <input id="f-creditor" name="creditor_key" required maxlength="140" autocomplete="off" inputmode="text"
+           placeholder="EVP, e-mail, telefone (+55…) ou CPF/CNPJ"
+           {{if .Errors.creditor_key}}aria-invalid="true" aria-describedby="e-creditor"{{else}}aria-describedby="h-creditor"{{end}}>
+    {{if .Errors.creditor_key}}<span class="error" id="e-creditor" role="alert">{{.Errors.creditor_key}}</span>{{else}}<span class="help" id="h-creditor">EVP/UUID, e-mail, telefone E.164 ou CPF/CNPJ (somente dígitos).</span>{{end}}
+  </div>
+
+  <div class="form-actions">
+    <button class="btn btn--primary" type="submit">Salvar chave</button>
+  </div>
+</form>
+{{else}}
+<div id="creditor-card" class="card">
+  <h2>Chave PIX do recebedor</h2>
+  <dl class="dl">
+    <dt>Chave registrada</dt>
+    <dd>{{if .Bank.CreditorKeySet}}<code>{{.Bank.CreditorKey}}</code>{{else}}<span class="muted">— não configurada</span>{{end}}</dd>
+  </dl>
+  <p class="help">A edição da chave pela console está disponível apenas no banco padrão.</p>
+</div>
+{{end}}
 {{end}}

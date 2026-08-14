@@ -54,21 +54,58 @@ Semântica do guard (já behind `adminAuthMiddleware`):
 ## 2. Credencial bancária por-tenant (write path)
 
 A port de leitura `ports.CredentialStore` (`GetBankCredential`) ganhou uma irmã
-de escrita, separada por ISP:
+de escrita, separada por ISP. A credencial é chaveada pelo par `(tenantID, bankID)`
+(ADR-0007 / SIN-66015): um tenant pode ter credenciais independentes em mais de um
+banco.
 
 ```go
 type CredentialWriter interface {
-    SetBankCredential(ctx context.Context, tenantID, clientID, secret string) error
+    // bankID vazio é armazenado sob o banco default BankIDC6 (retro-compat).
+    SetBankCredential(ctx context.Context, tenantID, bankID, clientID, secret string) error
 }
 ```
 
 - Adapter: `internal/adapters/secret` (`*secret.Store` implementa as duas ports).
-- Use-case: `app.AdminService.SetBankCredential(ctx, tenantID, clientID, secret)`
-  — valida que o tenant existe e delega ao writer.
+- Use-case: `app.AdminService.SetBankCredential(ctx, tenantID, bank, clientID, secret)`
+  — normaliza o `bank` (trim+lowercase; vazio → `c6`), valida que é um **banco
+  conhecido** (`ports.IsKnownBankID`, deny-by-default — hoje só `c6` tem adapter),
+  valida que o tenant existe e delega ao writer.
 - **O secret nunca** entra em estado de domínio, log, erro ou URL (threat C1/C4):
   transita direto para o secret store. A resposta HTTP confirma a escrita
-  **sem** ecoar o secret (`{tenant_id, client_id, status}`).
+  **sem** ecoar o secret.
+- **Auditoria**: a escrita grava uma entry `credential.set` com o `bank_id`
+  (não-secreto, slug de roteamento). O secret e o `client_id` **nunca** entram na
+  entry (`audit.NewCredentialSetEntry` não tem parâmetro de secret).
 - Rota: `PUT /admin/tenants/{tenantID}/bank-credential` (guard `requireRole(RoleAdmin)`).
+
+### Contrato do endpoint (para a UX — SIN-66017)
+
+`PUT /admin/tenants/{tenantID}/bank-credential` · auth: Bearer admin (RoleAdmin) ·
+`Content-Type: application/json` · corpo estritamente decodificado (campos
+desconhecidos → 400).
+
+Request:
+
+```json
+{ "bank": "c6", "client_id": "<id>", "secret": "<write-only>" }
+```
+
+- `bank` — **opcional**. Slug do banco; normalizado (trim + lowercase). Ausente ou
+  vazio ⇒ `c6` (retro-compat). Banco desconhecido ⇒ **400**. Hoje o único slug
+  aceito é `c6`; o conjunto cresce conforme novos adapters entram.
+- `client_id` / `secret` — obrigatórios; `secret` é write-only (nunca lido de volta).
+
+Response `200`:
+
+```json
+{ "tenant_id": "<id>", "bank": "c6", "client_id": "<id>", "status": "ok" }
+```
+
+- `bank` ecoado é o **resolvido/normalizado** (confirma sob qual banco gravou).
+- O `secret` **nunca** aparece na resposta.
+
+Erros: `400` (corpo inválido / banco desconhecido / `secret` ausente) · `401`
+(sem role admin) · `404` (tenant inexistente — mascarado como not-found).
 
 ## 3. Isolamento de tenant no admin plane
 

@@ -1,0 +1,28 @@
+{{define "body"}}
+<p class="breadcrumb"><a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">‹ {{.Tenant.Name}}</a> / Faturas</p>
+<div class="topbar"><h1>Faturas</h1></div>
+
+<nav class="tabs" aria-label="Seções do tenant">
+  <a href="/console/tenants/{{.Tenant.ID}}" hx-get="/console/tenants/{{.Tenant.ID}}" hx-target="#main" hx-push-url="true">Visão geral</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/banks" hx-get="/console/tenants/{{.Tenant.ID}}/banks" hx-target="#main" hx-push-url="true">Bancos</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/pricing" hx-get="/console/tenants/{{.Tenant.ID}}/pricing" hx-target="#main" hx-push-url="true">Tarifação</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/consumption" hx-get="/console/tenants/{{.Tenant.ID}}/consumption" hx-target="#main" hx-push-url="true">Consumo</a>
+  <a href="/console/tenants/{{.Tenant.ID}}/invoices" aria-current="page">Faturas</a>
+</nav>
+
+<p class="muted">Fatura = recorte imutável e auditável do consumo faturável no período (soma do ledger append-only). Gerar não altera o consumo; produz um documento permanente.</p>
+
+<form class="toolbar" method="post" action="/console/tenants/{{.Tenant.ID}}/invoices"
+      hx-post="/console/tenants/{{.Tenant.ID}}/invoices" hx-target="#main" hx-push-url="true">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <label for="start_date">De</label>
+  <input id="start_date" type="date" name="start_date" value="{{.StartDate}}" required>
+  <label for="end_date">Até</label>
+  <input id="end_date" type="date" name="end_date" value="{{.EndDate}}" required>
+  <button class="btn btn--primary" type="submit">Gerar fatura</button>
+</form>
+
+<div class="table-wrap" id="invoices-list">
+  {{template "invoice_rows" .}}
+</div>
+{{end}}

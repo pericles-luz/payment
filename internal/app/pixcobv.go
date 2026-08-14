@@ -57,7 +57,11 @@ func NewPixDueChargeService(d Deps) *PixDueChargeService {
 // rates (validated against the legal caps in the core). The devedor and creditor
 // PIX key are required.
 type DueChargeInput struct {
-	TenantID           string
+	TenantID string
+	// AccountID is the owning account resolved at the auth choke-point (SIN-69126),
+	// stamped on the ledger for account→tenant→endpoint metering (SIN-69127).
+	// Attribution-only; empty = self-account. See CreateChargeInput.AccountID.
+	AccountID          string
 	AmountCents        int64
 	Currency           string
 	DueDate            time.Time
@@ -125,7 +129,7 @@ func (s *PixDueChargeService) CreateDueCharge(ctx context.Context, in DueChargeI
 	}
 	p.SetTxID(res.TxID)
 
-	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, PixCobVCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now())
+	entry, err := billing.NewLedgerEntry(s.ids.NewID(), in.TenantID, PixCobVCreateEndpoint, p.ID(), price.PriceCents(), s.clock.Now(), billing.WithAccount(in.AccountID))
 	if err != nil {
 		return nil, ports.PixDueChargeResult{}, err
 	}

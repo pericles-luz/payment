@@ -25,6 +25,7 @@ func newConsole() (*app.ConsoleService, *persistence.Store, *secret.Store) {
 		Pricing:    store,
 		Ledger:     store,
 		CredWriter: creds,
+		CredReader: creds,
 		Clock:      fixedClock{t: time.Unix(1000, 0).UTC()},
 		IDs:        &seqIDs{},
 	})
@@ -152,7 +153,7 @@ func TestConsoleSetBankCredential(t *testing.T) {
 	if err := svc.SetBankCredential(ctx, "t1", "client-1", "s3cr3t"); err != nil {
 		t.Fatalf("set credential: %v", err)
 	}
-	got, err := creds.GetBankCredential(ctx, "t1")
+	got, err := creds.GetBankCredential(ctx, "t1", ports.BankIDC6)
 	if err != nil || got.ClientID != "client-1" || got.Secret != "s3cr3t" {
 		t.Fatalf("stored credential = %+v, %v", got, err)
 	}
@@ -238,6 +239,56 @@ func TestConsoleConsumption(t *testing.T) {
 	}
 	if _, err := svc.Consumption(ctx, "missing"); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("missing tenant err = %v", err)
+	}
+}
+
+func TestConsoleConsumptionInRange(t *testing.T) {
+	t.Parallel()
+	svc, store, _ := newConsole()
+	ctx := context.Background()
+	seedTenant(t, store, "t1", "Acme", true, 100)
+
+	// appendLedger stamps each entry's time at time.Unix(idN, 0): 10, 50, 5000s.
+	appendLedger(t, store, "t1", "POST /v1/charges", 100, 10)
+	appendLedger(t, store, "t1", "POST /v1/charges", 100, 50)
+	appendLedger(t, store, "t1", "GET /v1/charges", 200, 5000)
+
+	// Half-open [Start, End): includes Unix(10) and Unix(50), excludes Unix(5000).
+	rng := app.ConsumptionRange{Start: time.Unix(0, 0).UTC(), End: time.Unix(100, 0).UTC()}
+	rep, err := svc.ConsumptionInRange(ctx, "t1", rng)
+	if err != nil {
+		t.Fatalf("consumption in range: %v", err)
+	}
+	if rep.TotalCalls != 2 || rep.TotalCents != 200 {
+		t.Fatalf("windowed totals = %d/%d, want 2/200", rep.TotalCalls, rep.TotalCents)
+	}
+	if len(rep.Lines) != 1 || rep.Lines[0].Endpoint != "POST /v1/charges" {
+		t.Fatalf("windowed lines = %+v", rep.Lines)
+	}
+
+	// End is exclusive: a window ending exactly at Unix(50) drops that entry.
+	excl, err := svc.ConsumptionInRange(ctx, "t1", app.ConsumptionRange{Start: time.Unix(0, 0).UTC(), End: time.Unix(50, 0).UTC()})
+	if err != nil || excl.TotalCalls != 1 {
+		t.Fatalf("exclusive end = %+v, %v", excl, err)
+	}
+
+	// Zero range is unbounded — every entry counts (parity with Consumption).
+	all, err := svc.ConsumptionInRange(ctx, "t1", app.ConsumptionRange{})
+	if err != nil || all.TotalCalls != 3 {
+		t.Fatalf("unbounded = %+v, %v", all, err)
+	}
+
+	// Unknown tenant still 404s through the windowed path.
+	if _, err := svc.ConsumptionInRange(ctx, "missing", rng); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("missing tenant err = %v", err)
+	}
+}
+
+func TestConsoleNow(t *testing.T) {
+	t.Parallel()
+	svc, _, _ := newConsole()
+	if got := svc.Now(); !got.Equal(time.Unix(1000, 0).UTC()) {
+		t.Fatalf("Now() = %v, want fixed clock 1000", got)
 	}
 }
 

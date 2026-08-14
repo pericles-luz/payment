@@ -49,7 +49,7 @@ func cobvAnchor(req ports.PixDueChargeRequest) string {
 // amount or an empty anchor is rejected (complete mediation at the money seam,
 // mirroring the C6 adapter).
 func (s *StubProvider) CreateDueCharge(ctx context.Context, tenantID string, req ports.PixDueChargeRequest) (ports.PixDueChargeResult, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.PixDueChargeResult{}, err
 	}
 	anchor := cobvAnchor(req)
@@ -93,7 +93,7 @@ func (s *StubProvider) CreateDueCharge(ctx context.Context, tenantID string, req
 // GetDueCharge returns the authoritative state of a cobv charge for reconciliation.
 // An unknown txid (within the tenant) is shared.ErrNotFound.
 func (s *StubProvider) GetDueCharge(ctx context.Context, tenantID, txID string) (ports.PixDueChargeResult, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.PixDueChargeResult{}, err
 	}
 	s.mu.Lock()
@@ -109,7 +109,7 @@ func (s *StubProvider) GetDueCharge(ctx context.Context, tenantID, txID string) 
 // (txid). An unknown txid (within the tenant) is shared.ErrNotFound; the operation
 // is tenant-scoped so one tenant can never amend another's charge.
 func (s *StubProvider) UpdateDueCharge(ctx context.Context, tenantID, txID string, req ports.PixDueChargeRequest) (ports.PixDueChargeResult, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.PixDueChargeResult{}, err
 	}
 	if req.AmountCents <= 0 {

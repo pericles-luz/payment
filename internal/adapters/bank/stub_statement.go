@@ -32,7 +32,7 @@ func (s *StubProvider) SeedStatementEntries(tenantID string, entries []ports.Sta
 // then returns the entries whose posting date falls within [Start, End] inclusive.
 // The result is a fresh slice so a caller cannot mutate the stub's stored state.
 func (s *StubProvider) GetStatement(ctx context.Context, tenantID string, filter ports.StatementFilter) (ports.Statement, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.Statement{}, err
 	}
 	s.mu.Lock()

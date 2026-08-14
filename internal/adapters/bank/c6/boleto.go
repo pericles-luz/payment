@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
@@ -55,12 +57,10 @@ type boletoPayerBody struct {
 	Address boletoAddressBody `json:"address"`
 }
 
-// boletoRequestBody is the JSON sent to C6 POST /v1/bank_slips to register a BolePix
-// boleto (ADR-0005). amount, due_date (yyyy-MM-dd), external_reference_id and the
-// payer object are the confirmed real contract. The fine/interest/discount RATE
-// fields are transmitted so C6 registers them (roteiro grupos 1–3); their wire names
-// are best-effort and UNCONFIRMED until a real 201 is captured (SIN-65882, step 3) —
-// the amount owed at any instant is still computed by the boleto domain, never here.
+// boletoRequestBody is the LEGACY /boletos/{id} amend body (UpdateBoleto only). Its real
+// contract is uncaptured, so it keeps the prior invented shape (amount in cents,
+// fine_bps/etc) and is deliberately out of SIN-65953's scope. Registration uses the real
+// bankSlipRequestBody below; do not route new work through this struct.
 type boletoRequestBody struct {
 	Amount              int64           `json:"amount"`
 	DueDate             string          `json:"due_date"`
@@ -109,6 +109,186 @@ type boletoResponseBody struct {
 	Discounts          []boletoDiscountBody `json:"discounts"`
 }
 
+// --- Real C6 /v1/bank_slips contract (201 captured, SIN-65888) -----------------
+//
+// The register path has its own request/response DTOs: the captured 201 is shape-
+// incompatible with the legacy /boletos/{id} representation above (still used by the
+// id-addressed read/cancel/amend ops, contract uncaptured). On the wire amount is REAIS
+// DECIMAIS (e.g. 12.34), NOT cents; fees are {value,type} objects; the response is
+// id/our_number/bar_code/digitable_line (none of the legacy keys exist).
+
+// brlDecimal is a money quantity carried in the port as integer minor units (centavos)
+// but serialized to / parsed from the C6 wire as a JSON decimal number with exactly two
+// fractional digits. Conversion is integer arithmetic ONLY — never float64 — so a payment
+// amount can never drift (1234 centavos ⇒ "12.34", never "12.340000001"; ADR-0005
+// addendum / SIN-65953). It also carries fee values measured in hundredths (bps ⇒
+// percent: 150 bps ⇒ "1.50").
+type brlDecimal int64
+
+// MarshalJSON renders the minor-unit value as a bare JSON decimal number "<int>.<2-frac>".
+func (d brlDecimal) MarshalJSON() ([]byte, error) {
+	v := int64(d)
+	sign := ""
+	if v < 0 {
+		sign, v = "-", -v
+	}
+	return []byte(fmt.Sprintf("%s%d.%02d", sign, v/100, v%100)), nil
+}
+
+// UnmarshalJSON parses a JSON decimal number (or numeric string) back to integer minor
+// units by splitting on '.', never via strconv.ParseFloat — the same no-float discipline
+// as MarshalJSON. Fractions are normalized to two digits (shorter padded, longer
+// truncated). An empty/null value parses as zero.
+func (d *brlDecimal) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		*d = 0
+		return nil
+	}
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	intPart, fracPart := s, ""
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		intPart, fracPart = s[:i], s[i+1:]
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	whole, err := strconv.ParseInt(intPart, 10, 64)
+	if err != nil {
+		return fmt.Errorf("brlDecimal: bad integer part %q: %w", intPart, err)
+	}
+	if len(fracPart) > 2 {
+		fracPart = fracPart[:2]
+	}
+	for len(fracPart) < 2 {
+		fracPart += "0"
+	}
+	frac, err := strconv.ParseInt(fracPart, 10, 64)
+	if err != nil {
+		return fmt.Errorf("brlDecimal: bad fraction %q: %w", fracPart, err)
+	}
+	cents := whole*100 + frac
+	if neg {
+		cents = -cents
+	}
+	*d = brlDecimal(cents)
+	return nil
+}
+
+// bankSlipFee is the C6 fine/interest object {value:<decimal>, type:<string>}. value is a
+// brlDecimal (percent for "PERCENTAGE" — bps/100 — or reais for "FIXED" — cents/100).
+type bankSlipFee struct {
+	Value brlDecimal `json:"value"`
+	Type  string     `json:"type"`
+}
+
+// bankSlipRequestBody is the JSON POSTed to C6 /v1/bank_slips (real 201 contract,
+// SIN-65888). amount is decimal reais; fine/interest are omitempty objects (the C6 schema
+// is strict — a zero-fee key is a 400, so the nil pointer omits it). The discount object
+// is portal-gated (inner schema undiscovered) and intentionally omitted until captured —
+// tracked as a child follow-up of SIN-65953.
+type bankSlipRequestBody struct {
+	Amount              brlDecimal      `json:"amount"`
+	DueDate             string          `json:"due_date"`
+	ExternalReferenceID string          `json:"external_reference_id"`
+	ValidUntil          string          `json:"valid_until,omitempty"`
+	Payer               boletoPayerBody `json:"payer"`
+	Fine                *bankSlipFee    `json:"fine,omitempty"`
+	Interest            *bankSlipFee    `json:"interest,omitempty"`
+}
+
+// bankSlipResponseBody is the C6 201 we consume (SIN-65888). id is the bank's registration
+// reference (mapped to BoletoResult.TxID — the billing-finalized marker); our_number /
+// bar_code / digitable_line are reconciliation/scannable artifacts. No status/txid/qr_code
+// exist on create (status is read-sourced later).
+type bankSlipResponseBody struct {
+	ID            string     `json:"id"`
+	OurNumber     string     `json:"our_number"`
+	OriginatorID  string     `json:"originator_id"`
+	BarCode       string     `json:"bar_code"`
+	DigitableLine string     `json:"digitable_line"`
+	Amount        brlDecimal `json:"amount"`
+	BillingScheme string     `json:"billing_scheme"`
+	BillingType   string     `json:"billing_type"`
+	DueDate       string     `json:"due_date"`
+}
+
+// toBankSlipFees maps the port fine/interest RATES to the C6 fee objects. FineBps and
+// FineFixedCents are mutually exclusive (percentage vs fixed); a zero rate yields a nil
+// pointer so the strict C6 schema never sees the key (the "every CreateBoleto 400" fix).
+// The "PERCENTAGE"/"FIXED" type strings are best-effort until a fee is echoed by a real
+// 201 — a 400 here is the signal to adjust (SIN-65953).
+func toBankSlipFees(req ports.BoletoRequest) (fine, interest *bankSlipFee) {
+	switch {
+	case req.FineBps > 0:
+		fine = &bankSlipFee{Value: brlDecimal(req.FineBps), Type: "PERCENTAGE"}
+	case req.FineFixedCents > 0:
+		fine = &bankSlipFee{Value: brlDecimal(req.FineFixedCents), Type: "FIXED"}
+	}
+	if req.MonthlyInterestBps > 0 {
+		interest = &bankSlipFee{Value: brlDecimal(req.MonthlyInterestBps), Type: "PERCENTAGE"}
+	}
+	return fine, interest
+}
+
+// toBankSlipRequestBody maps the port request to the real C6 bank_slips JSON. The full
+// payer is mandatory (validation lives here so the stub stays lenient — ADR-0005);
+// due_date/valid_until are yyyy-MM-dd and external_reference_id is derived from the boleto
+// id (both transport concerns owned by the adapter).
+func toBankSlipRequestBody(op string, req ports.BoletoRequest) (bankSlipRequestBody, error) {
+	if err := validatePayer(op, req.Payer); err != nil {
+		return bankSlipRequestBody{}, err
+	}
+	fine, interest := toBankSlipFees(req)
+	body := bankSlipRequestBody{
+		Amount:              brlDecimal(req.AmountCents),
+		DueDate:             req.DueDate.Format(dueDateLayout),
+		ExternalReferenceID: externalReferenceID(req.BoletoID),
+		Payer: boletoPayerBody{
+			Name:  req.Payer.Name,
+			TaxID: req.Payer.TaxID,
+			Address: boletoAddressBody{
+				Street:  req.Payer.Address.Street,
+				Number:  req.Payer.Address.Number,
+				City:    req.Payer.Address.City,
+				State:   req.Payer.Address.State,
+				ZipCode: req.Payer.Address.ZipCode,
+			},
+		},
+		Fine:     fine,
+		Interest: interest,
+	}
+	if !req.ValidUntil.IsZero() {
+		body.ValidUntil = req.ValidUntil.Format(dueDateLayout)
+	}
+	return body, nil
+}
+
+// toBankSlipResult maps the C6 201 onto the port result. CRITICAL: id → TxID. id is the
+// bank's registration reference and the app treats a non-empty TxID as the
+// billing-finalized marker (app/boleto.go); leaving it empty would let a retry/concurrent
+// registration re-bill (duplicate ledger entry). Status/QRCode stay zero — C6 does not
+// return them on create; they are read-sourced via GetBoleto/extrato (SIN-65953, CTO).
+func toBankSlipResult(out bankSlipResponseBody) ports.BoletoResult {
+	res := ports.BoletoResult{
+		BoletoID:      out.ID,
+		TxID:          out.ID,
+		OurNumber:     out.OurNumber,
+		DigitableLine: out.DigitableLine,
+		Barcode:       out.BarCode,
+		AmountCents:   int64(out.Amount),
+	}
+	if out.DueDate != "" {
+		if t, err := time.Parse(dueDateLayout, out.DueDate); err == nil {
+			res.DueDate = t
+		}
+	}
+	return res
+}
+
 // toDiscountBodies maps the port discount tiers to their transport JSON.
 func toDiscountBodies(in []ports.BoletoDiscountTier) []boletoDiscountBody {
 	if len(in) == 0 {
@@ -133,20 +313,12 @@ func fromDiscountBodies(in []boletoDiscountBody) []ports.BoletoDiscountTier {
 	return out
 }
 
-// toBoletoRequestBody maps the port request to the C6 bank_slips transport JSON
-// (shared by register and amend). due_date/valid_until are formatted yyyy-MM-dd and
-// external_reference_id is derived from the boleto id — both transport concerns owned
-// here, not in the port (ADR-0005). When requirePayer is true (registration), the full
-// payer is mandatory: a missing name/tax_id or any required address field is a
-// validation error. requirePayer is false for amend, where the payer is not part of
-// the captured contract (the stub stays lenient by construction — validation lives
-// here, never in the app — so stub tests don't break, quality-bar rule 3).
-func toBoletoRequestBody(op string, req ports.BoletoRequest, requirePayer bool) (boletoRequestBody, error) {
-	if requirePayer {
-		if err := validatePayer(op, req.Payer); err != nil {
-			return boletoRequestBody{}, err
-		}
-	}
+// toBoletoRequestBody maps the port request to the LEGACY /boletos/{id} amend JSON
+// (UpdateBoleto only — the real amend contract is uncaptured, so this path is out of
+// SIN-65953's scope and keeps its prior shape). The payer is optional here (amend does
+// not carry it); due_date/valid_until are yyyy-MM-dd and external_reference_id is derived
+// from the boleto id. Registration goes through toBankSlipRequestBody, not this.
+func toBoletoRequestBody(req ports.BoletoRequest) boletoRequestBody {
 	body := boletoRequestBody{
 		Amount:              req.AmountCents,
 		DueDate:             req.DueDate.Format(dueDateLayout),
@@ -170,7 +342,7 @@ func toBoletoRequestBody(op string, req ports.BoletoRequest, requirePayer bool) 
 	if !req.ValidUntil.IsZero() {
 		body.ValidUntil = req.ValidUntil.Format(dueDateLayout)
 	}
-	return body, nil
+	return body
 }
 
 // validatePayer enforces the C6 bank_slips mandatory payer block. Number is allowed to
@@ -225,7 +397,7 @@ func toBoletoResult(out boletoResponseBody) ports.BoletoResult {
 // (falling back to the BoletoID) is forwarded so the PSP collapses retried
 // registrations into one boleto. The OAuth2 bearer token is attached per tenant.
 func (p *Provider) CreateBoleto(ctx context.Context, tenantID string, req ports.BoletoRequest) (ports.BoletoResult, error) {
-	body, err := toBoletoRequestBody("create_boleto", req, true)
+	body, err := toBankSlipRequestBody("create_boleto", req)
 	if err != nil {
 		return ports.BoletoResult{}, err
 	}
@@ -243,11 +415,11 @@ func (p *Provider) CreateBoleto(ctx context.Context, tenantID string, req ports.
 		return ports.BoletoResult{}, err
 	}
 
-	var out boletoResponseBody
+	var out bankSlipResponseBody
 	if err := p.do(httpReq, "create_boleto", &out); err != nil {
 		return ports.BoletoResult{}, err
 	}
-	return toBoletoResult(out), nil
+	return toBankSlipResult(out), nil
 }
 
 // GetBoleto reconciles the authoritative state of a registered boleto from C6
@@ -293,12 +465,9 @@ func (p *Provider) CancelBoleto(ctx context.Context, tenantID, boletoID string) 
 func (p *Provider) UpdateBoleto(ctx context.Context, tenantID, boletoID string, req ports.BoletoRequest) (ports.BoletoResult, error) {
 	// Amend does not require the payer: the real bank_slips amendment contract is not
 	// yet captured, and the app's UpdateBoleto path carries no payer (the payer is not
-	// amended). requirePayer=false keeps this lenient and the stub tests green
+	// amended). The legacy amend body stays lenient so the stub tests stay green
 	// (ADR-0005 §"UpdateBoleto compartilha toBoletoRequestBody").
-	body, err := toBoletoRequestBody("update_boleto", req, false)
-	if err != nil {
-		return ports.BoletoResult{}, err
-	}
+	body := toBoletoRequestBody(req)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return ports.BoletoResult{}, &Error{Op: "update_boleto", sentinel: shared.ErrValidation}

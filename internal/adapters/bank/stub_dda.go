@@ -66,7 +66,7 @@ func ddaAnchor(req ports.DDAGroupRequest) string { return req.IdempotencyKey }
 // resolves the tenant credential first (isolation) and returns a copy so a caller
 // cannot mutate the stub's state.
 func (s *StubProvider) ListOpenBoletos(ctx context.Context, tenantID string) ([]ports.DDABoleto, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -83,7 +83,7 @@ func (s *StubProvider) ListOpenBoletos(ctx context.Context, tenantID string) ([]
 // item; an empty anchor or empty barcode list is rejected (complete mediation,
 // mirroring the C6 adapter).
 func (s *StubProvider) CreatePaymentGroup(ctx context.Context, tenantID string, req ports.DDAGroupRequest) (ports.DDAGroup, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.DDAGroup{}, err
 	}
 	anchor := ddaAnchor(req)
@@ -118,7 +118,7 @@ func (s *StubProvider) CreatePaymentGroup(ctx context.Context, tenantID string, 
 // shared.ErrNotFound; the read is tenant-scoped so one tenant can never observe
 // another's group.
 func (s *StubProvider) GetPaymentGroup(ctx context.Context, tenantID, groupID string) (ports.DDAGroup, error) {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.DDAGroup{}, err
 	}
 	s.mu.Lock()
@@ -133,7 +133,7 @@ func (s *StubProvider) GetPaymentGroup(ctx context.Context, tenantID, groupID st
 // unknown group is shared.ErrNotFound; removing an item id not present is a no-op (the
 // transition legality is enforced by the domain in the use-case before this call).
 func (s *StubProvider) RemovePaymentGroupItems(ctx context.Context, tenantID, groupID string, itemIDs []string) error {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -168,7 +168,7 @@ func (s *StubProvider) RemovePaymentGroupItem(ctx context.Context, tenantID, gro
 // adapter (which forwards it as Idempotency-Key); resource-state idempotency makes
 // re-submission safe regardless.
 func (s *StubProvider) SubmitPaymentGroup(ctx context.Context, tenantID, groupID, idemKey string) error {
-	if _, err := s.creds.GetBankCredential(ctx, tenantID); err != nil {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return err
 	}
 	s.mu.Lock()
