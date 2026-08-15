@@ -55,6 +55,11 @@ func run() error {
 	}
 
 	store := sqlite.NewStore(db)
+	// Account-key store (ADR-0011 §3, B1/SIN-69278): durable, hash-at-rest bearer
+	// keys keyed by Account. Wired as the choke-point's AccountKeyAuth; it only ever
+	// runs when the PAYMENT_ACCOUNT_KEY_SELECTOR flag is on (model (b)), so building
+	// it here is inert in the default model (a) deployment.
+	accountKeys := sqlite.NewAccountKeyStore(db, system.Clock{})
 	creds := secret.NewStore(cfg.BankCreds)
 	// Per-(tenant,bank) mTLS certificate vault (SIN-66087): the admin console writes
 	// the cert/key here as write-only material with public metadata exposed. It is
@@ -247,6 +252,23 @@ func run() error {
 		TrustedProxyHops: cfg.TrustedProxyHops,
 		// Self-serve credential intake (SIN-69196), default-off dark-ship.
 		SelfServeCredIntake: cfg.SelfServeCredIntake,
+		// Model (b) account-key + per-request client selector (ADR-0011 §2 /
+		// SIN-69279), default-off dark-ship: consulted only when AccountKeySelector
+		// is on and the bearer has the ak_ shape; otherwise inert (model (a)).
+		AccountKeyAuth:     accountKeys,
+		AccountKeySelector: cfg.AccountKeySelector,
+		// Model (b) key emission/rotation (ADR-0011 §3 / SIN-69280): mints/rotates an
+		// Account's bearer key for POST /v1/account-key (self-rotate) and POST
+		// /admin/accounts/{id}/account-key (bootstrap). Backed by the same durable,
+		// hash-at-rest account-key store; the plaintext is returned once and never
+		// stored/logged (display-once).
+		AccountKeyMint: app.NewAccountKeyService(accountKeys, system.Clock{}),
+		// Model (b) empresa-cliente provisioning (ADR-0011 §4 / SIN-69281): a reseller
+		// Conta creates a new empresa-cliente via POST /v1/clients, bound to the Account
+		// resolved from its account-key (server-side, never the body — A01/T6). Backed by
+		// the same durable tenant repository as the admin plane; Idempotency-Key dedups
+		// retries so a lost-response retry does not create a duplicate empresa-cliente.
+		ClientProvisioner: app.NewClientProvisioningService(deps.Tenants, deps.IDs, system.Clock{}),
 	})
 
 	httpServer := &stdhttp.Server{

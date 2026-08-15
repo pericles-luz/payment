@@ -14,6 +14,18 @@ info:
     - **Autenticação:** `Authorization: Bearer <token>` em toda rota `/v1`. A
       empresa-cliente é derivada do token, nunca de um parâmetro. Token
       ausente/inválido → `401`.
+      **Ressalva do caminho chave-de-Conta (revendedor, modelo b — ADR-0011):**
+      quando o Bearer é uma **chave-de-Conta** (não um token de empresa-cliente),
+      a empresa-cliente é escolhida por chamada no header `X-Client-Tenant`. Esse
+      seletor é o **único mecanismo AUTORIZADO** de seleção, mediado pelo guard de
+      autorização por-request (ADR-0011 §2): a chave só opera sobre
+      empresas-clientes da **própria Conta**. Um token de empresa-cliente continua
+      **sem** seletor — se um `X-Client-Tenant` for enviado com um token de
+      empresa-cliente, é rejeitado (`400`). O caminho chave-de-Conta é
+      **flag-gated, default-off** (`PAYMENT_ACCOUNT_KEY_SELECTOR`), habilitado por
+      Conta; com a flag desligada o comportamento é idêntico ao modelo (a). Ver o
+      esquema de segurança `accountKeyAuth`, o parâmetro `ClientSelector` e o
+      runbook `docs/ops/runbook-verz-account-key-selector.md`.
     - **Valores monetários:** sempre em **centavos** (inteiro). R$ 10,00 → `1000`.
     - **Datas/hora:** RFC 3339 (ex. `2026-08-20T00:00:00-03:00`), exceto a janela
       do extrato que usa `YYYY-MM-DD`.
@@ -50,6 +62,10 @@ tags:
     description: Cobrança genérica (compat).
   - name: Sistema
     description: Health check e provisionamento.
+  - name: Revenda
+    description: >-
+      Modelo (b) revendedor (ADR-0011, flag-gated default-off): emissão/rotação
+      da chave-de-Conta e provisionamento de empresas-clientes pela própria Conta.
 
 paths:
   /healthz:
@@ -479,6 +495,82 @@ paths:
         "409": { $ref: "#/components/responses/Conflict" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /v1/account-key:
+    post:
+      operationId: rotateAccountKey
+      tags: [Revenda]
+      summary: Emitir/rotacionar a chave-de-Conta (modelo b, flag-gated)
+      description: |
+        **Modelo (b) — ADR-0011 §3. Flag-gated (`PAYMENT_ACCOUNT_KEY_SELECTOR`),
+        default-off.** Emite uma nova chave-de-Conta e **invalida a anterior**
+        (create==rotate idempotente, mesmo padrão de `PUT /v1/bank-credential`,
+        SIN-69196). O segredo em claro (`ak_…`, ≥256-bit) é exibido **uma única
+        vez** nesta resposta (display-once, ADR-0010): nunca é retornado de novo
+        nem registrado em log; guarde-o em cofre no ato.
+
+        Autenticação: pela **chave-de-Conta atual** (self-rotate) ou, para a
+        **1ª chave** da Conta, por bootstrap do admin-plane (o board cadastra a
+        Conta e emite a 1ª chave por canal seguro — mesma disciplina do
+        `PAYMENT_CONSOLE_BOOTSTRAP_TOKEN`). Uma chave **não** pode emitir chave
+        de outra Conta: a Conta é derivada do próprio Bearer, nunca de parâmetro.
+
+        `Idempotency-Key` obrigatório (retentativa com a mesma chave não emite
+        um segredo novo — devolve a operação original).
+      security:
+        - accountKeyAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "201":
+          description: Nova chave emitida; a anterior foi invalidada. Segredo exibido UMA vez.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountKeyIssued" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/clients:
+    post:
+      operationId: provisionClient
+      tags: [Revenda]
+      summary: Provisionar empresa-cliente da Conta (modelo b, flag-gated)
+      description: |
+        **Modelo (b) — ADR-0011 §4. Flag-gated (`PAYMENT_ACCOUNT_KEY_SELECTOR`),
+        default-off.** Autenticada **pela chave-de-Conta**, cria uma
+        empresa-cliente (tenant) já vinculada à Conta e devolve o `tenant_id`
+        para uso no seletor `X-Client-Tenant`.
+
+        **Segurança (A01/T6):** o `account_id` da nova empresa-cliente vem
+        **sempre da chave** (server-side, imutável — invariante set-once,
+        ADR-0009 §2). O corpo **não** aceita `account_id`; enviá-lo é ignorado/
+        rejeitado. Assim uma Conta nunca provisiona empresa-cliente sob outra
+        Conta.
+
+        A credencial bancária da nova empresa-cliente segue por
+        `PUT /v1/bank-credential` self-serve (SIN-69196), agora endereçável pelo
+        seletor. `Idempotency-Key` obrigatório (dedup em retry).
+      security:
+        - accountKeyAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateClientRequest" }
+      responses:
+        "201":
+          description: Empresa-cliente criada e vinculada à Conta da chave.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Client" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /v1/statement:
     get:
       operationId: getStatement
@@ -511,9 +603,31 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Token de API escopado por empresa-cliente.
+      description: Token de API escopado por empresa-cliente (modelo a).
+    accountKeyAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Chave-de-Conta (modelo b, ADR-0011, flag-gated default-off). Segredo
+        opaco `ak_…` (≥256-bit) que identifica a **Conta** revendedora, não uma
+        empresa-cliente. Exige o header `X-Client-Tenant` a cada chamada `/v1`
+        para escolher a empresa-cliente-alvo (mediado pelo guard §2). Emitida/
+        rotacionada via `POST /v1/account-key`.
 
   parameters:
+    ClientSelector:
+      name: X-Client-Tenant
+      in: header
+      required: true
+      description: >-
+        Seletor da empresa-cliente-alvo (o `tenant_id` retornado por
+        `POST /v1/clients`). Obrigatório **somente** no caminho chave-de-Conta
+        (modelo b). Ausente numa chave-de-Conta → `400`. Enviado junto com um
+        token de empresa-cliente (modelo a) → `400` (o token não tem autoridade
+        de seleção). Empresa-cliente de outra Conta ou inexistente → `404`
+        (mesma resposta, sem oráculo de enumeração cross-account). Nunca vai em
+        query string/URL.
+      schema: { type: string, minLength: 1 }
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -574,6 +688,38 @@ components:
       required: [error]
       properties:
         error: { type: string, description: Mensagem curta e segura (sem detalhe interno). }
+
+    AccountKeyIssued:
+      type: object
+      description: >-
+        Resultado da emissão/rotação da chave-de-Conta (modelo b). O campo
+        `account_key` traz o segredo em claro e aparece **uma única vez** — não
+        é retornado em nenhuma outra chamada nem registrado em log.
+      required: [account_key, account_id]
+      properties:
+        account_key:
+          type: string
+          description: Segredo em claro `ak_…` (≥256-bit). Guardar em cofre no ato; exibido só aqui.
+          example: "ak_9f2c…redigido…"
+        account_id: { type: string, description: Identificador da Conta dona da chave. }
+        rotated: { type: boolean, description: "true se invalidou uma chave anterior; false na 1ª emissão." }
+
+    CreateClientRequest:
+      type: object
+      description: >-
+        Provisionamento de empresa-cliente (modelo b). NÃO aceita `account_id`:
+        a Conta vem sempre da chave (server-side, imutável — A01/T6).
+      properties:
+        name: { type: string, description: Nome/label da empresa-cliente (opcional). }
+    Client:
+      type: object
+      description: Empresa-cliente provisionada, já vinculada à Conta da chave.
+      properties:
+        tenant_id:
+          type: string
+          description: Identificador da empresa-cliente. Use-o no header `X-Client-Tenant`.
+        account_id: { type: string, description: Conta dona (derivada da chave). }
+        name: { type: string }
 
     Devedor:
       type: object

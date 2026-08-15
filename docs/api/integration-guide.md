@@ -41,8 +41,9 @@ Authorization: Bearer <seu-token-de-API>
 
 - O token é **emitido por nós** para a sua empresa-cliente e a identifica de
   forma única. **A empresa-cliente é derivada do token, nunca de um parâmetro
-  da requisição.** Não existe seletor de empresa no corpo, na query ou em
-  header — o isolamento entre empresas é garantido pelo escopo do token.
+  da requisição.** Nesse modelo (o **modelo a**, default) não existe seletor de
+  empresa no corpo, na query ou em header — o isolamento entre empresas é
+  garantido pelo escopo do token.
 - Um token inválido, ausente ou malformado retorna **`401 Unauthorized`** com
   corpo `{"error":"unauthorized"}`. A resposta é uniforme (não confirma se um
   recurso existe em outra empresa).
@@ -50,10 +51,22 @@ Authorization: Bearer <seu-token-de-API>
   registre em logs nem o coloque em URLs. Rotacione sob suspeita de vazamento
   (fale com o suporte para reemissão).
 
-> **Modelo de revenda (2 níveis).** Um usuário-API revendedor (ex.: Verz) possui
-> N empresas-clientes. Cada empresa-cliente recebe o seu próprio token escopado;
-> não há troca de contexto dentro de uma sessão. Uma empresa nunca enxerga dados
-> (cobranças, extrato, credenciais) de outra. Ver ADR de tenancy de 2 níveis.
+> **Modelo de revenda (2 níveis) — dois caminhos.** Um usuário-API revendedor
+> (ex.: **Verz**) possui N empresas-clientes e uma **Conta** que as agrupa
+> (bilhetagem consolidada na Conta). Há dois modos de acesso, ambos com o mesmo
+> isolamento cross-empresa:
+>
+> - **Modelo (a) — token por empresa-cliente (default):** cada empresa-cliente
+>   recebe o seu próprio token escopado; não há troca de contexto dentro de uma
+>   sessão. Uma empresa nunca enxerga dados de outra.
+> - **Modelo (b) — 1 chave-de-Conta + seletor por chamada (ADR-0011,
+>   flag-gated):** a Conta tem **uma** chave rotacionável e escolhe a
+>   empresa-cliente-alvo **a cada chamada** com o header `X-Client-Tenant`. É o
+>   caminho adotado pela Verz. Detalhado na **§11**. A chave só opera sobre
+>   empresas-clientes da **própria Conta** — o guard nega (com `404`) qualquer
+>   seletor de outra Conta.
+>
+> Ver ADR de tenancy de 2 níveis (ADR-0009) e ADR-0011 (chave-de-Conta).
 
 ## 3. Onboarding (checklist)
 
@@ -190,7 +203,78 @@ apresente o QR/copia-e-cola retornado, ou boleto (`POST /v1/boletos`).
 - **Homologação vs. produção:** use a base URL do ambiente correspondente; nunca
   aponte credenciais de produção para homologação.
 
-## 11. Suporte
+## 11. Modelo (b): 1 chave-de-Conta + seletor por chamada (revendedor Verz)
+
+> **Disponibilidade.** O modelo (b) é **flag-gated** (`PAYMENT_ACCOUNT_KEY_SELECTOR`),
+> habilitado **por Conta** quando o board confirma. Com a flag desligada valem
+> apenas os tokens de empresa-cliente do modelo (a). Contrato de referência:
+> `openapi.yaml` (esquema `accountKeyAuth`, parâmetro `X-Client-Tenant`, rotas
+> `POST /v1/account-key` e `POST /v1/clients`). Base normativa: ADR-0011.
+
+Neste modelo a **Conta** revendedora (ex.: Verz) opera todas as suas
+empresas-clientes com **uma única chave-de-Conta**, escolhendo o alvo a cada
+chamada. É o padrão "Stripe-Connect" (`Stripe-Account`).
+
+### 11.1 A chave-de-Conta
+
+- Segredo opaco `ak_…` (≥256-bit) que identifica a **Conta**, não uma
+  empresa-cliente. É um **segredo** — TLS, cofre, nunca em log/URL.
+- A **1ª chave** é emitida pelo board no cadastro da Conta e entregue por canal
+  seguro. Depois a Conta **rotaciona sozinha** via `POST /v1/account-key`.
+- **Rotação (`POST /v1/account-key`):** emite uma nova chave e **invalida a
+  anterior** (create==rotate idempotente). O segredo em claro aparece **uma
+  única vez** na resposta (`account_key`) — guarde no ato; não há como relê-lo.
+  Requer `Idempotency-Key`.
+
+### 11.2 Provisionar empresas-clientes (`POST /v1/clients`)
+
+- Autenticada **pela chave-de-Conta**. Cria uma empresa-cliente e devolve o
+  `tenant_id` — é esse valor que você usa no seletor.
+- O vínculo com a Conta é **server-side**: você **não** informa `account_id` no
+  corpo; ele vem da chave. Uma Conta nunca cria empresa-cliente sob outra Conta.
+- A credencial bancária da nova empresa-cliente vai por `PUT /v1/bank-credential`
+  self-serve, endereçada pelo mesmo seletor (§11.3). Requer `Idempotency-Key`.
+
+### 11.3 O seletor `X-Client-Tenant` (a cada chamada de negócio)
+
+Toda chamada `/v1` de negócio (PIX, boleto, checkout, extrato, credencial…)
+feita com a chave-de-Conta **deve** trazer:
+
+```
+Authorization: Bearer ak_...           # chave-de-Conta
+X-Client-Tenant: <tenant_id da empresa-cliente-alvo>
+```
+
+O choke-point autentica a chave, valida que a empresa-cliente-alvo **pertence à
+Conta da chave** e só então executa a operação no escopo dela. Os handlers são
+os mesmos do modelo (a) — muda só quem seleciona o escopo.
+
+### 11.4 Códigos de erro específicos do seletor
+
+| Situação | Status | `error` |
+|---|---|---|
+| Chave-de-Conta **sem** `X-Client-Tenant` | `400` | `client selector required` |
+| `X-Client-Tenant` enviado com **token de empresa-cliente** (modelo a) | `400` | `client selector not permitted for tenant token` |
+| Chave-de-Conta inválida/ausente | `401` | `unauthorized` |
+| `X-Client-Tenant` aponta empresa-cliente de **outra Conta** ou **inexistente** | `404` | `not found` |
+
+> **Sem oráculo (segurança).** "Empresa de outra Conta" e "empresa inexistente"
+> retornam a **mesma `404`** — uma chave-de-Conta válida **não** consegue
+> enumerar empresas-clientes de outras Contas. Nunca é `403` (um `403`
+> confirmaria a existência). O guard é **fail-closed**: qualquer falha de leitura
+> ou seletor inválido **nega**.
+
+### 11.5 Blast radius e boa prática
+
+Uma chave-de-Conta dá acesso a **todas** as empresas-clientes **daquela Conta**
+(nunca além). Trate-a como credencial de alto valor: rotacione periodicamente e
+sob qualquer suspeita de vazamento (a rotação invalida a anterior de imediato).
+A bilhetagem de todas as chamadas é consolidada **na Conta**.
+
+Runbook operacional (bootstrap da 1ª chave, rotação, provisionamento e uso do
+seletor): `docs/ops/runbook-verz-account-key-selector.md`.
+
+## 12. Suporte
 
 Dúvidas de integração, reemissão de token, provisionamento de credencial/cert e
 registro de webhook: canal de suporte técnico Sindireceita (a definir no contrato

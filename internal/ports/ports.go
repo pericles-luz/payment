@@ -67,6 +67,35 @@ type AccountRepository interface {
 	FindAccountByID(ctx context.Context, id string) (*account.Account, error)
 }
 
+// AccountKeyStore persists and authenticates the rotatable bearer key that an
+// Account presents in the model (b) access path (ADR-0011 §3, SIN-69278/B1). It is
+// deliberately separate from AccountRepository and from the financial Repository
+// bundle: an account key is a credential (hash-at-rest), never an aggregate that
+// touches money, so it does not participate in the payment unit-of-work.
+//
+// Ships DARK: this port exists and has adapters, but nothing calls it yet — the
+// choke-point wiring and the flag are phase B2.
+//
+// Signatures carry only opaque strings so the plaintext secret never crosses the
+// port as a domain type, and the interface stays swappable (in-memory ⇄ durable
+// sqlite) with identical behaviour.
+type AccountKeyStore interface {
+	// PutKey mints a fresh key for accountID and returns the plaintext ONCE. It is
+	// idempotent in the create==rotate sense (SIN-69196): whether or not the account
+	// already has a key, the call replaces it with a new active key and invalidates
+	// the previous one immediately. The plaintext is returned only here and must
+	// never be logged or persisted in the clear.
+	PutKey(ctx context.Context, accountID string) (plaintext string, err error)
+	// Rotate is the explicit rotation entrypoint; it has the same effect as PutKey
+	// (mint new, invalidate previous) and is provided as an intention-revealing name
+	// for callers that are rotating an existing key.
+	Rotate(ctx context.Context, accountID string) (plaintext string, err error)
+	// AuthenticateAccountKey resolves a presented plaintext secret to its owning
+	// account id. It returns ("", false) for any unknown, malformed, or superseded
+	// secret — a single non-oracle failure mode, mirroring AuthenticateWebhook.
+	AuthenticateAccountKey(ctx context.Context, secret string) (accountID string, ok bool)
+}
+
 // PricingRepository resolves and stores per-endpoint pricing. The admin-console
 // listing (ListEndpointPrices) is declared by app.PricingStore, keeping this
 // port narrow (the concrete stores implement both).

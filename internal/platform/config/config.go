@@ -67,6 +67,18 @@ type Config struct {
 	// (production credentials are provisioned via the admin intake); it is a
 	// fast-follow convenience. Set PAYMENT_SELFSERVE_CRED_INTAKE truthy to enable.
 	SelfServeCredIntake bool
+	// AccountKeySelector enables the model (b) account-key + per-request client
+	// selector auth path at the tenant choke-point (ADR-0011 §2, SIN-69279). When
+	// on, a caller may present an Account's rotatable bearer key (ak_… prefix) plus
+	// an X-Client-Tenant selector: the choke-point authenticates the key, resolves
+	// the selected tenant's owning Account and grants scope ONLY if it is that
+	// Account (fail-closed, same-404 no-oracle). Defaults to false (secure /
+	// dark-ship): when off the key/selector are ignored and the choke-point behaves
+	// EXACTLY as model (a) — legacy tenant tokens only. It deliberately reintroduces
+	// the A01/IDOR surface that model (a) designed out, so the per-request guard is
+	// load-bearing; keep it off until the guard has been security-reviewed for a
+	// deployment. Set PAYMENT_ACCOUNT_KEY_SELECTOR truthy to enable.
+	AccountKeySelector bool
 	// C6 holds the C6 bank adapter transport configuration. Endpoints are
 	// per-environment and resolved from config (never hard-coded). The per-tenant
 	// OAuth2 credentials live in BankCreds / the secret store, not here.
@@ -144,6 +156,7 @@ func FromEnv() Config {
 		SecureCookies:         getenvBool("PAYMENT_SECURE_COOKIES", true),
 		TrustedProxyHops:      getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
 		SelfServeCredIntake:   getenvBool("PAYMENT_SELFSERVE_CRED_INTAKE", false),
+		AccountKeySelector:    getenvBool("PAYMENT_ACCOUNT_KEY_SELECTOR", false),
 		ConsoleUsername:       getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
 		ConsoleBootstrapToken: os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
 		C6: C6Config{

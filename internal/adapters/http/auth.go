@@ -16,8 +16,19 @@ import (
 
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/accountkey"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 )
+
+// clientSelectorHeader is the request header that an account-key caller uses to
+// name the empresa-cliente (tenant) it is acting for in the model (b) access path
+// (ADR-0011 §2, SIN-69279). It is meaningful ONLY on an account-key request: a
+// tenant-token request that carries it is rejected (a tenant token has no
+// selection authority), and when the account-key selector flag is off it is
+// ignored entirely. The value is a tenant id; it is never trusted as authority on
+// its own — the choke-point resolves the selected tenant's owning Account and
+// grants scope only if it is the authenticated key's Account.
+const clientSelectorHeader = "X-Client-Tenant"
 
 type ctxKey int
 
@@ -90,6 +101,40 @@ type TenantPrincipalAuthenticator interface {
 // isolation boundary stays keyed on the tenant id.
 type AccountResolver interface {
 	ResolveAccountID(ctx context.Context, tenantID string) string
+}
+
+// AccountKeyAuthenticator resolves a presented plaintext account-key secret to its
+// owning Account id (model (b) access path, ADR-0011 §2 / SIN-69279). It is the
+// credential half of the "chave-de-Conta + seletor" model: the choke-point routes
+// a bearer with the account-key shape (accountkey.HasSecretShape) here, and on
+// success learns which Account the caller authenticated AS — never which tenant.
+// The tenant is chosen by the X-Client-Tenant selector and authorized separately
+// against this Account by the §2 guard.
+//
+// Resolution is failure-closed and MUST NOT be an enumeration oracle: an unknown,
+// malformed, or superseded secret returns the same ("", false), so the choke-point
+// answers a uniform 401 that never reveals whether an Account exists. Satisfied by
+// ports.AccountKeyStore (accept-narrow: the middleware needs only authentication,
+// not the mint/rotate surface).
+type AccountKeyAuthenticator interface {
+	AuthenticateAccountKey(ctx context.Context, secret string) (accountID string, ok bool)
+}
+
+// accountKeyGuard configures the model (b) account-key + per-request selector path
+// at the tenant choke-point (ADR-0011 §2). Its zero value is DISABLED: the
+// choke-point then behaves exactly as model (a) — legacy tenant tokens only, no
+// key and no selector — so the dark-ship default is a genuine no-op. It is enabled
+// only when the PAYMENT_ACCOUNT_KEY_SELECTOR flag is on AND a key authenticator is
+// wired; a nil keyAuth keeps the path off even with the flag set (fail-closed).
+type accountKeyGuard struct {
+	enabled bool
+	keyAuth AccountKeyAuthenticator
+}
+
+// active reports whether the account-key path should run: the flag is on and a key
+// authenticator is present. Anything else falls through to the tenant-token path.
+func (g accountKeyGuard) active() bool {
+	return g.enabled && g.keyAuth != nil
 }
 
 // tenantAccountFinder is the narrow slice of the tenant read store the account
@@ -417,11 +462,73 @@ func bearerToken(r *http.Request) string {
 // failure keeps the self-account default (retrocompat, fail-safe). The tenant id
 // is never sourced from the resolver, so the isolation boundary is unchanged.
 func tenantAuthMiddleware(auth TenantPrincipalAuthenticator, resolver ...AccountResolver) func(http.Handler) http.Handler {
+	return tenantAuthMiddlewareWithSelector(auth, accountKeyGuard{}, resolver...)
+}
+
+// tenantAuthMiddlewareWithSelector is the choke-point core: it enforces tenant
+// authentication and, when the account-key guard is active (ADR-0011 §2 model (b),
+// SIN-69279), distinguishes an Account bearer key from a tenant token and applies
+// the load-bearing per-request authorization guard. With a disabled guard it is
+// byte-for-byte model (a) — tenantAuthMiddleware delegates here with the zero
+// guard, so every existing call site and test is unaffected (flag-off = no-op).
+//
+// Account-key path (guard active AND bearer has the account-key shape):
+//   - Authenticate the key → owning Account id; a bad key denies with the same
+//     uniform 401 as a bad token (no new oracle).
+//   - Require the X-Client-Tenant selector (T4): absent ⇒ 400. An account key must
+//     NEVER fall into a default tenant — the tenant is always chosen explicitly.
+//   - Resolve the SELECTED tenant's owning Account via the resolver and grant scope
+//     ONLY if it equals the key's Account. owner=="" (unknown/unassigned tenant, or
+//     ANY read error — T2/T7) and owner!=account (cross-account — T1) BOTH deny with
+//     the SAME 404, so a valid account key cannot enumerate other Accounts' tenants
+//     (A01, §2 no-oracle). Note the resolver's "" is fail-safe-PERMISSIVE in model
+//     (a) — it keeps the self-account default below — but fail-closed-DENY here:
+//     same signal, opposite disposition, because model (b) never defaults a tenant.
+//   - Only on success inject ctxTenantID=selector (authoritative isolation) and
+//     ctxAccountID=account.
+//
+// Tenant-token path (guard inactive, or bearer is not an account key):
+//   - Unchanged model (a) resolution. When the guard is active a tenant-token
+//     request carrying a selector is rejected (T3, 400): a tenant token has no
+//     selection authority, so the selector is refused rather than silently ignored.
+func tenantAuthMiddlewareWithSelector(auth TenantPrincipalAuthenticator, guard accountKeyGuard, resolver ...AccountResolver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			p, ok := auth.AuthenticateTenantPrincipal(bearerToken(r))
+			bearer := bearerToken(r)
+			selector := strings.TrimSpace(r.Header.Get(clientSelectorHeader))
+
+			if guard.active() && accountkey.HasSecretShape(bearer) {
+				accountID, ok := guard.keyAuth.AuthenticateAccountKey(r.Context(), bearer)
+				if !ok {
+					writeError(w, http.StatusUnauthorized, "unauthorized")
+					return
+				}
+				if selector == "" {
+					writeError(w, http.StatusBadRequest, "client selector required")
+					return
+				}
+				owner := resolveOwner(r.Context(), selector, resolver)
+				if owner == "" || owner != accountID {
+					// Same-404 for cross-account, unknown tenant and read error: no
+					// enumeration oracle (A01, T1/T2/T7). Never 403 — a 403 would confirm
+					// the tenant exists.
+					writeError(w, http.StatusNotFound, "not found")
+					return
+				}
+				ctx := context.WithValue(r.Context(), ctxTenantID, selector)
+				ctx = context.WithValue(ctx, ctxAccountID, accountID)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
+			p, ok := auth.AuthenticateTenantPrincipal(bearer)
 			if !ok {
 				writeError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+			if guard.active() && selector != "" {
+				// T3: a tenant token cannot select a client. Reject rather than ignore.
+				writeError(w, http.StatusBadRequest, "client selector not permitted for tenant token")
 				return
 			}
 			accountID := p.AccountID
@@ -439,6 +546,23 @@ func tenantAuthMiddleware(auth TenantPrincipalAuthenticator, resolver ...Account
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// resolveOwner reads the selected tenant's owning Account id via the first non-nil
+// resolver (there is at most one in practice). It returns "" when no resolver is
+// wired or the resolver returns "" — the caller (model (b) guard) treats "" as a
+// hard deny, so a missing resolver fails closed (an account key can authorize
+// nothing without the store that proves ownership). The resolver itself already
+// collapses every store error to "" (fail-safe), which the guard turns into the
+// same-404 deny (T2/T7).
+func resolveOwner(ctx context.Context, tenantID string, resolver []AccountResolver) string {
+	for _, res := range resolver {
+		if res == nil {
+			continue
+		}
+		return res.ResolveAccountID(ctx, tenantID)
+	}
+	return ""
 }
 
 // adminAuthMiddleware enforces admin authentication and injects the resolved

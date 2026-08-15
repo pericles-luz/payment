@@ -112,6 +112,75 @@ func (rl *rateLimiter) middlewareSelfServeCred(retryAfterSecs int) func(http.Han
 	}
 }
 
+// middlewareAccountKeyRotate is the DEDICATED inbound limiter for the account-key
+// self-rotation route (POST /v1/account-key, SIN-69280). It mirrors
+// middlewareSelfServeCred but keys STRICTLY on the authenticated Account (the route
+// sits behind accountKeyAuthMiddleware, so ctxAccountID is always present): account
+// -key rotation is a rare, high-value write, so it gets its own tight bucket that
+// cannot be masked by, nor mask, ordinary tenant traffic. retryAfterSecs is emitted
+// on a 429 so a client can back off deterministically.
+//
+// Fail-securely-for-availability: if the account key is unexpectedly empty — only
+// possible via a wiring bug that placed this middleware before auth — it FAILS OPEN
+// (logs a warning and admits) rather than throttling. An Account must never be
+// locked out of rotating its own credential by an internal limiter fault; the route
+// is already authenticated, so failing open here does not widen access (identical
+// posture to the self-serve credential limiter).
+func (rl *rateLimiter) middlewareAccountKeyRotate(retryAfterSecs int) func(http.Handler) http.Handler {
+	retryAfter := strconv.Itoa(retryAfterSecs)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			acct := accountFromContext(r.Context())
+			if acct == "" {
+				slog.Warn("account-key rotate limiter: empty account key; failing open")
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !rl.allow("account-key-rotate:" + acct) {
+				w.Header().Set("Retry-After", retryAfter)
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// middlewareClientProvision is the DEDICATED inbound limiter for the account-plane
+// empresa-cliente provisioning route (POST /v1/clients, SIN-69281). It mirrors
+// middlewareAccountKeyRotate and keys STRICTLY on the authenticated Account (the
+// route sits behind accountKeyAuthMiddleware, so ctxAccountID is always present):
+// provisioning is a rare, high-value write, so it gets its own bucket that cannot be
+// masked by, nor mask, account-key rotation or ordinary tenant traffic. It is a
+// touch more generous than rotation because an onboarding burst legitimately creates
+// several empresas-clientes in a row. retryAfterSecs is emitted on a 429 so a client
+// can back off deterministically.
+//
+// Fail-securely-for-availability: if the account key is unexpectedly empty — only
+// possible via a wiring bug that placed this middleware before auth — it FAILS OPEN
+// (logs a warning and admits) rather than throttling. The route is already
+// authenticated, so failing open here does not widen access (identical posture to
+// the account-key rotate and self-serve credential limiters).
+func (rl *rateLimiter) middlewareClientProvision(retryAfterSecs int) func(http.Handler) http.Handler {
+	retryAfter := strconv.Itoa(retryAfterSecs)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			acct := accountFromContext(r.Context())
+			if acct == "" {
+				slog.Warn("client-provision limiter: empty account key; failing open")
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !rl.allow("client-provision:" + acct) {
+				w.Header().Set("Retry-After", retryAfter)
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // tenantOrIPKey keys by authenticated tenant when present, else remote address.
 func tenantOrIPKey(r *http.Request) string {
 	if tid := tenantFromContext(r.Context()); tid != "" {
