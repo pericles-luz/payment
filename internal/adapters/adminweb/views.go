@@ -88,10 +88,13 @@ type NewTenantView struct {
 	Errors map[string]string
 }
 
-// DetailView backs the tenant detail screen.
+// DetailView backs the tenant detail screen. Errors carries per-field validation
+// messages for the inline rename form (ADR-0012 §1); it is nil on a normal render
+// (a nil map indexes to the empty string in templates, so the form shows no error).
 type DetailView struct {
 	Base
 	Tenant TenantView
+	Errors map[string]string
 }
 
 // PriceRow is one endpoint price in the pricing screen.
@@ -482,6 +485,9 @@ type AccountDetailView struct {
 	Base
 	Account AccountView
 	Tenants []TenantView
+	// Errors carries per-field validation messages for the inline rename form
+	// (ADR-0012 §1); nil on a normal render (a nil map indexes to "" in templates).
+	Errors map[string]string
 }
 
 // NewAccountTenantView backs the "create empresa-cliente under this account" form.

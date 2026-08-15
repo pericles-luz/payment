@@ -44,6 +44,13 @@ type ConsoleService struct {
 	// certificate"; a nil writer disables the upload path (the screens still render).
 	certWriter ports.BankCertificateWriter
 	certReader ports.BankCertificateReader
+	// credDeleter / certDeleter hard-delete a tenant's per-bank configuration (the
+	// credential and the certificate for a (tenant, bank) pair) on "Remover banco"
+	// (ADR-0012 §5). Both are idempotent and zeroise the secret material before the
+	// delete. Optional: a nil deleter degrades to a no-op for that half (RemoveBankConfig
+	// still removes whichever half is wired), so wiring-light tests keep working.
+	credDeleter ports.CredentialDeleter
+	certDeleter ports.BankCertificateDeleter
 	// invoices is the append-only Fatura store (SIN-69121). The console generates
 	// an invoice by freezing a consumption window and reads them back for the
 	// "Faturas" screen and the CSV download. Optional: a nil store disables the
@@ -144,6 +151,12 @@ type ConsoleDeps struct {
 	// CertWriter disables the upload use-case (the screen still renders read-only).
 	CertWriter ports.BankCertificateWriter
 	CertReader ports.BankCertificateReader
+	// CredDeleter / CertDeleter hard-delete a tenant's per-bank configuration on
+	// "Remover banco" (ADR-0012 §5): the credential and certificate for a (tenant,
+	// bank) pair, each idempotent and zeroising the secret before delete. Optional:
+	// a nil deleter degrades to a no-op for that half.
+	CredDeleter ports.CredentialDeleter
+	CertDeleter ports.BankCertificateDeleter
 	// Invoices is the append-only Fatura store (SIN-69121). Optional: nil disables
 	// the invoice use-cases (the rest of the console still works).
 	Invoices InvoiceStore
@@ -181,6 +194,8 @@ func NewConsoleService(d ConsoleDeps) *ConsoleService {
 		credReader:    d.CredReader,
 		certWriter:    d.CertWriter,
 		certReader:    d.CertReader,
+		credDeleter:   d.CredDeleter,
+		certDeleter:   d.CertDeleter,
 		invoices:      d.Invoices,
 		credEvictor:   ci,
 		audit:         a,
@@ -292,24 +307,65 @@ func (s *ConsoleService) CreateTenant(ctx context.Context, name string) (*tenant
 	return t, nil
 }
 
-// SuspendTenant deactivates a tenant (reversible). Returns the updated tenant.
+// RenameTenant edits a tenant's display name (ADR-0012 §1). The domain enforces the
+// name invariants (non-blank, ≤ 200 chars) and leaves the immutable accountID
+// binding untouched; a validation error surfaces inline at the boundary. A missing
+// tenant yields the same clean 404 (no enumeration oracle, OWASP A01). Audited
+// (tenant.rename) with who/which-tenant/when — never the name value.
+func (s *ConsoleService) RenameTenant(ctx context.Context, id, name string) (*tenant.Tenant, error) {
+	return s.transition(ctx, id, audit.ActionRenameTenant, func(t *tenant.Tenant) error {
+		return t.Rename(name)
+	})
+}
+
+// SuspendTenant deactivates a tenant (soft-delete / reversible, ADR-0012 §4).
+// Returns the updated tenant. Audited (tenant.suspend). The auth choke-point already
+// rejects a deactivated tenant's token/selector, so the deactivation takes effect at
+// the boundary without any change here (ADR-0012 §4).
 func (s *ConsoleService) SuspendTenant(ctx context.Context, id string) (*tenant.Tenant, error) {
-	return s.transition(ctx, id, (*tenant.Tenant).Deactivate)
+	return s.transition(ctx, id, audit.ActionSuspendTenant, func(t *tenant.Tenant) error {
+		t.Deactivate()
+		return nil
+	})
 }
 
-// ActivateTenant re-enables a suspended tenant. Returns the updated tenant.
+// DeactivateTenant is the ADR-0012 §4 name for SuspendTenant (soft-delete). Both
+// deactivate the tenant and audit as tenant.suspend.
+func (s *ConsoleService) DeactivateTenant(ctx context.Context, id string) (*tenant.Tenant, error) {
+	return s.SuspendTenant(ctx, id)
+}
+
+// ActivateTenant re-enables a suspended tenant (ADR-0012 §4). Returns the updated
+// tenant. Audited (tenant.activate).
 func (s *ConsoleService) ActivateTenant(ctx context.Context, id string) (*tenant.Tenant, error) {
-	return s.transition(ctx, id, (*tenant.Tenant).Activate)
+	return s.transition(ctx, id, audit.ActionActivateTenant, func(t *tenant.Tenant) error {
+		t.Activate()
+		return nil
+	})
 }
 
-func (s *ConsoleService) transition(ctx context.Context, id string, apply func(*tenant.Tenant)) (*tenant.Tenant, error) {
+// transition loads a tenant, applies a mutation (which may reject with a validation
+// error, e.g. a rename), persists it and appends the tenant-scoped audit entry for
+// the given action. Fail-closed: an audit-append error surfaces rather than dropping
+// the forensic trail (mirroring the console's credential/creditor-key writes). The
+// audit runs after the save, matching the console's other single-store mutations.
+func (s *ConsoleService) transition(ctx context.Context, id string, action audit.Action, apply func(*tenant.Tenant) error) (*tenant.Tenant, error) {
 	t, err := s.tenants.FindTenantByID(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return nil, fmt.Errorf("find tenant: %w", err)
 	}
-	apply(t)
+	if err := apply(t); err != nil {
+		return nil, err
+	}
 	if err := s.tenants.SaveTenant(ctx, t); err != nil {
 		return nil, fmt.Errorf("save tenant: %w", err)
+	}
+	e, err := audit.NewEntry(s.ids.NewID(), OperatorIDFromContext(ctx), action, t.ID(), s.clock.Now())
+	if err != nil {
+		return nil, fmt.Errorf("build audit entry: %w", err)
+	}
+	if err := s.audit.Append(ctx, e); err != nil {
+		return nil, fmt.Errorf("append audit entry: %w", err)
 	}
 	return t, nil
 }
@@ -644,6 +700,57 @@ func (s *ConsoleService) SetBankCertificate(ctx context.Context, tenantID, bankI
 		NotBefore:         cert.NotBefore,
 		NotAfter:          cert.NotAfter,
 	}, nil
+}
+
+// RemoveBankConfig hard-deletes a tenant's per-bank configuration — the credential
+// AND the mTLS certificate for the (tenantID, bankID) pair (ADR-0012 §5). It is the
+// only destructive path that removes real material rather than soft-deleting, and it
+// is safe precisely because the (tenant, bank) pair anchors no ledger, invoice,
+// pii_access_log nor recurrence mandate — it is pure operational configuration. The
+// tenant must exist (clean 404 — no enumeration oracle, OWASP A01) and the bank slug
+// must be in the closed allow-list (deny-by-default; empty → default c6). Both
+// deletes are IDEMPOTENT (removing an absent half is a no-op that still returns 200),
+// so a repeated "Remover banco" click is harmless, and each adapter zeroises the
+// secret/key BEFORE dropping the row (threat C1/C4). The cached OAuth token is evicted
+// so the removal takes effect without the TTL lag (ADR-0003). Audited
+// (bank_config.remove) with who/tenant/bank — NEVER the deleted secret or key.
+//
+// The two deletes are ordered credential-then-certificate and fail fast: on a
+// deleter error the operation aborts and surfaces it. With the in-process stores
+// each delete cannot partially fail; a durable backing would wrap the pair in the
+// unit-of-work so they commit or roll back together (ADR-0012 §5, "transacional").
+func (s *ConsoleService) RemoveBankConfig(ctx context.Context, tenantID, bankID string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	if _, err := s.tenants.FindTenantByID(ctx, tenantID); err != nil {
+		return fmt.Errorf("resolve tenant: %w", err)
+	}
+	slug := ports.NormalizeBankID(bankID)
+	if !ports.IsKnownBankID(slug) {
+		return shared.NewValidationError("bank", "banco não suportado")
+	}
+	if s.credDeleter != nil {
+		if err := s.credDeleter.DeleteBankCredential(ctx, tenantID, slug); err != nil {
+			return fmt.Errorf("delete bank credential: %w", err)
+		}
+	}
+	if s.certDeleter != nil {
+		if err := s.certDeleter.DeleteBankCertificate(ctx, tenantID, slug); err != nil {
+			return fmt.Errorf("delete bank certificate: %w", err)
+		}
+	}
+	// Evict any cached OAuth token minted under the now-removed credential so new
+	// transactions fail closed immediately instead of riding a cached bearer.
+	s.credEvictor.InvalidateToken(tenantID)
+	// Audit the removal with who/tenant/bank (never the deleted material). Fail-closed:
+	// a forensic-record error surfaces rather than dropping the trail.
+	e, err := audit.NewBankConfigRemovedEntry(s.ids.NewID(), OperatorIDFromContext(ctx), tenantID, slug, s.clock.Now())
+	if err != nil {
+		return fmt.Errorf("build audit entry: %w", err)
+	}
+	if err := s.audit.Append(ctx, e); err != nil {
+		return fmt.Errorf("append audit entry: %w", err)
+	}
+	return nil
 }
 
 // --- Pricing ---

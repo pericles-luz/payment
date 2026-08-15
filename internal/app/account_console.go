@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/audit"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/invoice"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
@@ -153,19 +154,52 @@ func (s *ConsoleService) CreateAccount(ctx context.Context, name string) (*accou
 	return a, nil
 }
 
-// SuspendAccount suspends an account (reversible). v1: an administrative label
-// with no effect on the empresas-clientes' auth/tokens — that coupling is a
-// trilha A / SecurityEngineer decision (spec §7), deferred.
+// RenameAccount edits an account's display name (ADR-0012 §1). The domain enforces
+// the name invariants AND refuses a derived self-account (its name reflects the
+// underlying empresa-cliente) — both surface as a validation error at the boundary.
+// A missing account yields the same clean 404 as the other account use-cases (no
+// enumeration oracle, OWASP A01). The rename is audited (account.rename); the audit
+// records only who/which-account/when — never the name value.
+func (s *ConsoleService) RenameAccount(ctx context.Context, id, name string) (*account.Account, error) {
+	return s.accountTransition(ctx, id, audit.ActionRenameAccount, func(a *account.Account) error {
+		return a.Rename(name)
+	})
+}
+
+// DeactivateAccount suspends an account (soft-delete / reversible, ADR-0012 §3).
+// v1: an administrative label; the empresa-cliente auth coupling is enforced by the
+// account-key guard (ADR-0011 B2), which already rejects a key on an inactive
+// account. Audited (account.suspend).
+func (s *ConsoleService) DeactivateAccount(ctx context.Context, id string) (*account.Account, error) {
+	return s.accountTransition(ctx, id, audit.ActionSuspendAccount, func(a *account.Account) error {
+		a.Deactivate()
+		return nil
+	})
+}
+
+// SuspendAccount suspends an account (reversible). Retained name alongside
+// DeactivateAccount (ADR-0012 §3) for the existing console callers; both audit as
+// account.suspend.
 func (s *ConsoleService) SuspendAccount(ctx context.Context, id string) (*account.Account, error) {
-	return s.accountTransition(ctx, id, (*account.Account).Deactivate)
+	return s.DeactivateAccount(ctx, id)
 }
 
-// ActivateAccount re-enables a suspended account. Returns the updated account.
+// ActivateAccount re-enables a suspended account (ADR-0012 §3). Audited
+// (account.activate). Returns the updated account.
 func (s *ConsoleService) ActivateAccount(ctx context.Context, id string) (*account.Account, error) {
-	return s.accountTransition(ctx, id, (*account.Account).Activate)
+	return s.accountTransition(ctx, id, audit.ActionActivateAccount, func(a *account.Account) error {
+		a.Activate()
+		return nil
+	})
 }
 
-func (s *ConsoleService) accountTransition(ctx context.Context, id string, apply func(*account.Account)) (*account.Account, error) {
+// accountTransition loads an account, applies a mutation (which may reject with a
+// validation error, e.g. a self-account rename), persists it and appends the
+// account-scoped audit entry for the given action. Fail-closed: an audit-append
+// error surfaces rather than silently dropping the forensic trail (mirroring the
+// console's credential/creditor-key writes). The audit runs after the save, matching
+// the console's other privileged single-store mutations.
+func (s *ConsoleService) accountTransition(ctx context.Context, id string, action audit.Action, apply func(*account.Account) error) (*account.Account, error) {
 	if s.accounts == nil {
 		return nil, ErrAccountsUnavailable
 	}
@@ -173,9 +207,18 @@ func (s *ConsoleService) accountTransition(ctx context.Context, id string, apply
 	if err != nil {
 		return nil, fmt.Errorf("find account: %w", err)
 	}
-	apply(a)
+	if err := apply(a); err != nil {
+		return nil, err
+	}
 	if err := s.accounts.SaveAccount(ctx, a); err != nil {
 		return nil, fmt.Errorf("save account: %w", err)
+	}
+	e, err := audit.NewAccountActionEntry(s.ids.NewID(), OperatorIDFromContext(ctx), action, a.ID(), s.clock.Now())
+	if err != nil {
+		return nil, fmt.Errorf("build audit entry: %w", err)
+	}
+	if err := s.audit.Append(ctx, e); err != nil {
+		return nil, fmt.Errorf("append audit entry: %w", err)
 	}
 	return a, nil
 }

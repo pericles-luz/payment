@@ -34,11 +34,31 @@ const (
 	// (OWASP A09); the entry names who/which-tenant/which-bank only — never the key
 	// value (the key is routing-sensitive; threat C1/C4).
 	ActionSetCreditorKey Action = "credential.creditor_key.set"
-	// ActionSuspendTenant records suspension of a tenant (reserved for when the
-	// lifecycle operation exists).
+	// ActionSuspendTenant records suspension (soft-delete / deactivation) of a
+	// tenant (ADR-0012 §4). It names the operator and the target tenant; no secret
+	// is involved.
 	ActionSuspendTenant Action = "tenant.suspend"
-	// ActionActivateTenant records (re)activation of a tenant (reserved).
+	// ActionActivateTenant records (re)activation of a suspended tenant (ADR-0012 §4).
 	ActionActivateTenant Action = "tenant.activate"
+	// ActionRenameTenant records an edit of a tenant's display name (ADR-0012 §1).
+	// It records who/which-tenant/when only — never the old or new name value (a
+	// name is not a secret, but the trail records the fact of the change, OWASP A09).
+	ActionRenameTenant Action = "tenant.rename"
+	// ActionRenameAccount records an edit of an Account's display name (ADR-0012 §1).
+	// Account-scoped: the entry's AccountID names the target and its tenant_id is
+	// empty (an account is not a tenant).
+	ActionRenameAccount Action = "account.rename"
+	// ActionSuspendAccount records suspension (soft-delete / deactivation) of an
+	// Account (ADR-0012 §3). Account-scoped like ActionRenameAccount.
+	ActionSuspendAccount Action = "account.suspend"
+	// ActionActivateAccount records (re)activation of a suspended Account (ADR-0012 §3).
+	ActionActivateAccount Action = "account.activate"
+	// ActionRemoveBankConfig records the hard-delete of a tenant's per-bank
+	// configuration — the credential AND certificate for a (tenant, bankID) pair
+	// (ADR-0012 §5). It carries the non-secret bankID so the trail records WHICH
+	// bank's configuration was removed; it NEVER records the deleted secret or key
+	// material by construction (threat C1/C4).
+	ActionRemoveBankConfig Action = "bank_config.remove"
 	// ActionSettlementAmountMismatch records a money-movement divergence: a charge
 	// the PSP marked paid whose received amount did not match the expected
 	// (original) amount, so settlement was refused (reconcile-before-settle, threat
@@ -104,6 +124,8 @@ func (a Action) valid() bool {
 	switch a {
 	case ActionCreateTenant, ActionSetEndpointPrice, ActionSetBankCredential,
 		ActionSetCreditorKey, ActionSuspendTenant, ActionActivateTenant,
+		ActionRenameTenant, ActionRenameAccount, ActionSuspendAccount,
+		ActionActivateAccount, ActionRemoveBankConfig,
 		ActionSettlementAmountMismatch, ActionRecCreated, ActionRecApproved,
 		ActionRecRejected, ActionRecExpired, ActionRecCancelled, ActionCobRCreated,
 		ActionSetBankCertificate, ActionInvoiceGenerated:
@@ -134,6 +156,13 @@ type Entry struct {
 	expectedCents int64
 	receivedCents int64
 	bankID        string
+	// accountID is set ONLY for an account-scoped action (ActionRenameAccount /
+	// ActionSuspendAccount / ActionActivateAccount, ADR-0012 §1/§3), where the
+	// target is an Account and there is no tenant. When set it is the value AccountID()
+	// returns; when empty (every tenant-scoped action) AccountID() derives from the
+	// tenant, so existing constructors keep their prior meaning unchanged. It carries
+	// NO secret — an account id is a public attribution id.
+	accountID string
 	// origin labels WHICH surface performed the action: OriginAdmin (an admin
 	// operator on the admin plane / console) or OriginSelfServe (an empresa-cliente
 	// rotating its own credential via the tenant-plane self-serve intake, SIN-69196).
@@ -179,6 +208,77 @@ func NewEntry(id, operatorID string, action Action, tenantID string, at time.Tim
 		action:     action,
 		tenantID:   tenantID,
 		at:         at,
+	}, nil
+}
+
+// accountActionValid reports whether action is one of the account-scoped
+// lifecycle actions NewAccountActionEntry accepts (deny-by-default so a
+// tenant-scoped or money-movement action can never be smuggled through the
+// account constructor and land with an empty tenant_id).
+func accountActionValid(action Action) bool {
+	switch action {
+	case ActionRenameAccount, ActionSuspendAccount, ActionActivateAccount:
+		return true
+	default:
+		return false
+	}
+}
+
+// NewAccountActionEntry builds an account-scoped audit record (rename / suspend /
+// activate of an Account, ADR-0012 §1/§3). Unlike the tenant-scoped constructors
+// the target is an Account, so it carries the account id explicitly (AccountID()
+// returns it) and leaves the tenant id empty — an account is not a tenant. It
+// NEVER records a name or any secret by construction (it has no such parameter).
+// Invariants: a non-empty id, a known account action and a non-empty accountID.
+func NewAccountActionEntry(id, operatorID string, action Action, accountID string, at time.Time) (Entry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Entry{}, shared.NewValidationError("id", "audit entry id is required")
+	}
+	if !accountActionValid(action) {
+		return Entry{}, shared.NewValidationError("action", "unknown account audit action")
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return Entry{}, shared.NewValidationError("account_id", "account id is required")
+	}
+	return Entry{
+		id:         id,
+		operatorID: strings.TrimSpace(operatorID),
+		action:     action,
+		at:         at,
+		accountID:  accountID,
+	}, nil
+}
+
+// NewBankConfigRemovedEntry builds the audit record for the hard-delete of a
+// tenant's per-bank configuration — the credential AND certificate for a
+// (tenant, bankID) pair (ActionRemoveBankConfig, ADR-0012 §5). Like
+// NewCredentialSetEntry it carries the non-secret bankID so the trail records
+// WHICH bank's configuration was removed for the tenant; it NEVER records the
+// deleted secret or private key by construction (it has no such parameter, threat
+// C1/C4). Invariants: a non-empty id, tenant and bankID (the console normalises an
+// empty selector to the default bank before calling).
+func NewBankConfigRemovedEntry(id, operatorID, tenantID, bankID string, at time.Time) (Entry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Entry{}, shared.NewValidationError("id", "audit entry id is required")
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return Entry{}, shared.NewValidationError("tenant_id", "tenant id is required")
+	}
+	bankID = strings.TrimSpace(bankID)
+	if bankID == "" {
+		return Entry{}, shared.NewValidationError("bank_id", "bank id is required")
+	}
+	return Entry{
+		id:         id,
+		operatorID: strings.TrimSpace(operatorID),
+		action:     ActionRemoveBankConfig,
+		tenantID:   tenantID,
+		at:         at,
+		bankID:     bankID,
 	}, nil
 }
 
@@ -438,15 +538,21 @@ func (e Entry) Action() Action { return e.action }
 // TenantID returns the tenant the action targeted.
 func (e Entry) TenantID() string { return e.tenantID }
 
-// AccountID returns the owning API-user/reseller account of the audited tenant —
+// AccountID returns the owning API-user/reseller account of the audited entity —
 // the forensic completeness of the account→tenant rollup (design §4, SIN-69127).
-// In the 1:1 self-account regime it is DERIVED from the tenant through the single
-// source of truth (account.SelfAccountID), so it matches migration 0007/0009's
-// backfill ('acct-'||tenant_id) and the F1 auth-side derivation exactly. When
-// explicit (non-self) accounts arrive in a later phase this becomes a stored
-// field — the same residual noted for the F1 auth resolver; until then deriving
-// here and stamping it on write can never diverge from the tenant's real owner.
-func (e Entry) AccountID() string { return account.SelfAccountID(e.tenantID) }
+// For an ACCOUNT-scoped action (rename/suspend/activate of an Account, ADR-0012)
+// the account is the target itself, carried in the explicit accountID field. For a
+// TENANT-scoped action it is DERIVED from the tenant through the single source of
+// truth (account.SelfAccountID), matching migration 0007/0009's backfill
+// ('acct-'||tenant_id) and the F1 auth-side derivation exactly. When explicit
+// (non-self) tenant→account bindings become stored the derivation branch will read
+// the binding; until then deriving here can never diverge from the tenant's owner.
+func (e Entry) AccountID() string {
+	if e.accountID != "" {
+		return e.accountID
+	}
+	return account.SelfAccountID(e.tenantID)
+}
 
 // At returns the time the action occurred.
 func (e Entry) At() time.Time { return e.at }

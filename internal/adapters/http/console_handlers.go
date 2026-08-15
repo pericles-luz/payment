@@ -181,6 +181,64 @@ func (s *Server) consoleTransition(w http.ResponseWriter, r *http.Request, op fu
 		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: msg}})
 }
 
+// consoleRenameTenant edits a tenant's display name (ADR-0012 §1) from the inline
+// rename form. On success it swaps the rename form back with the new value and
+// updates the detail header name out-of-band, plus a toast. A validation error
+// (blank / too long) re-renders the form inline with the field error (422); a bad
+// id yields the same clean 404 as the other routes (no enumeration oracle).
+func (s *Server) consoleRenameTenant(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	t, err := s.console.RenameTenant(r.Context(), id, name)
+	if err != nil {
+		if errors.Is(err, shared.ErrNotFound) || errors.Is(err, shared.ErrTenantScope) || isServiceError(err) {
+			s.consoleError(w, err)
+			return
+		}
+		// Validation error: re-render the rename form with the current name and the
+		// inline field error. Re-fetch so the form value reflects the unchanged state.
+		cur, gErr := s.console.GetTenant(r.Context(), id)
+		if gErr != nil {
+			s.consoleError(w, gErr)
+			return
+		}
+		s.ui.Partial(w, http.StatusUnprocessableEntity, "tenant_rename_form",
+			adminweb.DetailView{Tenant: adminweb.ToTenantView(cur), Errors: fieldErrors(err, "name")})
+		return
+	}
+	tv := adminweb.ToTenantView(t)
+	s.ui.Partials(w, http.StatusOK,
+		adminweb.OOBPart{Name: "tenant_rename_form", Data: adminweb.DetailView{Tenant: tv}},
+		adminweb.OOBPart{Name: "tenant_name_oob", Data: tv},
+		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: "Nome atualizado."}})
+}
+
+// consoleRemoveBank hard-deletes a tenant's per-bank configuration — the
+// credential and the mTLS certificate for the (tenant, bank) pair (ADR-0012 §5).
+// On success it navigates back to the bank list (the bank is gone) with a toast;
+// the delete is idempotent, so a repeat is harmless. A bad tenant id / unsupported
+// bank slug yields the clean 404 / 400 mapping.
+func (s *Server) consoleRemoveBank(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	bankID := chi.URLParam(r, "bankId")
+	t, err := s.console.GetTenant(r.Context(), id)
+	if err != nil {
+		s.consoleError(w, err)
+		return
+	}
+	if err := s.console.RemoveBankConfig(r.Context(), id, bankID); err != nil {
+		s.consoleError(w, err)
+		return
+	}
+	view, err := s.bankListView(r, t)
+	if err != nil {
+		s.consoleError(w, err)
+		return
+	}
+	s.ui.BodyWithOOB(w, http.StatusOK, "banks", view,
+		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: "Configuração do banco removida."}})
+}
+
 // --- Bank credentials (write-only) ---
 
 func (s *Server) consoleCredentialsForm(w http.ResponseWriter, r *http.Request) {

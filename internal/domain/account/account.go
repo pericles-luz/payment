@@ -95,6 +95,31 @@ func (a *Account) Active() bool { return a.active }
 // CreatedAt returns the creation timestamp.
 func (a *Account) CreatedAt() time.Time { return a.createdAt }
 
+// Rename changes the account display name, enforcing the SAME invariants as New
+// (non-blank, ≤ 200 chars, trimmed) so a persisted rename can never bypass the
+// creation rules (ADR-0012 §1). It mutates only the name; id, active state and
+// createdAt are immutable. A blank or over-long name is rejected as a validation
+// error and leaves the aggregate unchanged.
+//
+// A DERIVED self-account (acct-<tenantID>, IsSelfAccountID) cannot be renamed
+// directly: its display name reflects the underlying empresa-cliente, so a rename
+// must go through the tenant (ADR-0012 §1). The attempt is rejected with a generic
+// validation error that leaks no account-existence oracle (OWASP A01/A07).
+func (a *Account) Rename(name string) error {
+	if IsSelfAccountID(a.id) {
+		return shared.NewValidationError("id", "self-account cannot be renamed directly")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return shared.NewValidationError("name", "account name is required")
+	}
+	if len(name) > 200 {
+		return shared.NewValidationError("name", "account name too long")
+	}
+	a.name = name
+	return nil
+}
+
 // Deactivate suspends the account.
 func (a *Account) Deactivate() { a.active = false }
 

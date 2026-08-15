@@ -180,6 +180,8 @@ func run() error {
 		CredReader:      creds,
 		CertWriter:      certs,
 		CertReader:      certs,
+		CredDeleter:     creds,
+		CertDeleter:     certs,
 		Invoices:        store,
 		CredInvalidator: credInvalidator,
 		Audit:           store,

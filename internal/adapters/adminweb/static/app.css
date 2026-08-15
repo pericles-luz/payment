@@ -179,6 +179,13 @@ select:focus-visible,
   padding: var(--space-5);
 }
 
+/* card--danger frames a destructive action (remove bank config, ADR-0012 §5) so an
+   irreversible operation reads visually distinct from the routine cards around it. */
+.card--danger {
+  border-color: var(--color-danger, #c0392b);
+  border-left-width: 4px;
+}
+
 .card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));

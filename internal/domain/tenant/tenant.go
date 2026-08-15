@@ -94,6 +94,23 @@ func (t *Tenant) AssignAccount(accountID string) error {
 	return nil
 }
 
+// Rename changes the tenant display name, enforcing the SAME invariants as New
+// (non-blank, ≤ 200 chars, trimmed) so a persisted rename can never bypass the
+// creation rules (ADR-0012 §1). It mutates only the name; id, active state,
+// createdAt and the immutable accountID binding are untouched. A blank or
+// over-long name is rejected as a validation error and leaves the tenant unchanged.
+func (t *Tenant) Rename(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return shared.NewValidationError("name", "tenant name is required")
+	}
+	if len(name) > 200 {
+		return shared.NewValidationError("name", "tenant name too long")
+	}
+	t.name = name
+	return nil
+}
+
 // Deactivate suspends the tenant (no further transactions allowed).
 func (t *Tenant) Deactivate() { t.active = false }
 

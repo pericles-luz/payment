@@ -19,4 +19,15 @@
 {{template "cert_card" .}}
 
 {{template "creditor_card" .}}
+
+<div class="card card--danger">
+  <h2>Remover banco</h2>
+  <p class="muted">Remove a credencial e o certificado mTLS deste banco para <strong>{{.Tenant.Name}}</strong>. <strong>Interrompe imediatamente</strong> novas transações do tenant neste banco. O material sensível é zerado antes da exclusão; a ação é auditada. Basta recadastrar a configuração para voltar a operar.</p>
+  <div class="form-actions">
+    <button class="btn btn--danger" type="button"
+      hx-delete="/console/tenants/{{.Tenant.ID}}/banks/{{.Bank.Slug}}"
+      hx-target="#main" hx-swap="innerHTML" hx-push-url="/console/tenants/{{.Tenant.ID}}/banks"
+      hx-confirm="Remover a configuração do {{.Bank.DisplayName}} para {{.Tenant.Name}}? Isso apaga a credencial e o certificado e interrompe novas transações neste banco imediatamente.">Remover banco</button>
+  </div>
+</div>
 {{end}}

@@ -16,6 +16,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/adminweb"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 )
 
 // isServiceError reports whether err is a "dependency not configured" service
@@ -147,6 +148,36 @@ func (s *Server) accountTransition(w http.ResponseWriter, r *http.Request, op fu
 	s.ui.Partials(w, http.StatusOK,
 		adminweb.OOBPart{Name: "account_status_header_oob", Data: av},
 		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: msg}})
+}
+
+// consoleRenameAccount edits a Conta's display name (ADR-0012 §1) from the inline
+// rename form. On success it swaps the rename form back with the new value and
+// updates the detail header name out-of-band, plus a toast. A validation error
+// (blank / too long / a derived self-account, which the domain refuses) re-renders
+// the form inline with the field error (422); a bad id yields the clean 404.
+func (s *Server) consoleRenameAccount(w http.ResponseWriter, r *http.Request) {
+	acctID := chi.URLParam(r, "acctId")
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	a, err := s.console.RenameAccount(r.Context(), acctID, name)
+	if err != nil {
+		if errors.Is(err, shared.ErrNotFound) || isServiceError(err) {
+			s.consoleError(w, err)
+			return
+		}
+		cur, gErr := s.console.GetAccount(r.Context(), acctID)
+		if gErr != nil {
+			s.consoleError(w, gErr)
+			return
+		}
+		s.ui.Partial(w, http.StatusUnprocessableEntity, "account_rename_form",
+			adminweb.AccountDetailView{Account: adminweb.ToAccountView(cur), Errors: fieldErrors(err, "name")})
+		return
+	}
+	av := adminweb.ToAccountView(a)
+	s.ui.Partials(w, http.StatusOK,
+		adminweb.OOBPart{Name: "account_rename_form", Data: adminweb.AccountDetailView{Account: av}},
+		adminweb.OOBPart{Name: "account_name_oob", Data: av},
+		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: "Nome atualizado."}})
 }
 
 func (s *Server) consoleNewAccountTenantForm(w http.ResponseWriter, r *http.Request) {

@@ -7,7 +7,7 @@
 {{end}}
 <div class="topbar">
   <div>
-    <h1>{{.Name}} <span id="tenant-status">{{template "status_badge" .}}</span></h1>
+    <h1><span id="tenant-name">{{.Name}}</span> <span id="tenant-status">{{template "status_badge" .}}</span></h1>
     <p class="muted">criado {{.CreatedAtBR}}</p>
   </div>
   <span id="tenant-status-action">{{template "status_action" .}}</span>
@@ -42,6 +42,7 @@
         {{- end -}}
       </dd>
     </dl>
+    {{template "tenant_rename_form" $}}
   </div>
   <div class="card">
     <h2>Atalhos</h2>

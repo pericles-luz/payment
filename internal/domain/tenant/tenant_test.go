@@ -57,4 +57,48 @@ func TestTenantDeactivateAndRehydrate(t *testing.T) {
 	if tt.Active() {
 		t.Fatal("should be inactive after Deactivate")
 	}
+	tt.Activate()
+	if !tt.Active() {
+		t.Fatal("should be active after Activate")
+	}
+}
+
+func TestTenantRename(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(0, 0).UTC()
+	tests := []struct {
+		name, in, want string
+		wantErr        bool
+	}{
+		{name: "ok", in: "Acme Novo", want: "Acme Novo", wantErr: false},
+		{name: "trims", in: "  Acme  ", want: "Acme", wantErr: false},
+		{name: "blank", in: "   ", wantErr: true},
+		{name: "empty", in: "", wantErr: true},
+		{name: "too long", in: strings.Repeat("x", 201), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tn, err := tenant.New("t1", "Original", now)
+			if err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			err = tn.Rename(tt.in)
+			if tt.wantErr {
+				if !errors.Is(err, shared.ErrValidation) {
+					t.Fatalf("want ErrValidation, got %v", err)
+				}
+				if tn.Name() != "Original" {
+					t.Fatalf("name must be unchanged on error, got %q", tn.Name())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected: %v", err)
+			}
+			if tn.Name() != tt.want {
+				t.Fatalf("Name() = %q, want %q", tn.Name(), tt.want)
+			}
+		})
+	}
 }

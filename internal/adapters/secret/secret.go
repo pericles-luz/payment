@@ -121,6 +121,32 @@ func (s *Store) SetBankCredential(_ context.Context, tenantID, bankID, clientID,
 	return nil
 }
 
+// DeleteBankCredential implements ports.CredentialDeleter: it hard-removes the
+// credential for the (tenantID, bankID) pair (ADR-0012 §5). It is IDEMPOTENT —
+// removing an absent pair returns nil, giving the caller no enumeration oracle
+// (OWASP A01) and making a repeated "remove bank" click a harmless no-op. Before
+// dropping the map slot it ZEROISES the in-memory secret material (Secret and the
+// routing-sensitive CreditorKey), the in-process analog of the SQLite
+// "UPDATE … SET client_secret=” … DELETE" the ADR prescribes, so a sensitive
+// value never lingers in a stale struct (threat C1/C4). An empty bankID resolves
+// to the default BankIDC6 (retro-compat).
+func (s *Store) DeleteBankCredential(_ context.Context, tenantID, bankID string) error {
+	key := credKey(tenantID, defaultBankID(bankID))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.creds[key]
+	if !ok {
+		return nil
+	}
+	// Zeroise before delete: overwrite the sensitive fields in the stored value so
+	// no secret survives in a lingering copy, then drop the slot entirely.
+	cur.Secret = ""
+	cur.CreditorKey = ""
+	s.creds[key] = cur
+	delete(s.creds, key)
+	return nil
+}
+
 // pixEVPPattern / pixEmailPattern / pixPhonePattern match the syntactic shapes
 // BACEN accepts for a PIX key other than CPF/CNPJ (checked separately as digit
 // strings): an EVP random key (UUID), an e-mail, or an E.164 phone. They are a

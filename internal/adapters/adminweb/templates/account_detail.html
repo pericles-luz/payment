@@ -2,7 +2,7 @@
 <p class="breadcrumb"><a href="/console/accounts" hx-get="/console/accounts" hx-target="#main" hx-push-url="true">‹ Contas</a> / {{.Account.Name}}</p>
 <div class="topbar">
   <div>
-    <h1>{{.Account.Name}} <span id="account-status">{{template "account_badge" .Account}}</span></h1>
+    <h1><span id="account-name">{{.Account.Name}}</span> <span id="account-status">{{template "account_badge" .Account}}</span></h1>
     <p class="muted">criada {{.Account.CreatedAtBR}}</p>
   </div>
   <span id="account-status-action">{{template "account_status_action" .Account}}</span>
@@ -24,6 +24,7 @@
     <dt>Status</dt><dd>{{template "account_badge" .Account}}</dd>
     <dt>Criada em</dt><dd>{{.Account.CreatedAtBR}}</dd>
   </dl>
+  {{if not .Account.IsSelf}}{{template "account_rename_form" .}}{{end}}
 </div>
 
 <div class="topbar">

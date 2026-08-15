@@ -53,6 +53,28 @@ func (s *CertStore) SetBankCertificate(_ context.Context, cert ports.BankCertifi
 	return nil
 }
 
+// DeleteBankCertificate implements ports.BankCertificateDeleter: it hard-removes
+// the certificate for the (tenantID, bankID) pair (ADR-0012 §5). It is IDEMPOTENT
+// — removing an absent pair returns nil, giving the caller no enumeration oracle
+// (OWASP A01). Before dropping the map slot it ZEROISES the in-memory private key
+// (KeyPEM), the in-process analog of the SQLite "UPDATE … SET key_pem=” … DELETE"
+// the ADR prescribes, so the key material never lingers in a stale struct (threat
+// C1/C4). An empty bankID resolves to the default BankIDC6 (retro-compat).
+func (s *CertStore) DeleteBankCertificate(_ context.Context, tenantID, bankID string) error {
+	key := credKey(tenantID, defaultBankID(bankID))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.certs[key]
+	if !ok {
+		return nil
+	}
+	// Zeroise the private key before delete, then drop the slot entirely.
+	cur.KeyPEM = ""
+	s.certs[key] = cur
+	delete(s.certs, key)
+	return nil
+}
+
 // GetBankCertificateMeta implements ports.BankCertificateReader. It returns ONLY
 // the public metadata of the stored certificate, re-derived from the stored leaf
 // certificate via bankcert.ParseCert; the private key never leaves the store. The

@@ -67,6 +67,64 @@ func TestAccountRehydrateAndToggle(t *testing.T) {
 	}
 }
 
+func TestAccountRename(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(0, 0).UTC()
+	tests := []struct {
+		name, in, want string
+		wantErr        bool
+	}{
+		{name: "ok", in: "Verz Novo", want: "Verz Novo", wantErr: false},
+		{name: "trims", in: "  Verz  ", want: "Verz", wantErr: false},
+		{name: "blank", in: "   ", wantErr: true},
+		{name: "empty", in: "", wantErr: true},
+		{name: "too long", in: strings.Repeat("x", 201), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a, err := account.New("a1", "Original", now)
+			if err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			err = a.Rename(tt.in)
+			if tt.wantErr {
+				if !errors.Is(err, shared.ErrValidation) {
+					t.Fatalf("want ErrValidation, got %v", err)
+				}
+				if a.Name() != "Original" {
+					t.Fatalf("name must be unchanged on error, got %q", a.Name())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected: %v", err)
+			}
+			if a.Name() != tt.want {
+				t.Fatalf("Name() = %q, want %q", a.Name(), tt.want)
+			}
+		})
+	}
+}
+
+func TestAccountRenameSelfAccountRejected(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(0, 0).UTC()
+	// A derived self-account carries the acct-<tenantID> id; rehydrate one and
+	// confirm a direct rename is refused and the name is left untouched (ADR-0012 §1).
+	self := account.Rehydrate(account.SelfAccountID("t-123"), "Self", true, now)
+	if !account.IsSelfAccountID(self.ID()) {
+		t.Fatalf("setup: %q is not a self-account id", self.ID())
+	}
+	err := self.Rename("New Name")
+	if !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("want ErrValidation renaming self-account, got %v", err)
+	}
+	if self.Name() != "Self" {
+		t.Fatalf("name must be unchanged, got %q", self.Name())
+	}
+}
+
 func TestSelfAccountID(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

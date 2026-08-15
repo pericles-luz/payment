@@ -548,11 +548,19 @@ func (s *Server) Router() http.Handler {
 				r.Post("/accounts", s.consoleCreateAccount)
 				r.Post("/accounts/{acctId}/suspend", s.consoleSuspendAccount)
 				r.Post("/accounts/{acctId}/activate", s.consoleActivateAccount)
+				// Rename a Conta (ADR-0012 §1). PATCH the resource; the domain refuses a
+				// derived self-account. CSRF rides the global body hx-headers.
+				r.Patch("/accounts/{acctId}", s.consoleRenameAccount)
 				r.Post("/accounts/{acctId}/tenants", s.consoleCreateAccountTenant)
 				r.Post("/accounts/{acctId}/invoices", s.consoleGenerateAccountInvoices)
 				r.Post("/tenants", s.consoleCreateTenant)
 				r.Post("/tenants/{id}/suspend", s.consoleSuspendTenant)
 				r.Post("/tenants/{id}/activate", s.consoleActivateTenant)
+				// Rename an empresa-cliente (ADR-0012 §1).
+				r.Patch("/tenants/{id}", s.consoleRenameTenant)
+				// Remove a tenant's per-bank configuration — hard-delete cred + cert for the
+				// (tenant, bank) pair, zeroised before delete and audited (ADR-0012 §5).
+				r.Delete("/tenants/{id}/banks/{bankId}", s.consoleRemoveBank)
 				r.Post("/tenants/{id}/credentials", s.consoleSetCredential)
 				r.Post("/tenants/{id}/banks", s.consoleAddBank)
 				r.Post("/tenants/{id}/banks/{bankId}/credential", s.consoleSetBankCredential)

@@ -424,6 +424,21 @@ type CredentialWriter interface {
 	SetBankCredential(ctx context.Context, tenantID, bankID, clientID, secret string) error
 }
 
+// CredentialDeleter is the admin-plane hard-delete path for a tenant's bank (PSP)
+// credential, keyed by the composite (tenantID, bankID) pair (ADR-0012 §5). It is
+// kept separate from CredentialWriter (ISP, least privilege): removing a bank
+// configuration is a distinct, destructive capability from rotating a secret, and
+// the (tenant, bank) credential pair is pure operational configuration — it
+// anchors no ledger, invoice, pii_access_log nor recurrence mandate, so a hard
+// delete loses no business history. DeleteBankCredential MUST be idempotent
+// (deleting an absent pair returns nil, not an error — no enumeration oracle,
+// OWASP A01) and MUST zeroise the stored secret material BEFORE removing the row
+// so a private value never lingers in a deleted-but-recoverable slot (threat
+// C1/C4). An empty bankID resolves to the default BankIDC6 (retro-compat).
+type CredentialDeleter interface {
+	DeleteBankCredential(ctx context.Context, tenantID, bankID string) error
+}
+
 // CreditorKeyWriter is the admin-plane write path for a tenant's registered PIX
 // creditor key (chave do recebedor). It is kept deliberately separate from
 // CredentialWriter so the secret-rotation capability and the fund-routing
@@ -531,6 +546,18 @@ type BankCertificateMeta struct {
 // calling; an empty BankID is stored under the default BankIDC6 (retro-compat).
 type BankCertificateWriter interface {
 	SetBankCertificate(ctx context.Context, cert BankCertificate) error
+}
+
+// BankCertificateDeleter is the admin-plane hard-delete path for a tenant's
+// per-(tenant,bank) mTLS client certificate (ADR-0012 §5). Kept separate from the
+// writer/reader (ISP): removing a bank's certificate is a distinct, destructive
+// capability. Like CredentialDeleter it MUST be idempotent (deleting an absent
+// pair returns nil — no enumeration oracle, OWASP A01) and MUST zeroise the stored
+// private key BEFORE removing the row so the key material never lingers in a
+// deleted-but-recoverable slot (threat C1/C4). An empty bankID resolves to the
+// default BankIDC6 (retro-compat).
+type BankCertificateDeleter interface {
+	DeleteBankCertificate(ctx context.Context, tenantID, bankID string) error
 }
 
 // BankCertificateReader returns ONLY the public metadata of a stored certificate,

@@ -294,6 +294,54 @@
 </form>
 {{end}}
 
+{{/* tenant_rename_form is the inline "Renomear" form on the tenant detail (ADR-0012
+     §1). It posts a name via hx-patch to the tenant resource and swaps itself
+     (outerHTML), so a rename never disturbs the rest of the screen. CSRF rides the
+     global body hx-headers (X-CSRF-Token), like the suspend/activate toggles — no
+     hidden field needed for the htmx path. Data exposes .Tenant (TenantView) and
+     .Errors (map), satisfied by both DetailView and the swap responses. */}}
+{{define "tenant_rename_form"}}
+<form id="tenant-rename" class="form"
+      hx-patch="/console/tenants/{{.Tenant.ID}}" hx-target="#tenant-rename" hx-swap="outerHTML">
+  <div class="field{{if .Errors.name}} has-error{{end}}">
+    <label for="f-tenant-rename">Renomear</label>
+    <input id="f-tenant-rename" name="name" value="{{.Tenant.Name}}" required maxlength="200" autocomplete="off"
+           {{if .Errors.name}}aria-invalid="true" aria-describedby="e-tenant-rename"{{end}}>
+    {{if .Errors.name}}<span class="error" id="e-tenant-rename" role="alert">{{.Errors.name}}</span>{{end}}
+  </div>
+  <div class="form-actions"><button class="btn btn--secondary" type="submit">Salvar nome</button></div>
+</form>
+{{end}}
+
+{{/* tenant_name_oob updates the detail header's tenant name out-of-band after a
+     rename. Data is a TenantView. */}}
+{{define "tenant_name_oob"}}
+<span id="tenant-name" hx-swap-oob="true">{{.Name}}</span>
+{{end}}
+
+{{/* account_rename_form mirrors tenant_rename_form for a Conta (ADR-0012 §1). It is
+     rendered only for a real (non-self) account; a derived self-account has no
+     editable name (its name reflects the empresa-cliente). Data exposes .Account
+     (AccountView) and .Errors (map), satisfied by AccountDetailView and the swaps. */}}
+{{define "account_rename_form"}}
+<form id="account-rename" class="form"
+      hx-patch="/console/accounts/{{.Account.ID}}" hx-target="#account-rename" hx-swap="outerHTML">
+  <div class="field{{if .Errors.name}} has-error{{end}}">
+    <label for="f-account-rename">Renomear</label>
+    <input id="f-account-rename" name="name" value="{{.Account.Name}}" required maxlength="200" autocomplete="off"
+           {{if .Errors.name}}aria-invalid="true" aria-describedby="e-account-rename"{{end}}>
+    {{if .Errors.name}}<span class="error" id="e-account-rename" role="alert">{{.Errors.name}}</span>{{end}}
+  </div>
+  <div class="form-actions"><button class="btn btn--secondary" type="submit">Salvar nome</button></div>
+</form>
+{{end}}
+
+{{/* account_name_oob updates the account detail header's name out-of-band after a
+     rename. Data is an AccountView. */}}
+{{define "account_name_oob"}}
+<span id="account-name" hx-swap-oob="true">{{.Name}}</span>
+{{end}}
+
 {{define "status_header_oob"}}
 <span id="tenant-status" hx-swap-oob="true">{{template "status_badge" .}}</span>
 <span id="tenant-status-action" hx-swap-oob="true">{{template "status_action" .}}</span>
