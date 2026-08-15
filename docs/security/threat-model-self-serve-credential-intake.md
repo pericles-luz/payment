@@ -153,12 +153,52 @@ Recomendo `PUT`. Confirmar com SecEng.
 
 ---
 
+## 6.5. Delta — intake self-serve de certificado mTLS (private key em trânsito) — SIN-69346
+
+Segunda superfície self-serve, **entregue** (não mais "fora de escopo"): a
+empresa-cliente envia seu PRÓPRIO par certificado/chave via `PUT /v1/bank-certificate`,
+autenticada pelo próprio token, reusando 1:1 a arquitetura do intake de credencial
+acima. **Toda a análise das seções 2–6 se aplica sem alteração** (mesmo trust
+boundary, mesmo A01-por-construção `tenantID = ctxTenantID`, mesma allow-list `{c6}`,
+mesmo limiter inbound dedicado + `Retry-After`, mesma flag `PAYMENT_SELFSERVE_CRED_INTAKE`,
+mesma auditoria com `origin=self-serve`, zero migração). Este delta cobre **apenas o
+ativo novo e mais sensível: a chave privada em trânsito**.
+
+### 6.5.1. Por que a chave privada é mais sensível que o `client_secret`
+
+Um `client_secret` OAuth2 é rotacionável e só vale contra o token endpoint do PSP.
+A **chave privada mTLS** autentica o canal de transporte inteiro contra o C6 e, se
+vazar, permite personificar a empresa-cliente na conexão TLS. Logo, o manuseio da
+chave recebe controle **estrito e explicitamente testado**, acima do secret.
+
+### 6.5.2. Controles de manuseio da private key (todos com teste dedicado)
+
+| # | Controle | Onde | Verificação |
+|---|----------|------|-------------|
+| K1 | **Nunca ecoada no response** | handler `handleTenantSetBankCertificate` retorna só `bankCertificateView` (fingerprint, subject, issuer, serial, janela de validade) — **não existe campo de chave** na struct | Teste `TestSelfServeCertWritesOwnTenant`/`…CreateEqualsRotate` afirmam que o corpo base64 da chave NÃO aparece no response |
+| K2 | **Write-only no cofre** | par vai para `secret.CertStore` keyed `(tenant, bank)`; a chave nunca é lida de volta por nenhuma rota (não há GET de chave) | `bankcert`/`CertStore` redigem material sensível; nenhum caminho de leitura expõe `key_pem` |
+| K3 | **Nunca logada** | `BankCertificate`/material seguem o padrão `LogValue`/redação (threat C1/C4); o handler não loga o corpo; erro de validação **não ecoa** o PEM | herdado do padrão de redação da seção 4; erro é código nomeado (`invalid request` / validação), sem eco do input |
+| K4 | **Validada server-side ANTES do cofre** | `Parse` (x509) + casamento `tls.X509KeyPair` + **rejeição de cert expirado** (`NotAfter < now`) no use-case → `400` (nunca `500`), material ruim nunca chega ao storage | `TestSelfServeCertRejectsExpired`, `TestSelfServeCertRejectsMismatchedKey` |
+| K5 | **TLS-only** | a chave só transita no corpo de um `PUT` sobre TLS (nunca em URL/path/query — mesma regra I1 do secret) | contrato: `key_pem` é campo de body, jamais parâmetro de rota |
+| K6 | **Auditoria sem a chave** | `NewSelfServeCertificateSetEntry` grava who/tenant/bank + **fingerprint** (id público) em `tx_id`, `origin=self-serve`; nunca a chave (não há parâmetro de chave no construtor) | `TestSelfServeCertWritesOwnTenant` afirma `origin=self-serve` no trail; construtor não tem campo de chave |
+
+### 6.5.3. Delta STRIDE frente ao intake de credencial
+
+Único item que muda de peso: **I1 (Info disclosure do segredo)** sobe de *Crítica*
+para *Crítica+* pela natureza da chave privada — mitigado pelos K1–K6 acima
+(response só-metadados, write-only, sem log, validação no boundary). Todos os demais
+itens (S/T/R/D/E e I2 oráculo) são **idênticos** ao intake de credencial: sem
+seletor não há A01/oráculo cross-tenant; limiter próprio cobre D; flag cobre
+reversibilidade. **Nenhum novo vetor** é introduzido além do manuseio da chave, já
+coberto.
+
+---
+
 ## 7. Fora de escopo desta primeira entrega (fast-follow do fast-follow)
 
-- **Rotação de cert mTLS self-serve** (`BankCertificate`): a chave privada é ativo
-  ainda mais sensível e o parse x509/`tls.X509KeyPair` adiciona superfície. Fica
-  para uma entrega posterior com o seu próprio mini-threat-model. Primeira entrega
-  cobre só `client_id`/`secret`.
+- ~~**Rotação de cert mTLS self-serve** (`BankCertificate`)~~ — **ENTREGUE em
+  SIN-69346**; ver seção 6.5 (delta private-key). A allow-list, o limiter dedicado
+  e a auditoria `origin` são reusados 1:1 do intake de credencial.
 - **Chave do recebedor (creditor key) self-serve:** é routing-sensitive (A01
   confused-deputy, ADR-0004/0008). Mantém-se admin-only por ora.
 - **UX/console HTMX self-serve:** entrega separada após o aceite do contrato

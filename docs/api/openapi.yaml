@@ -66,6 +66,12 @@ tags:
     description: >-
       Modelo (b) revendedor (ADR-0011, flag-gated default-off): emissão/rotação
       da chave-de-Conta e provisionamento de empresas-clientes pela própria Conta.
+  - name: Onboarding
+    description: >-
+      Intake self-serve de material bancário da própria empresa-cliente
+      (flag-gated `PAYMENT_SELFSERVE_CRED_INTAKE`, default-off): credencial PSP e
+      certificado mTLS enviados pela API, tenant = chamador autenticado (sem
+      seletor → A01 eliminado por construção).
 
 paths:
   /healthz:
@@ -571,6 +577,78 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /v1/bank-credential:
+    put:
+      operationId: setSelfServeBankCredential
+      tags: [Onboarding]
+      summary: Enviar/rotacionar a credencial bancária da própria empresa-cliente (flag-gated)
+      description: |
+        **Intake self-serve (SIN-69196). Flag-gated (`PAYMENT_SELFSERVE_CRED_INTAKE`),
+        default-off — com a flag desligada a rota não existe (`404`).** A
+        empresa-cliente envia/rotaciona sua PRÓPRIA credencial PSP (`client_id` +
+        `secret`) autenticada pelo próprio token.
+
+        **Segurança:** o tenant é o chamador autenticado (contexto), **nunca** vem
+        do corpo/URL — não há seletor, então A01 é eliminado por construção.
+        `bank` é opcional (default `c6`) e restrito à allow-list self-serve `{c6}`;
+        qualquer outro → `400` sem eco do valor. O `secret` é **write-only**: nunca
+        é logado, ecoado ou retornado (a resposta traz só metadados não-secretos).
+        `create==rotate` (última escrita vence, resposta byte-idêntica → sem
+        oráculo de existência). Limiter inbound dedicado por tenant emite
+        `Retry-After` no `429`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SelfServeBankCredentialRequest" }
+      responses:
+        "200":
+          description: Credencial armazenada (metadados não-secretos; sem o secret).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BankCredentialView" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/bank-certificate:
+    put:
+      operationId: setSelfServeBankCertificate
+      tags: [Onboarding]
+      summary: Enviar/rotacionar o certificado mTLS da própria empresa-cliente (flag-gated)
+      description: |
+        **Intake self-serve (SIN-69346). Mesma flag do intake de credencial
+        (`PAYMENT_SELFSERVE_CRED_INTAKE`), default-off — desligada, a rota não
+        existe (`404`).** A empresa-cliente envia/rotaciona seu PRÓPRIO certificado
+        cliente mTLS (par `cert_pem`/`key_pem`) autenticada pelo próprio token.
+
+        **Segurança:** o tenant é o chamador autenticado (contexto), **nunca** vem
+        do corpo/URL — sem seletor, A01 eliminado por construção. `bank` opcional
+        (default `c6`), restrito à allow-list self-serve `{c6}` (senão `400` sem
+        eco). O par PEM é validado server-side (parse x509, casamento cert/chave,
+        **rejeição de certificado expirado** → `400`, nunca `500`). A **chave
+        privada** é **write-only**: nunca é logada, ecoada ou retornada — a
+        resposta traz SÓ metadados públicos do certificado (fingerprint SHA-256,
+        subject, janela de validade). `create==rotate` byte-idêntico (sem oráculo).
+        Limiter inbound dedicado por tenant (bucket separado do intake de
+        credencial) emite `Retry-After` no `429`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SelfServeBankCertificateRequest" }
+      responses:
+        "200":
+          description: Certificado armazenado (só metadados públicos; nunca a chave privada).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BankCertificateView" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /v1/statement:
     get:
       operationId: getStatement
@@ -720,6 +798,63 @@ components:
           description: Identificador da empresa-cliente. Use-o no header `X-Client-Tenant`.
         account_id: { type: string, description: Conta dona (derivada da chave). }
         name: { type: string }
+
+    SelfServeBankCredentialRequest:
+      type: object
+      description: >-
+        Credencial PSP da própria empresa-cliente (intake self-serve). O tenant
+        NÃO é um campo: vem do token autenticado. `secret` é write-only.
+      required: [client_id, secret]
+      properties:
+        bank:
+          type: string
+          description: Slug do banco (opcional, default `c6`; allow-list self-serve `{c6}`).
+          example: c6
+        client_id: { type: string, description: Client id da credencial OAuth2 do PSP. }
+        secret:
+          type: string
+          description: Secret da credencial. Write-only — nunca retornado, logado ou ecoado.
+    BankCredentialView:
+      type: object
+      description: Confirmação de escrita da credencial — apenas campos NÃO-secretos (sem o secret).
+      properties:
+        tenant_id: { type: string }
+        bank: { type: string, example: c6 }
+        client_id: { type: string }
+        status: { type: string, example: ok }
+
+    SelfServeBankCertificateRequest:
+      type: object
+      description: >-
+        Certificado cliente mTLS da própria empresa-cliente (intake self-serve). O
+        tenant NÃO é um campo: vem do token autenticado. `key_pem` é write-only.
+      required: [cert_pem, key_pem]
+      properties:
+        bank:
+          type: string
+          description: Slug do banco (opcional, default `c6`; allow-list self-serve `{c6}`).
+          example: c6
+        cert_pem: { type: string, description: Certificado leaf PÚBLICO em PEM. }
+        key_pem:
+          type: string
+          description: >-
+            Chave privada em PEM. Write-only — validada server-side, guardada no
+            cofre e NUNCA retornada, logada ou ecoada. Envie somente sobre TLS.
+    BankCertificateView:
+      type: object
+      description: >-
+        Confirmação de escrita do certificado — apenas metadados PÚBLICOS. A chave
+        privada nunca aparece aqui.
+      properties:
+        tenant_id: { type: string }
+        bank: { type: string, example: c6 }
+        subject_cn: { type: string }
+        issuer: { type: string }
+        serial_number: { type: string }
+        fingerprint_sha256: { type: string, description: Fingerprint SHA-256 do certificado (id público). }
+        not_before: { type: string, format: date-time }
+        not_after: { type: string, format: date-time }
+        status: { type: string, example: ok }
 
     Devedor:
       type: object

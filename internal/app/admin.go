@@ -198,9 +198,17 @@ func (s *AdminService) setBankCredential(ctx context.Context, tenantID, bank, cl
 // write. It carries the non-secret bankID and the certificate's public SHA-256
 // fingerprint so the trail records WHICH certificate was provisioned, while still
 // deriving the operator server-side and never recording the private key. The
-// append is fail-closed (an error surfaces rather than dropping the record).
-func (s *AdminService) recordCertificateAudit(ctx context.Context, tenantID, bankID, fingerprint string) error {
-	e, err := audit.NewCertificateSetEntry(s.ids.NewID(), OperatorIDFromContext(ctx), tenantID, bankID, fingerprint, s.clock.Now())
+// selfServe flag selects the origin the entry is stamped with (self-serve when the
+// tenant self-provisioned its own certificate via the tenant-plane intake,
+// SIN-69346; admin otherwise) — the sole difference between the two write surfaces
+// at the trail. The append is fail-closed (an error surfaces rather than dropping
+// the record).
+func (s *AdminService) recordCertificateAudit(ctx context.Context, tenantID, bankID, fingerprint string, selfServe bool) error {
+	build := audit.NewCertificateSetEntry
+	if selfServe {
+		build = audit.NewSelfServeCertificateSetEntry
+	}
+	e, err := build(s.ids.NewID(), OperatorIDFromContext(ctx), tenantID, bankID, fingerprint, s.clock.Now())
 	if err != nil {
 		return fmt.Errorf("build audit entry: %w", err)
 	}
@@ -224,6 +232,33 @@ func (s *AdminService) recordCertificateAudit(ctx context.Context, tenantID, ban
 // echoed or audited (threat C1/C4). Wiring the stored material into the live C6
 // mTLS transport is a separable follow-up (plan "Fora de escopo").
 func (s *AdminService) SetBankCertificate(ctx context.Context, tenantID, bank, certPEM, keyPEM string) (ports.BankCertificateMeta, error) {
+	return s.setBankCertificate(ctx, tenantID, bank, certPEM, keyPEM, false)
+}
+
+// SetBankCertificateSelfServe stores an empresa-cliente's OWN per-bank mTLS client
+// certificate through the self-serve intake (SIN-69346), mirroring
+// SetBankCredentialSelfServe. It is byte-for-byte the same write as
+// SetBankCertificate — same (tenant, bank) key, same parse/expiry/key-pair
+// validation, same token-cache eviction, same never-leak-the-private-key guarantee
+// — with two deliberate distinctions: (1) the HTTP boundary derives tenantID from
+// the authenticated tenant context, NEVER from client input (so a token can only
+// ever write its own certificate — the broken-access-control class A01 is designed
+// out, there is no tenant selector to abuse); and (2) the audit entry is stamped
+// origin=self-serve so the forensic trail separates a tenant self-provisioned
+// certificate from an admin-driven write. The bank allow-list is enforced at the
+// HTTP boundary (a dedicated self-serve allow-list, currently {c6}); this method
+// re-validates the bank against the platform-wide known set as defense-in-depth,
+// identically to the admin path.
+func (s *AdminService) SetBankCertificateSelfServe(ctx context.Context, tenantID, bank, certPEM, keyPEM string) (ports.BankCertificateMeta, error) {
+	return s.setBankCertificate(ctx, tenantID, bank, certPEM, keyPEM, true)
+}
+
+// setBankCertificate is the shared implementation behind the admin and self-serve
+// certificate writes. selfServe selects only the audit origin; every port
+// interaction (validate → parse → expiry-check → write → evict → audit) is
+// identical, so the two surfaces can never diverge in what they validate, persist
+// or evict.
+func (s *AdminService) setBankCertificate(ctx context.Context, tenantID, bank, certPEM, keyPEM string, selfServe bool) (ports.BankCertificateMeta, error) {
 	bank = ports.NormalizeBankID(bank)
 	if !ports.IsKnownBankID(bank) {
 		// Reject an unknown bank without echoing any input back (deny-by-default).
@@ -256,7 +291,7 @@ func (s *AdminService) SetBankCertificate(ctx context.Context, tenantID, bank, c
 	// certificate rotation can take effect without waiting out a cache TTL
 	// (best-effort, local; ADR-0003). The live mTLS transport swap is a follow-up.
 	s.credEvictor.InvalidateToken(tenantID)
-	if err := s.recordCertificateAudit(ctx, tenantID, bank, cert.FingerprintSHA256); err != nil {
+	if err := s.recordCertificateAudit(ctx, tenantID, bank, cert.FingerprintSHA256, selfServe); err != nil {
 		return ports.BankCertificateMeta{}, err
 	}
 	return ports.BankCertificateMeta{

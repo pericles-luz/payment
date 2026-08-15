@@ -298,6 +298,26 @@ func NewCertificateSetEntry(id, operatorID, tenantID, bankID, fingerprint string
 	}, nil
 }
 
+// NewSelfServeCertificateSetEntry builds the audit record for a per-bank mTLS
+// certificate write a tenant performed on ITSELF through the self-serve intake
+// (SIN-69346): the certificate.set on PUT /v1/bank-certificate, authenticated by
+// the tenant's own token. It is identical to NewCertificateSetEntry — same
+// ActionSetBankCertificate, same invariants, the fingerprint (a public
+// identifier) in tx_id, and the same never-records-the-private-key guarantee (it
+// has no key parameter, threat C1/C4) — EXCEPT it stamps OriginSelfServe, so the
+// forensic trail distinguishes a tenant self-provisioned certificate from an
+// admin-driven write. Keeping NewCertificateSetEntry untouched means the admin
+// path (and its tests) are unchanged; only this new surface opts into the
+// self-serve origin, mirroring NewSelfServeCredentialSetEntry.
+func NewSelfServeCertificateSetEntry(id, operatorID, tenantID, bankID, fingerprint string, at time.Time) (Entry, error) {
+	e, err := NewCertificateSetEntry(id, operatorID, tenantID, bankID, fingerprint, at)
+	if err != nil {
+		return Entry{}, err
+	}
+	e.origin = OriginSelfServe
+	return e, nil
+}
+
 // NewSettlementMismatchEntry builds the audit record for a refused settlement: a
 // charge the PSP marked paid whose received amount did not match the expected
 // amount (reconcile-before-settle, threat W3). It is a system-actor event — the

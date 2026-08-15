@@ -112,6 +112,42 @@ func (rl *rateLimiter) middlewareSelfServeCred(retryAfterSecs int) func(http.Han
 	}
 }
 
+// middlewareSelfServeCert is the DEDICATED inbound limiter for the self-serve mTLS
+// certificate intake (PUT /v1/bank-certificate, SIN-69346). It mirrors
+// middlewareSelfServeCred exactly but keys on a SEPARATE bucket namespace
+// ("selfserve-cert:"+tid) so a certificate upload burst cannot mask, nor be masked
+// by, a credential rotation burst or ordinary tenant traffic — each rare high-value
+// write gets its own budget. The route sits behind tenant auth, so ctxTenantID is
+// always present; retryAfterSecs is emitted on a 429 so a client can back off
+// deterministically.
+//
+// Fail-securely-for-availability: if the tenant key is unexpectedly empty — only
+// possible via a wiring bug that placed this middleware before tenant auth — it
+// FAILS OPEN (logs a warning and admits the request) rather than throttling. A
+// tenant must never be locked out of provisioning its own (security-sensitive)
+// certificate by an internal limiter fault; the route is already authenticated, so
+// failing open here does not widen access (identical posture to the self-serve
+// credential limiter).
+func (rl *rateLimiter) middlewareSelfServeCert(retryAfterSecs int) func(http.Handler) http.Handler {
+	retryAfter := strconv.Itoa(retryAfterSecs)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tid := tenantFromContext(r.Context())
+			if tid == "" {
+				slog.Warn("self-serve certificate limiter: empty tenant key; failing open")
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !rl.allow("selfserve-cert:" + tid) {
+				w.Header().Set("Retry-After", retryAfter)
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // middlewareAccountKeyRotate is the DEDICATED inbound limiter for the account-key
 // self-rotation route (POST /v1/account-key, SIN-69280). It mirrors
 // middlewareSelfServeCred but keys STRICTLY on the authenticated Account (the route

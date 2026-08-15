@@ -414,6 +414,23 @@ func (s *Server) Router() http.Handler {
 					r.Use(newRateLimiter(selfServeBurst, selfServeRefillPS, nil).middlewareSelfServeCred(selfServeRetryAfter))
 					r.Put("/bank-credential", s.handleTenantSetBankCredential)
 				})
+				// Self-serve mTLS certificate intake (SIN-69346), the certificate sibling of
+				// the credential intake above. Same flag (one Verz onboarding surface), same
+				// A01-by-construction posture (tenant = authenticated caller, no selector),
+				// same {c6} self-serve allow-list. It carries its OWN dedicated inbound
+				// limiter on a SEPARATE bucket namespace, so a certificate upload burst and a
+				// credential rotation burst cannot mask one another. A private key in transit
+				// is more sensitive than a client_secret; the handler returns ONLY public
+				// certificate metadata (fingerprint/validity), never the key.
+				r.Group(func(r chi.Router) {
+					const (
+						selfServeCertBurst      = 5          // ≤5 cert uploads in a burst
+						selfServeCertRefillPS   = 1.0 / 60.0 // ~1 token/minute sustained
+						selfServeCertRetryAfter = 60         // seconds advertised on a 429
+					)
+					r.Use(newRateLimiter(selfServeCertBurst, selfServeCertRefillPS, nil).middlewareSelfServeCert(selfServeCertRetryAfter))
+					r.Put("/bank-certificate", s.handleTenantSetBankCertificate)
+				})
 			}
 		})
 	})
