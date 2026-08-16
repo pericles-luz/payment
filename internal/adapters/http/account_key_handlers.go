@@ -64,6 +64,12 @@ func accountKeyAuthMiddleware(auth AccountKeyAuthenticator) func(http.Handler) h
 				return
 			}
 			ctx := context.WithValue(r.Context(), ctxAccountID, accountID)
+			// Attribute the self-serve mint audit (SIN-69386): the Account acts on
+			// ITSELF here, so the operator is the account, stamped server-side as
+			// "account:<id>" (mirroring the console's "console:<subject>" and the admin
+			// token pseudonym). Never the bearer secret — only the resolved account id,
+			// a public attribution id.
+			ctx = app.WithOperatorID(ctx, "account:"+accountID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

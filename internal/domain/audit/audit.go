@@ -102,6 +102,18 @@ const (
 	// generated a statement for WHICH empresa-cliente and WHEN. It carries no
 	// secret and no PII — an invoice is ids + endpoints + money only.
 	ActionInvoiceGenerated Action = "invoice.generated"
+
+	// ActionMintAccountKey records the emission (create==rotate) of an Account's
+	// rotatable bearer key — the model (b) chave-de-Conta (ADR-0011 §3, SIN-69386).
+	// Key emission is a privileged credential-issuance action, so it MUST leave an
+	// attributable trail (OWASP A09): the entry names who (operator), which Conta
+	// (accountID) and when. Account-scoped like the other account.* actions — the
+	// target is an Account, so accountID is explicit and tenant_id is empty. It
+	// NEVER records the minted secret by construction (the constructor has no secret
+	// parameter; display-once, ADR-0010). A single entry covers BOTH write surfaces
+	// (JSON admin bootstrap + HTML console) because it is emitted from the shared
+	// mint path; an idempotent replay (409) mints nothing and so emits no entry.
+	ActionMintAccountKey Action = "account.key_mint"
 )
 
 // recurrenceActionByStatus maps a recurrence.RecStatus string to the audit Action
@@ -128,7 +140,7 @@ func (a Action) valid() bool {
 		ActionActivateAccount, ActionRemoveBankConfig,
 		ActionSettlementAmountMismatch, ActionRecCreated, ActionRecApproved,
 		ActionRecRejected, ActionRecExpired, ActionRecCancelled, ActionCobRCreated,
-		ActionSetBankCertificate, ActionInvoiceGenerated:
+		ActionSetBankCertificate, ActionInvoiceGenerated, ActionMintAccountKey:
 		return true
 	default:
 		return false
@@ -246,6 +258,37 @@ func NewAccountActionEntry(id, operatorID string, action Action, accountID strin
 		id:         id,
 		operatorID: strings.TrimSpace(operatorID),
 		action:     action,
+		at:         at,
+		accountID:  accountID,
+	}, nil
+}
+
+// NewAccountKeyMintEntry builds the audit record for minting/rotating an Account's
+// rotatable bearer key (ActionMintAccountKey, ADR-0011 §3 / SIN-69386). Account-key
+// emission is a privileged credential-issuance action, so it MUST be attributable
+// (OWASP A09): the entry names who (operatorID), which Conta (accountID) and when.
+// Like the other account-scoped constructors the target is an Account, so it carries
+// the account id explicitly (AccountID() returns it) and leaves the tenant id empty
+// — an Account is not a tenant (ADR-0012 pattern). It records the mint as a FACT
+// only and NEVER the minted secret by construction — it has no secret parameter
+// (threat C1/C4; display-once, ADR-0010, so the plaintext leaves the mint service
+// exactly once and never reaches the trail). It is emitted from the shared mint path
+// so BOTH write surfaces (JSON admin bootstrap + HTML console) are covered
+// uniformly. Invariants: a non-empty id and accountID; operatorID may be empty (a
+// non-attributed internal caller).
+func NewAccountKeyMintEntry(id, operatorID, accountID string, at time.Time) (Entry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Entry{}, shared.NewValidationError("id", "audit entry id is required")
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return Entry{}, shared.NewValidationError("account_id", "account id is required")
+	}
+	return Entry{
+		id:         id,
+		operatorID: strings.TrimSpace(operatorID),
+		action:     ActionMintAccountKey,
 		at:         at,
 		accountID:  accountID,
 	}, nil
