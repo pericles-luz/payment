@@ -488,6 +488,27 @@ type AccountDetailView struct {
 	// Errors carries per-field validation messages for the inline rename form
 	// (ADR-0012 §1); nil on a normal render (a nil map indexes to "" in templates).
 	Errors map[string]string
+	// AccountKeyEnabled gates the "Chave-de-Conta" card (SIN-69380): true only when
+	// the mint service is wired (model (b), ADR-0011 §3) AND the account is a real
+	// Conta — a derived self-account has no account key, so the card is hidden.
+	AccountKeyEnabled bool
+	// AccountKeyToken is a fresh per-render idempotency nonce embedded in the mint
+	// form (SIN-69184 pattern): a genuine double-submit resubmits the SAME nonce and
+	// collapses to a 409 (display-once, never a double-mint), while a fresh render
+	// carries a fresh nonce so a deliberate rotation always produces a new key.
+	AccountKeyToken string
+}
+
+// AccountKeyResultView backs the display-once success partial after a Conta-key
+// mint/rotation (SIN-69380). Secret carries the plaintext EXACTLY once — it is
+// rendered into this single HTMX response and never persisted in a view model
+// beyond it, never logged, and no read path echoes it (ADR-0010 display-once).
+// Token is a fresh nonce feeding the embedded "rotate again" form; the replay
+// (409) partial reuses this view with Secret left empty (no secret on replay).
+type AccountKeyResultView struct {
+	AccountID string
+	Secret    string
+	Token     string
 }
 
 // NewAccountTenantView backs the "create empresa-cliente under this account" form.

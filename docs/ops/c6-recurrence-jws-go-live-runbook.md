@@ -83,9 +83,32 @@ O C6 publica as chaves públicas de assinatura de Recorrência em…
    `ErrUnavailable`); um `kid` desconhecido / assinatura inválida falha fechado.
 
 > Se o JWKS é servido **atrás do mesmo mTLS** da API C6, o cliente mTLS já é
-> reutilizado pelo verificador (`main.go:268`, `c6cfg.HTTPClient`) — nenhum passo
+> reutilizado pelo verificador (`main.go`, `c6cfg.HTTPClient`) — nenhum passo
 > extra. Se for um host TLS público distinto, o verificador constrói o próprio
 > cliente TLS-1.2+.
+>
+> ⚠️ **Carimbo de tenant no fetch do JWKS (SIN-69375).** O fetch do JWKS é
+> **process-wide** e não tem tenant natural, então ele não carimba tenant. Com o
+> transporte mTLS **baseado no cofre por tenant** (SIN-69368), um request sem tenant
+> cai no slot de **cert bootstrap §8** (`PAYMENT_C6_CLIENT_CERT`/`_KEY`). Numa
+> implantação **vault-only** (Verz — sem cert §8 configurado, cada cert vem do cofre),
+> esse fetch apresentaria **cert de cliente vazio** e o handshake mTLS do JWKS
+> **falha fechado** — quebrando a verificação de assinatura de TODA leitura de
+> recorrência. Não é brecha (fail-closed), mas quebra a funcionalidade. Duas
+> resoluções (qualquer uma basta):
+>
+> - **(a) operacional:** manter o cert bootstrap §8 (`PAYMENT_C6_CLIENT_CERT`/`_KEY`)
+>   configurado enquanto a recorrência estiver ligada — o fetch tenantless usa esse
+>   cert.
+> - **(b) código (preferida em vault-only):** setar `PAYMENT_C6_REC_JWKS_MTLS_TENANT`
+>   com o **tenant designado** cujo certificado no cofre satisfaz o mTLS do endpoint
+>   JWKS. O verificador carimba esse tenant no fetch (`WithMTLSTenant`) e apresenta o
+>   cert desse tenant — sem depender do cert §8. Vazio (default) mantém o
+>   comportamento anterior (tenantless → cert §8, ou nenhum). Só tem efeito quando o
+>   JWKS está atrás de mTLS; num JWKS público o carimbo é inerte.
+>
+> Se o JWKS for um **host TLS público** (sem client cert), nada disso se aplica —
+> deixe `PAYMENT_C6_REC_JWKS_MTLS_TENANT` vazio.
 
 ### 1.B — Modelo cert-pinado (B): NÃO ligar a URL
 

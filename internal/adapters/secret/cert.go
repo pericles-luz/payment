@@ -2,6 +2,7 @@ package secret
 
 import (
 	"context"
+	"crypto/tls"
 	"sync"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/bankcert"
@@ -73,6 +74,31 @@ func (s *CertStore) DeleteBankCertificate(_ context.Context, tenantID, bankID st
 	s.certs[key] = cur
 	delete(s.certs, key)
 	return nil
+}
+
+// LoadTLSCertificate re-assembles the stored cert/key for (tenantID, bankID) into a
+// ready-to-handshake tls.Certificate for the live mTLS transport (SIN-69368). This
+// is the ONLY read path that touches the private key, and even here the key never
+// leaves the adapter as raw PEM: it is consumed by tls.X509KeyPair and returned only
+// inside the opaque tls.Certificate the TLS stack needs, so the write-only-key
+// posture is preserved (threat C1/C4). The lookup is exact-match with NO fallback: a
+// missing pair returns shared.ErrNotFound so the transport can fall back to the
+// bootstrap (path §8) certificate (deny-by-default; threat T1/T2). An empty bankID
+// resolves to the default BankIDC6 (retro-compat).
+func (s *CertStore) LoadTLSCertificate(_ context.Context, tenantID, bankID string) (*tls.Certificate, error) {
+	s.mu.RLock()
+	c, ok := s.certs[credKey(tenantID, defaultBankID(bankID))]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, shared.ErrNotFound
+	}
+	cert, err := tls.X509KeyPair([]byte(c.CertPEM), []byte(c.KeyPEM))
+	if err != nil {
+		// The material was validated on write, so a pairing failure here is an
+		// internal inconsistency — surface it rather than presenting a broken cert.
+		return nil, err
+	}
+	return &cert, nil
 }
 
 // GetBankCertificateMeta implements ports.BankCertificateReader. It returns ONLY

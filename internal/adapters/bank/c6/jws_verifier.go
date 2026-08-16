@@ -61,6 +61,11 @@ type JWSVerifier struct {
 	algs    []jose.SignatureAlgorithm
 	fetcher jwksFetcher
 
+	// mtlsTenant is the tenant identity stamped on the JWKS fetch so a vault-backed
+	// mTLS transport presents that tenant's client certificate (SIN-69375). Empty
+	// leaves the fetch tenantless (prior behaviour: §8 bootstrap cert, or none).
+	mtlsTenant string
+
 	now        func() time.Time
 	minRefetch time.Duration
 
@@ -105,6 +110,23 @@ func WithMinRefetch(d time.Duration) VerifierOption {
 	}
 }
 
+// WithMTLSTenant designates the tenant whose vault mTLS client certificate is
+// presented on the JWKS fetch. The JWKS endpoint is process-wide with no natural
+// tenant, so its request stamps none and a vault-backed mTLS transport would fall
+// back to the §8 bootstrap certificate; in a vault-only deployment that bootstrap
+// cert is absent, so the handshake — and every recurrence signature verification
+// downstream — fails closed (SIN-69375). Setting this to a tenant that owns a vault
+// certificate makes the fetch present that certificate. An empty tenantID is ignored
+// (the fetch stays tenantless). This only affects a transport that reads the stamped
+// tenant (the vault mTLS RoundTripper); the default JWKS client ignores it.
+func WithMTLSTenant(tenantID string) VerifierOption {
+	return func(v *JWSVerifier) {
+		if tenantID != "" {
+			v.mtlsTenant = tenantID
+		}
+	}
+}
+
 // NewJWSVerifier builds a verifier that fetches C6's JWKS over HTTP. jwksURL must be
 // an absolute https URL (secure-by-default, TLS-only — the public keys must come over
 // an authenticated channel). When client is nil a TLS-1.2+ client is built. The
@@ -117,7 +139,11 @@ func NewJWSVerifier(jwksURL string, client *http.Client, opts ...VerifierOption)
 		client = jwksHTTPClient()
 	}
 	f := &httpJWKSFetcher{url: jwksURL, client: client}
-	return newVerifier(f, opts...), nil
+	v := newVerifier(f, opts...)
+	// Propagate the designated JWKS mTLS tenant (if any) down to the concrete HTTP
+	// fetcher; the test seam (newVerifier with a fake fetcher) needs no stamping.
+	f.mtlsTenant = v.mtlsTenant
+	return v, nil
 }
 
 // newVerifier wires a verifier around an arbitrary fetcher (the test seam).
@@ -208,9 +234,18 @@ func lookupKey(set *jose.JSONWebKeySet, kid string) *jose.JSONWebKey {
 type httpJWKSFetcher struct {
 	url    string
 	client *http.Client
+	// mtlsTenant, when non-empty, is stamped onto the fetch context so a vault-backed
+	// mTLS transport selects that tenant's client certificate (SIN-69375).
+	mtlsTenant string
 }
 
 func (f *httpJWKSFetcher) fetch(ctx context.Context) (*jose.JSONWebKeySet, error) {
+	if f.mtlsTenant != "" {
+		// Stamp the designated tenant so the vault mTLS RoundTripper presents that
+		// tenant's certificate on this otherwise-tenantless process-wide fetch. On a
+		// plain (non-mTLS-vault) client the stamp is inert.
+		ctx = withTenant(ctx, f.mtlsTenant)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
 		return nil, err

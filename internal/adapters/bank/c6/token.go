@@ -102,7 +102,10 @@ func (m *tokenManager) token(ctx context.Context, tenantID string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	tok, err := m.fetch(ctx, cred)
+	// The OAuth token endpoint is also behind C6's mTLS, so stamp the tenant onto the
+	// fetch context too — the token handshake then presents the tenant's vault
+	// certificate, keeping the whole tenant call chain on one identity (SIN-69368).
+	tok, err := m.fetch(withTenant(ctx, tenantID), cred)
 	if err != nil {
 		return "", err
 	}

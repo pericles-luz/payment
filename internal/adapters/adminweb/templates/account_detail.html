@@ -27,6 +27,26 @@
   {{if not .Account.IsSelf}}{{template "account_rename_form" .}}{{end}}
 </div>
 
+{{/* Chave-de-Conta (SIN-69380): admin-only generation/rotation of the model (b)
+     account key, rendered only for a real Conta with the mint service wired. The
+     card region (#account-key-card) is swapped wholesale by the display-once result
+     on submit; the key plaintext is shown exactly once and never re-fetched. */}}
+{{if .AccountKeyEnabled}}
+<div id="account-key-card" class="card">
+  <h2>Chave-de-Conta</h2>
+  <p class="muted">Autentica as chamadas de API desta Conta (modelo b). Gerar uma nova chave <strong>substitui a atual imediatamente</strong> — a chave anterior deixa de funcionar.</p>
+  <form class="form"
+        hx-post="/console/accounts/{{.Account.ID}}/account-key"
+        hx-target="#account-key-card" hx-swap="outerHTML"
+        hx-confirm="Isto substitui a chave atual da Conta; a chave anterior deixa de funcionar imediatamente e a nova chave é exibida apenas uma vez. Continuar?">
+    <input type="hidden" name="idempotency_key" value="{{.AccountKeyToken}}">
+    <div class="form-actions">
+      <button class="btn btn--primary" type="submit">Gerar / rotacionar chave-de-Conta</button>
+    </div>
+  </form>
+</div>
+{{end}}
+
 <div class="topbar">
   <h2>Empresas-clientes</h2>
   <a class="btn btn--primary" href="/console/accounts/{{.Account.ID}}/tenants/new"

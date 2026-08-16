@@ -356,6 +356,9 @@ func (p *Provider) GetCharge(ctx context.Context, tenantID, txID string) (ports.
 // centralises the auth + header plumbing the consent/boleto/checkout operations
 // share so each operation file stays focused on its own request/response shape.
 func (p *Provider) authedJSONRequest(ctx context.Context, tenantID, op, method, endpoint string, body []byte, idem string) (*http.Request, error) {
+	// Stamp the tenant so the mTLS transport presents this tenant's vault certificate
+	// on the handshake (SIN-69368); harmless when the client is the plain/stub one.
+	ctx = withTenant(ctx, tenantID)
 	token, err := p.tokens.token(ctx, tenantID)
 	if err != nil {
 		return nil, err

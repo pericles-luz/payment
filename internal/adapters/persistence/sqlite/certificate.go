@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -21,10 +22,13 @@ import (
 //
 // SECURITY (threat C1/C4, ADR-0007): the private key is sealed with secret.Seal
 // (AES-256-GCM) before it touches a column, so the durable bytes are ciphertext. It
-// is WRITE-ONLY — the read path (GetBankCertificateMeta) returns ONLY public metadata
-// re-derived from the stored public leaf certificate; the sealed key is never opened
-// on a read, preserving the CertStore posture. The leaf certificate itself is public,
-// so cert_pem is stored in plaintext (needed to re-derive metadata on read).
+// is WRITE-ONLY — the metadata read path (GetBankCertificateMeta) returns ONLY public
+// metadata re-derived from the stored public leaf certificate and never opens the key.
+// The one exception is LoadTLSCertificate (the live mTLS transport, SIN-69368), which
+// opens the sealed key ONLY to assemble an in-memory tls.Certificate and never returns
+// the key as raw material — the write-only posture holds at the boundary. The leaf
+// certificate itself is public, so cert_pem is stored in plaintext (needed to
+// re-derive metadata on read).
 type CertificateVault struct {
 	db     *sql.DB
 	cipher *secret.Cipher
@@ -61,7 +65,7 @@ func (v *CertificateVault) SetBankCertificate(ctx context.Context, cert ports.Ba
 		return shared.NewValidationError("key_pem", "is required")
 	}
 	cert.BankID = secret.DefaultBankID(cert.BankID)
-	sealedKey, err := v.cipher.Seal([]byte(cert.KeyPEM))
+	sealedKey, err := v.cipher.SealWithAAD([]byte(cert.KeyPEM), secret.RowAAD(cert.TenantID, cert.BankID))
 	if err != nil {
 		return fmt.Errorf("seal private key: %w", err)
 	}
@@ -125,6 +129,51 @@ func (v *CertificateVault) GetBankCertificateMeta(ctx context.Context, tenantID,
 		NotBefore:         meta.NotBefore,
 		NotAfter:          meta.NotAfter,
 	}, nil
+}
+
+// LoadTLSCertificate re-assembles the stored cert/key for (tenantID, bankID) into a
+// ready-to-handshake tls.Certificate for the live C6 mTLS transport (SIN-69368). It
+// is the ONLY read path that OPENS the sealed private key, and even here the key
+// never crosses the boundary as raw material: it is decrypted, fed straight into
+// tls.X509KeyPair, and the plaintext buffer is zeroised before return — the caller
+// receives only the opaque tls.Certificate the TLS stack needs, so the write-only-key
+// posture of the vault is preserved (threat C1/C4). The blob is opened with
+// OpenWithAAD under the SAME RowAAD(tenantID, bankID) binding SetBankCertificate
+// sealed it with (SIN-69369), so a blob moved to another (tenant, bank) row fails
+// GCM authentication and never assembles a certificate. The lookup is
+// exact-match with NO fallback: a missing pair returns shared.ErrNotFound so the
+// transport can fall back to the bootstrap (path §8) certificate (deny-by-default;
+// threat T1/T2). An empty bankID resolves to BankIDC6.
+func (v *CertificateVault) LoadTLSCertificate(ctx context.Context, tenantID, bankID string) (*tls.Certificate, error) {
+	bankID = secret.DefaultBankID(bankID)
+	var certPEM string
+	var sealedKey []byte
+	err := v.db.QueryRowContext(ctx,
+		`SELECT cert_pem, key_pem_sealed FROM bank_certificates WHERE tenant_id = ? AND bank_id = ?`,
+		tenantID, bankID).Scan(&certPEM, &sealedKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, shared.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read bank certificate: %w", err)
+	}
+	keyPEM, err := v.cipher.OpenWithAAD(sealedKey, secret.RowAAD(tenantID, bankID))
+	if err != nil {
+		// A wrong KEK, a tampered blob, or a blob copied from another (tenant, bank)
+		// row fails to open — fail closed rather than presenting a certificate we
+		// cannot back with its key.
+		return nil, fmt.Errorf("open sealed private key: %w", err)
+	}
+	cert, err := tls.X509KeyPair([]byte(certPEM), keyPEM)
+	// Zeroise the decrypted private-key buffer as soon as the pair is built, so the
+	// plaintext key does not linger on the heap beyond the assembly (threat C1/C4).
+	for i := range keyPEM {
+		keyPEM[i] = 0
+	}
+	if err != nil {
+		return nil, fmt.Errorf("assemble mTLS certificate: %w", err)
+	}
+	return &cert, nil
 }
 
 // now returns the current instant formatted as RFC3339-UTC (the adapter-wide layout).

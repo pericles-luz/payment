@@ -5,9 +5,16 @@ import (
 	"testing"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank"
+	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
+
+// newCertProvider is the real in-memory certificate vault used as the C6 mTLS
+// transport's cert source in these wiring tests (SIN-69368). It is empty, so the
+// transport carries no client cert (no §8 path here either) — exactly the launch
+// default — while still satisfying the non-nil provider the wiring requires.
+func newCertProvider() *secret.CertStore { return secret.NewCertStore() }
 
 type noopCreds struct{}
 
@@ -21,7 +28,7 @@ func (noopCreds) GetBankCredential(context.Context, string, string) (ports.BankC
 // Migrated from the pre-multi-bank newBankProvider test (SIN-66022): the wiring now
 // returns a Registry, so the same invariant is asserted on the C6 ProviderSet.
 func TestNewBankRegistrySelectsStubWhenUnset(t *testing.T) {
-	reg, err := newBankRegistry(config.Config{}, noopCreds{})
+	reg, err := newBankRegistry(config.Config{}, noopCreds{}, newCertProvider())
 	if err != nil {
 		t.Fatalf("newBankRegistry: %v", err)
 	}
@@ -55,7 +62,7 @@ func TestNewBankRegistryWrapsC6InPixSettlement(t *testing.T) {
 	cfg.C6.BaseURL = "https://api.c6bank.example"
 	cfg.C6.TokenURL = "https://api.c6bank.example/oauth/token"
 
-	reg, err := newBankRegistry(cfg, noopCreds{})
+	reg, err := newBankRegistry(cfg, noopCreds{}, newCertProvider())
 	if err != nil {
 		t.Fatalf("newBankRegistry: %v", err)
 	}
@@ -88,7 +95,7 @@ func TestNewBankRegistryRejectsInsecureC6(t *testing.T) {
 	cfg.C6.BaseURL = "http://api.c6bank.example"
 	cfg.C6.TokenURL = "https://api.c6bank.example/oauth/token"
 
-	if _, err := newBankRegistry(cfg, noopCreds{}); err == nil {
+	if _, err := newBankRegistry(cfg, noopCreds{}, newCertProvider()); err == nil {
 		t.Fatal("expected an error for a non-HTTPS C6 base URL")
 	}
 }
@@ -102,7 +109,7 @@ func TestNewBankRegistryWiresRecJWKSVerifier(t *testing.T) {
 	cfg.C6.TokenURL = "https://api.c6bank.example/oauth/token"
 	cfg.C6.RecJWKSURL = "https://api.c6bank.example/.well-known/jwks.json"
 
-	if _, err := newBankRegistry(cfg, noopCreds{}); err != nil {
+	if _, err := newBankRegistry(cfg, noopCreds{}, newCertProvider()); err != nil {
 		t.Fatalf("newBankRegistry with a valid recurrence JWKS URL: %v", err)
 	}
 }
@@ -116,7 +123,7 @@ func TestNewBankRegistryRejectsInsecureRecJWKS(t *testing.T) {
 	cfg.C6.TokenURL = "https://api.c6bank.example/oauth/token"
 	cfg.C6.RecJWKSURL = "http://api.c6bank.example/jwks.json"
 
-	if _, err := newBankRegistry(cfg, noopCreds{}); err == nil {
+	if _, err := newBankRegistry(cfg, noopCreds{}, newCertProvider()); err == nil {
 		t.Fatal("expected an error for a non-HTTPS recurrence JWKS URL")
 	}
 }

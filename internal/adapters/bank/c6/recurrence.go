@@ -491,7 +491,7 @@ func (p *Provider) signedRead(ctx context.Context, tenantID, op, endpoint string
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(withTenant(ctx, tenantID), http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, transportError(op)
 	}

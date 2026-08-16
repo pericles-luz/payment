@@ -347,6 +347,58 @@
 <span id="tenant-status-action" hx-swap-oob="true">{{template "status_action" .}}</span>
 {{end}}
 
+{{/* account_key_result is the display-once success card after a Conta-key
+     mint/rotation (SIN-69380). It replaces #account-key-card wholesale and shows the
+     plaintext EXACTLY once with a destructive-action banner; there is no read path,
+     so a refresh/back re-renders the plain card (no secret) — the value cannot be
+     recovered. The embedded form carries a fresh nonce for another rotation. Data is
+     an AccountKeyResultView. */}}
+{{define "account_key_result"}}
+<div id="account-key-card" class="card">
+  <h2>Chave-de-Conta</h2>
+  <div class="banner banner--danger" role="alert">
+    <strong>Chave gerada — mostrada apenas agora.</strong> Copie e guarde em local seguro:
+    ela <strong>não pode ser recuperada</strong> depois. A chave anterior foi invalidada e não funciona mais.
+  </div>
+  <dl class="dl">
+    <dt>Nova chave-de-Conta</dt>
+    <dd><code>{{.Secret}}</code></dd>
+  </dl>
+  <form class="form"
+        hx-post="/console/accounts/{{.AccountID}}/account-key"
+        hx-target="#account-key-card" hx-swap="outerHTML"
+        hx-confirm="Isto substitui a chave que acabou de ser exibida; ela deixa de funcionar imediatamente e a nova chave é exibida apenas uma vez. Continuar?">
+    <input type="hidden" name="idempotency_key" value="{{.Token}}">
+    <div class="form-actions">
+      <button class="btn btn--secondary" type="submit">Rotacionar novamente</button>
+    </div>
+  </form>
+</div>
+{{end}}
+
+{{/* account_key_replay is the friendly 409 shown on a duplicate submit of the same
+     idempotency nonce (SIN-69380): the key was already minted and is display-once, so
+     it is NOT re-shown. It carries NO secret and a fresh nonce to rotate again. Data
+     is an AccountKeyResultView (Secret empty). */}}
+{{define "account_key_replay"}}
+<div id="account-key-card" class="card">
+  <h2>Chave-de-Conta</h2>
+  <div class="banner banner--danger" role="alert">
+    Esta ação já foi processada; a chave é exibida apenas uma vez e não pode ser recuperada.
+    Rotacione novamente para gerar uma nova chave.
+  </div>
+  <form class="form"
+        hx-post="/console/accounts/{{.AccountID}}/account-key"
+        hx-target="#account-key-card" hx-swap="outerHTML"
+        hx-confirm="Isto substitui a chave atual da Conta; a chave anterior deixa de funcionar imediatamente e a nova chave é exibida apenas uma vez. Continuar?">
+    <input type="hidden" name="idempotency_key" value="{{.Token}}">
+    <div class="form-actions">
+      <button class="btn btn--secondary" type="submit">Rotacionar novamente</button>
+    </div>
+  </form>
+</div>
+{{end}}
+
 {{/* account_status_header_oob updates the account detail header (badge + toggle)
      out-of-band after a suspend/activate. Data is an AccountView. */}}
 {{define "account_status_header_oob"}}

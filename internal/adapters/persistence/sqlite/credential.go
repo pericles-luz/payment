@@ -65,13 +65,14 @@ func (v *CredentialVault) Seed(ctx context.Context, creds map[string]ports.BankC
 			// bootstrappable credential; skip it rather than persist a half-row.
 			continue
 		}
-		sealedSecret, err := v.cipher.Seal([]byte(c.Secret))
+		aad := secret.RowAAD(c.TenantID, c.BankID)
+		sealedSecret, err := v.cipher.SealWithAAD([]byte(c.Secret), aad)
 		if err != nil {
 			return fmt.Errorf("seal seed secret: %w", err)
 		}
 		var sealedCK []byte
 		if c.CreditorKey != "" {
-			if sealedCK, err = v.cipher.Seal([]byte(c.CreditorKey)); err != nil {
+			if sealedCK, err = v.cipher.SealWithAAD([]byte(c.CreditorKey), aad); err != nil {
 				return fmt.Errorf("seal seed creditor key: %w", err)
 			}
 		}
@@ -107,7 +108,8 @@ func (v *CredentialVault) GetBankCredential(ctx context.Context, tenantID, bankI
 	if err != nil {
 		return ports.BankCredential{}, fmt.Errorf("read bank credential: %w", err)
 	}
-	sec, err := v.cipher.Open(sealedSec)
+	aad := secret.RowAAD(tenantID, bankID)
+	sec, err := v.cipher.OpenWithAAD(sealedSec, aad)
 	if err != nil {
 		return ports.BankCredential{}, fmt.Errorf("open bank secret: %w", err)
 	}
@@ -118,7 +120,7 @@ func (v *CredentialVault) GetBankCredential(ctx context.Context, tenantID, bankI
 		Secret:   string(sec),
 	}
 	if len(sealedCK) > 0 {
-		ck, err := v.cipher.Open(sealedCK)
+		ck, err := v.cipher.OpenWithAAD(sealedCK, aad)
 		if err != nil {
 			return ports.BankCredential{}, fmt.Errorf("open creditor key: %w", err)
 		}
@@ -143,7 +145,7 @@ func (v *CredentialVault) SetBankCredential(ctx context.Context, tenantID, bankI
 		return shared.NewValidationError("secret", "is required")
 	}
 	bankID = secret.DefaultBankID(bankID)
-	sealed, err := v.cipher.Seal([]byte(secretVal))
+	sealed, err := v.cipher.SealWithAAD([]byte(secretVal), secret.RowAAD(tenantID, bankID))
 	if err != nil {
 		return fmt.Errorf("seal bank secret: %w", err)
 	}
@@ -194,11 +196,11 @@ func (v *CredentialVault) SetCreditorKey(ctx context.Context, tenantID, creditor
 	if err := secret.ValidateCreditorKey(creditorKey); err != nil {
 		return err
 	}
-	sealed, err := v.cipher.Seal([]byte(creditorKey))
+	bankID := secret.DefaultBankID("")
+	sealed, err := v.cipher.SealWithAAD([]byte(creditorKey), secret.RowAAD(tenantID, bankID))
 	if err != nil {
 		return fmt.Errorf("seal creditor key: %w", err)
 	}
-	bankID := secret.DefaultBankID("")
 	res, err := v.db.ExecContext(ctx,
 		`UPDATE bank_credentials SET creditor_key_sealed = ?, updated_at = ?
 		 WHERE tenant_id = ? AND bank_id = ?`,

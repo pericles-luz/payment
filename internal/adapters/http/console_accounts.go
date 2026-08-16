@@ -101,7 +101,12 @@ func (s *Server) consoleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ui.BodyWithOOB(w, http.StatusOK, "account_detail",
-		adminweb.AccountDetailView{Base: s.consoleBase(r, a.Name(), "accounts"), Account: adminweb.ToAccountView(a)},
+		adminweb.AccountDetailView{
+			Base:              s.consoleBase(r, a.Name(), "accounts"),
+			Account:           adminweb.ToAccountView(a),
+			AccountKeyEnabled: s.accountKeyCardEnabled(a),
+			AccountKeyToken:   newIdempotencyToken(),
+		},
 		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: "Conta criada."}})
 }
 
@@ -120,10 +125,75 @@ func (s *Server) consoleAccountDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ui.Page(w, r, "account_detail", http.StatusOK, adminweb.AccountDetailView{
-		Base:    s.consoleBase(r, a.Name(), "accounts"),
-		Account: adminweb.ToAccountView(a),
-		Tenants: adminweb.ToTenantViews(tenants),
+		Base:              s.consoleBase(r, a.Name(), "accounts"),
+		Account:           adminweb.ToAccountView(a),
+		Tenants:           adminweb.ToTenantViews(tenants),
+		AccountKeyEnabled: s.accountKeyCardEnabled(a),
+		AccountKeyToken:   newIdempotencyToken(),
 	})
+}
+
+// accountKeyCardEnabled reports whether the "Chave-de-Conta" card should render:
+// only when the mint service is wired (model (b), ADR-0011 §3) AND the account is a
+// real Conta. A derived self-account (the legacy 1:1 backfill) has no account key —
+// model (b) keys are for real reseller Contas — so its card is hidden and the mint
+// route rejects it (defense-in-depth, see consoleMintAccountKey).
+func (s *Server) accountKeyCardEnabled(a *account.Account) bool {
+	return s.accountKeyMint != nil && !account.IsSelfAccountID(a.ID())
+}
+
+// consoleMintAccountKey generates (create==rotate) the model (b) account key for a
+// real Conta from the admin console, returning the plaintext EXACTLY once
+// (SIN-69380). Unlike the Bearer /admin route, this lives on the /console plane
+// (session + CSRF double-submit); it reuses the SAME app service (accountKeyMint) —
+// no new business logic. The account id comes from the path and is validated via
+// GetAccount (clean 404 for an unknown id). A derived self-account is refused (404):
+// account keys are for real Contas. The plaintext is written straight into the
+// response, never logged, under no-store so a back/refresh/cache never resurfaces it.
+func (s *Server) consoleMintAccountKey(w http.ResponseWriter, r *http.Request) {
+	acctID := chi.URLParam(r, "acctId")
+	if s.accountKeyMint == nil {
+		// Fail closed rather than pretend to mint when model (b) is not wired.
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	a, err := s.console.GetAccount(r.Context(), acctID)
+	if err != nil {
+		s.consoleError(w, err)
+		return
+	}
+	if account.IsSelfAccountID(a.ID()) {
+		// A derived self-account has no account key (model (b) is for real Contas). The
+		// card is hidden for it; a crafted POST is refused with the clean 404.
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	// Idempotency-Key from the per-render hidden nonce (SIN-69184 pattern): a genuine
+	// double-submit resubmits the SAME nonce and collapses to 409 (display-once, no
+	// re-mint); a fresh render carries a fresh nonce → a new rotation. If the nonce is
+	// absent (JS-off / crafted request), fall back to a server nonce so the mandatory
+	// Idempotency-Key contract still holds (each such call mints once).
+	idemKey := strings.TrimSpace(r.PostFormValue("idempotency_key"))
+	if idemKey == "" {
+		idemKey = newIdempotencyToken()
+	}
+	// The response carries the plaintext exactly once; never let it be cached/replayed.
+	w.Header().Set("Cache-Control", "no-store")
+	secret, err := s.accountKeyMint.RotateAccountKey(r.Context(), a.ID(), idemKey)
+	if errors.Is(err, app.ErrAccountKeyAlreadyRotated) {
+		// Replay of the same nonce: the key was already minted and shown once; never
+		// re-show it. htmx does not swap this 4xx (config), so a duplicate submit simply
+		// does not clobber the first response's secret.
+		s.ui.Partial(w, http.StatusConflict, "account_key_replay",
+			adminweb.AccountKeyResultView{AccountID: a.ID(), Token: newIdempotencyToken()})
+		return
+	}
+	if err != nil {
+		s.consoleError(w, err)
+		return
+	}
+	s.ui.Partial(w, http.StatusOK, "account_key_result",
+		adminweb.AccountKeyResultView{AccountID: a.ID(), Secret: secret, Token: newIdempotencyToken()})
 }
 
 func (s *Server) consoleSuspendAccount(w http.ResponseWriter, r *http.Request) {

@@ -39,7 +39,15 @@ type Config struct {
 	// the boot closed (secret.NewCipher rejects a non-32-byte key) rather than
 	// silently degrading to in-memory. This is a secret — it is never logged.
 	BankVaultKey string
-	RabbitURL    string
+	// BankVaultKeyPrevious is the hex-encoded AES-256 KEK that PROTECTED the vault
+	// rows BEFORE a key rotation. It is consumed ONLY by the offline vault-reseal
+	// command (SIN-69369): to rotate the KEK, set PAYMENT_BANK_VAULT_KEY to the NEW
+	// key and PAYMENT_BANK_VAULT_KEY_PREVIOUS to the outgoing key, then run the
+	// re-seal so every row is decrypted with the old key and re-encrypted with the
+	// new one. The running api process never reads it. Unset in steady state; it is
+	// a secret and is never logged. See docs/ops/bank-vault-kek-rotation-runbook.md.
+	BankVaultKeyPrevious string
+	RabbitURL            string
 	// SecureCookies controls the Secure attribute on cookies the HTTP adapter
 	// sets (CSRF token, and the admin-UI session cookie). It is a deployment fact,
 	// NOT a per-request decision: the service runs plaintext ListenAndServe behind
@@ -138,6 +146,16 @@ type C6Config struct {
 	// document, the correct interim until F4 go-live (SIN-66061). It is a URL, never
 	// a secret: only public keys are served from it.
 	RecJWKSURL string
+	// RecJWKSMTLSTenant designates which tenant's vault mTLS certificate is presented
+	// on the (process-wide) JWKS fetch. The JWKS endpoint has no natural tenant, so a
+	// request to it stamps no tenant and the mTLS transport would fall back to the §8
+	// bootstrap certificate — which is absent in a vault-only deployment, making the
+	// handshake (and thus every recurrence signature verification) fail closed
+	// (SIN-69375, follow-up of SIN-69368). Setting this to a tenant that owns a vault
+	// certificate makes the JWKS fetch present that certificate. Empty (the default)
+	// keeps the prior behaviour: the fetch uses the §8 bootstrap cert when configured,
+	// else presents no client cert. It is not a secret — only the tenant identifier.
+	RecJWKSMTLSTenant string
 	// RateLimitRPS and RateLimitBurst configure the proactive outbound token bucket
 	// that paces requests to C6 (Termo A5 — no DoS-shaped load). Zero/unparseable ⇒
 	// the adapter's conservative defaults. MaxRetries bounds retries on a retryable
@@ -162,6 +180,7 @@ func FromEnv() Config {
 		WebhookRefs:           parseKV(os.Getenv("PAYMENT_WEBHOOK_REFS")),
 		BankCreds:             bankCreds,
 		BankVaultKey:          os.Getenv("PAYMENT_BANK_VAULT_KEY"),
+		BankVaultKeyPrevious:  os.Getenv("PAYMENT_BANK_VAULT_KEY_PREVIOUS"),
 		RabbitURL:             os.Getenv("PAYMENT_RABBIT_URL"),
 		SecureCookies:         getenvBool("PAYMENT_SECURE_COOKIES", true),
 		TrustedProxyHops:      getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
@@ -170,16 +189,17 @@ func FromEnv() Config {
 		ConsoleUsername:       getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
 		ConsoleBootstrapToken: os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
 		C6: C6Config{
-			BaseURL:        os.Getenv("PAYMENT_C6_BASE_URL"),
-			TokenURL:       os.Getenv("PAYMENT_C6_TOKEN_URL"),
-			Scope:          os.Getenv("PAYMENT_C6_SCOPE"),
-			Timeout:        getenvDuration("PAYMENT_C6_TIMEOUT", 15*time.Second),
-			ClientCertPath: os.Getenv("PAYMENT_C6_CLIENT_CERT"),
-			ClientKeyPath:  os.Getenv("PAYMENT_C6_CLIENT_KEY"),
-			RecJWKSURL:     os.Getenv("PAYMENT_C6_REC_JWKS_URL"),
-			RateLimitRPS:   getenvFloat("PAYMENT_C6_RATE_LIMIT_RPS", 0),
-			RateLimitBurst: getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
-			MaxRetries:     getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
+			BaseURL:           os.Getenv("PAYMENT_C6_BASE_URL"),
+			TokenURL:          os.Getenv("PAYMENT_C6_TOKEN_URL"),
+			Scope:             os.Getenv("PAYMENT_C6_SCOPE"),
+			Timeout:           getenvDuration("PAYMENT_C6_TIMEOUT", 15*time.Second),
+			ClientCertPath:    os.Getenv("PAYMENT_C6_CLIENT_CERT"),
+			ClientKeyPath:     os.Getenv("PAYMENT_C6_CLIENT_KEY"),
+			RecJWKSURL:        os.Getenv("PAYMENT_C6_REC_JWKS_URL"),
+			RecJWKSMTLSTenant: os.Getenv("PAYMENT_C6_REC_JWKS_MTLS_TENANT"),
+			RateLimitRPS:      getenvFloat("PAYMENT_C6_RATE_LIMIT_RPS", 0),
+			RateLimitBurst:    getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
+			MaxRetries:        getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
 		},
 		STGSeed: getenvBool("PAYMENT_STG_SEED", false),
 	}

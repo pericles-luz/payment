@@ -190,7 +190,7 @@ func (p *Provider) CreateImmediateCharge(ctx context.Context, tenantID string, r
 	}
 
 	endpoint := p.baseURL + pixCobPath + "/" + url.PathEscape(txid)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(withTenant(ctx, tenantID), http.MethodPut, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return ports.PixChargeResult{}, transportError("create_pix")
 	}
@@ -219,7 +219,7 @@ func (p *Provider) GetImmediateCharge(ctx context.Context, tenantID, txID string
 	}
 
 	endpoint := p.baseURL + pixCobPath + "/" + url.PathEscape(txID)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	httpReq, err := http.NewRequestWithContext(withTenant(ctx, tenantID), http.MethodGet, endpoint, nil)
 	if err != nil {
 		return ports.PixChargeResult{}, transportError("get_pix")
 	}
@@ -274,7 +274,7 @@ func (p *Provider) ListImmediateCharges(ctx context.Context, tenantID string, fi
 	}
 
 	endpoint := p.baseURL + pixCobPath + "?" + q.Encode()
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	httpReq, err := http.NewRequestWithContext(withTenant(ctx, tenantID), http.MethodGet, endpoint, nil)
 	if err != nil {
 		return ports.PixChargeList{}, transportError("list_pix")
 	}

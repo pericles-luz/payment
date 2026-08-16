@@ -553,6 +553,11 @@ func (s *Server) Router() http.Handler {
 				r.Patch("/accounts/{acctId}", s.consoleRenameAccount)
 				r.Post("/accounts/{acctId}/tenants", s.consoleCreateAccountTenant)
 				r.Post("/accounts/{acctId}/invoices", s.consoleGenerateAccountInvoices)
+				// Generate/rotate a Conta's model (b) account key from the console
+				// (SIN-69380). Session + CSRF (this admin mutation group); the browser
+				// never touches the Bearer /admin/accounts/{id}/account-key route. Reuses
+				// the same accountKeyMint service; returns the plaintext display-once.
+				r.Post("/accounts/{acctId}/account-key", s.consoleMintAccountKey)
 				r.Post("/tenants", s.consoleCreateTenant)
 				r.Post("/tenants/{id}/suspend", s.consoleSuspendTenant)
 				r.Post("/tenants/{id}/activate", s.consoleActivateTenant)

@@ -86,7 +86,7 @@ func run() error {
 	// real C6 adapter when its endpoints are configured, otherwise the in-memory stub
 	// (local dev / tests). The C6 adapter rejects non-HTTPS endpoints, so a
 	// misconfigured URL fails startup rather than silently downgrading the transport.
-	registry, err := newBankRegistry(cfg, creds)
+	registry, err := newBankRegistry(cfg, creds, certs)
 	if err != nil {
 		return err
 	}
@@ -319,11 +319,16 @@ type credentialAdapter interface {
 
 // certificateAdapter is the union of mTLS-certificate ports the wiring depends on.
 // Both the in-memory secret.CertStore and the durable sqlite.CertificateVault satisfy
-// it.
+// it. It also carries c6.CertProvider (LoadTLSCertificate) so the live C6 transport
+// can source its client certificate from the vault, keyed per tenant (SIN-69368);
+// the compile-time assertion that this union satisfies c6.CertProvider is the call
+// to newBankRegistry, which passes a certificateAdapter where a c6.CertProvider is
+// expected.
 type certificateAdapter interface {
 	ports.BankCertificateWriter
 	ports.BankCertificateReader
 	ports.BankCertificateDeleter
+	c6.CertProvider
 }
 
 // newBankVaults selects the bank credential + certificate vault adapters (SIN-69366).
@@ -372,7 +377,7 @@ func newBankVaults(ctx context.Context, cfg config.Config, db *sql.DB) (credenti
 // wrapped in PixSettlementProvider for the generic Bank port (charge creation +
 // settlement reconcile via the verified PIX shape) while the raw provider backs the
 // immediate-PIX-charge port (PixService must speak the BACEN PIX shape directly).
-func newBankRegistry(cfg config.Config, creds ports.CredentialStore) (*bank.Registry, error) {
+func newBankRegistry(cfg config.Config, creds ports.CredentialStore, certs c6.CertProvider) (*bank.Registry, error) {
 	reg := bank.NewRegistry()
 	if cfg.C6.BaseURL == "" {
 		log.Print("api: PAYMENT_C6_BASE_URL not set — using in-memory bank stub")
@@ -391,18 +396,23 @@ func newBankRegistry(cfg config.Config, creds ports.CredentialStore) (*bank.Regi
 		RateLimitBurst:     cfg.C6.RateLimitBurst,
 		MaxRetries:         cfg.C6.MaxRetries,
 	}
-	// C6 requires an mTLS client certificate on the connection. When a cert/key
-	// path is configured, build a client-cert transport and inject it; a load
-	// failure fails the boot closed (explicit error) rather than silently
-	// connecting without the cert. Both paths empty ⇒ no client cert (the default
-	// transport), preserving stub/dev behaviour.
+	// C6 requires an mTLS client certificate on the connection. The transport now
+	// sources that certificate from the DURABLE vault, selected PER REQUEST by tenant
+	// (SIN-69368), so a self-serve cert (PUT /v1/bank-certificate) actually feeds the
+	// live handshake — durability now equals consumption. A tenant with no vault row
+	// falls back to the §8 path certificate (env-as-bootstrap, mirroring the credential
+	// vault); a load failure of that path fails the boot closed. Both the vault and the
+	// §8 path empty ⇒ no client cert presented, preserving stub/dev behaviour. The
+	// per-tenant transports keep tenant identities off each other's connections.
+	httpc, err := c6.NewVaultMTLSClient(certs, ports.BankIDC6, cfg.C6.ClientCertPath, cfg.C6.ClientKeyPath, cfg.C6.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	c6cfg.HTTPClient = httpc
 	if cfg.C6.ClientCertPath != "" || cfg.C6.ClientKeyPath != "" {
-		httpc, err := c6.MTLSHTTPClient(cfg.C6.ClientCertPath, cfg.C6.ClientKeyPath, cfg.C6.Timeout)
-		if err != nil {
-			return nil, err
-		}
-		c6cfg.HTTPClient = httpc
-		log.Print("api: C6 mTLS client certificate loaded")
+		log.Print("api: C6 mTLS transport wired (vault-per-tenant with §8 path bootstrap fallback)")
+	} else {
+		log.Print("api: C6 mTLS transport wired (vault-per-tenant; no §8 path bootstrap configured)")
 	}
 	// PIX Automático (Recorrência) reads are JWS-signed; wire the concrete verifier
 	// when a JWKS URL is configured. The verifier reuses the C6 HTTP client (so a
@@ -411,13 +421,28 @@ func newBankRegistry(cfg config.Config, creds ports.CredentialStore) (*bank.Regi
 	// closed. When PAYMENT_C6_REC_JWKS_URL is unset the verifier stays nil and the
 	// recurrence reads fail secure (ErrUnavailable) — the correct interim until F4
 	// go-live (SIN-66061).
+	//
+	// The JWKS endpoint is process-wide with no natural tenant, so its request stamps
+	// none and the vault mTLS transport would fall back to the §8 bootstrap cert; on a
+	// vault-only deployment that cert is absent and the handshake fails closed
+	// (SIN-69375). PAYMENT_C6_REC_JWKS_MTLS_TENANT designates a tenant whose vault cert
+	// is presented on the fetch so recurrence verification works without a §8 bootstrap
+	// cert. Empty keeps the prior tenantless behaviour.
 	if cfg.C6.RecJWKSURL != "" {
-		verifier, err := c6.NewJWSVerifier(cfg.C6.RecJWKSURL, c6cfg.HTTPClient)
+		var vopts []c6.VerifierOption
+		if cfg.C6.RecJWKSMTLSTenant != "" {
+			vopts = append(vopts, c6.WithMTLSTenant(cfg.C6.RecJWKSMTLSTenant))
+		}
+		verifier, err := c6.NewJWSVerifier(cfg.C6.RecJWKSURL, c6cfg.HTTPClient, vopts...)
 		if err != nil {
 			return nil, err
 		}
 		c6cfg.RecurrenceVerifier = verifier
-		log.Print("api: C6 recurrence JWS verifier configured")
+		if cfg.C6.RecJWKSMTLSTenant != "" {
+			log.Print("api: C6 recurrence JWS verifier configured (JWKS fetch uses designated mTLS tenant)")
+		} else {
+			log.Print("api: C6 recurrence JWS verifier configured")
+		}
 	}
 	c6p, err := c6.New(c6cfg, creds)
 	if err != nil {
