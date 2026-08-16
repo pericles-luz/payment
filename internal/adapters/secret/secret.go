@@ -34,6 +34,19 @@ func credKey(tenantID, bankID string) string {
 	return tenantID + "\x00" + defaultBankID(bankID)
 }
 
+// DefaultBankID is the exported form of defaultBankID: it resolves an unspecified
+// (empty) bank slug to the retro-compatible default BankIDC6. It exists so a durable
+// CredentialStore adapter in another package (e.g. the SQLite vault, SIN-69366) keys
+// on the SAME normalised (tenant, bank) pair as this in-memory Store — the two
+// adapters are behaviourally interchangeable behind the port.
+func DefaultBankID(bankID string) string { return defaultBankID(bankID) }
+
+// ValidateCreditorKey is the exported form of validateCreditorKey: it enforces the
+// PIX-key shape check at the credential write boundary. Exported so the durable
+// SQLite CreditorKeyWriter (SIN-69366) applies the IDENTICAL validation as this
+// in-memory adapter — a swap of backing store must never relax input validation.
+func ValidateCreditorKey(key string) error { return validateCreditorKey(key) }
+
 // defaultBankID resolves an unspecified (empty) bank to the retro-compatible
 // default BankIDC6, so pre-multi-bank config and call sites keep working unchanged
 // (ADR-0007). A non-empty bankID is returned verbatim — the registry/allowlist

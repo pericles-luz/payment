@@ -9,7 +9,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	stdhttp "net/http"
 	"os"
@@ -60,13 +63,18 @@ func run() error {
 	// runs when the PAYMENT_ACCOUNT_KEY_SELECTOR flag is on (model (b)), so building
 	// it here is inert in the default model (a) deployment.
 	accountKeys := sqlite.NewAccountKeyStore(db, system.Clock{})
-	creds := secret.NewStore(cfg.BankCreds)
-	// Per-(tenant,bank) mTLS certificate vault (SIN-66087): the admin console writes
-	// the cert/key here as write-only material with public metadata exposed. It is
-	// in-memory like the OAuth credential store today; an encrypted-at-rest backing
-	// is a separable follow-up. The live C6 mTLS transport still loads from the
-	// runbook §8 disk path until the transport-swap follow-up lands.
-	certs := secret.NewCertStore()
+	// Bank OAuth-credential and mTLS-certificate vaults. With PAYMENT_BANK_VAULT_KEY
+	// set (a 32-byte AES-256 KEK, hex), both are the DURABLE, encrypted-at-rest
+	// SQLite adapters (SIN-69366): a runtime-configured C6 credential/cert survives a
+	// restart, and the env seeds a fresh deployment once (env-as-bootstrap,
+	// DB-as-durable-source). With the key unset they fall back to the in-memory vaults
+	// (previous behaviour, fully backward compatible) — runtime edits then do NOT
+	// survive a restart. A set-but-malformed key fails the boot closed rather than
+	// silently degrading to in-memory.
+	creds, certs, err := newBankVaults(ctx, cfg, db)
+	if err != nil {
+		return err
+	}
 	// Durable, append-only audit trail for privileged admin-plane and money-movement
 	// actions (SIN-66025): the SQLite Store implements ports.AuditLog, so entries
 	// survive a restart and — when appended through the unit of work — commit
@@ -297,6 +305,57 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// credentialAdapter is the union of bank OAuth-credential ports the wiring depends
+// on. Both the in-memory secret.Store and the durable sqlite.CredentialVault satisfy
+// it, so newBankVaults can return either behind this one type.
+type credentialAdapter interface {
+	ports.CredentialStore
+	ports.CredentialWriter
+	ports.CredentialDeleter
+	ports.CreditorKeyWriter
+}
+
+// certificateAdapter is the union of mTLS-certificate ports the wiring depends on.
+// Both the in-memory secret.CertStore and the durable sqlite.CertificateVault satisfy
+// it.
+type certificateAdapter interface {
+	ports.BankCertificateWriter
+	ports.BankCertificateReader
+	ports.BankCertificateDeleter
+}
+
+// newBankVaults selects the bank credential + certificate vault adapters (SIN-69366).
+// When PAYMENT_BANK_VAULT_KEY is set it decodes the hex AES-256 KEK, builds the
+// sealing cipher (a wrong-size/garbage key fails the boot closed), and returns the
+// DURABLE, encrypted-at-rest SQLite vaults — seeding the credential vault from env
+// ONLY where a (tenant, bank) row is absent (env-as-bootstrap, DB-as-durable-source).
+// When the key is unset it returns the in-memory vaults (previous behaviour), logging
+// the restart-durability caveat so an operator running a real deployment without a
+// key sees it. The two vaults SHARE one cipher (one KEK for all bank secrets at rest).
+func newBankVaults(ctx context.Context, cfg config.Config, db *sql.DB) (credentialAdapter, certificateAdapter, error) {
+	if cfg.BankVaultKey == "" {
+		log.Print("api: bank secret vault is IN-MEMORY (PAYMENT_BANK_VAULT_KEY unset) — runtime-configured credentials/certificates do NOT survive a restart")
+		return secret.NewStore(cfg.BankCreds), secret.NewCertStore(), nil
+	}
+	key, err := hex.DecodeString(cfg.BankVaultKey)
+	if err != nil {
+		// Do not include the value in the error (it is key material).
+		return nil, nil, fmt.Errorf("api: PAYMENT_BANK_VAULT_KEY is not valid hex")
+	}
+	cipher, err := secret.NewCipher(key)
+	if err != nil {
+		// secret.ErrKeySize etc. — never echo the key.
+		return nil, nil, fmt.Errorf("api: PAYMENT_BANK_VAULT_KEY invalid: %w", err)
+	}
+	credVault := sqlite.NewCredentialVault(db, cipher, system.Clock{})
+	if err := credVault.Seed(ctx, cfg.BankCreds); err != nil {
+		return nil, nil, fmt.Errorf("api: seed durable credential vault: %w", err)
+	}
+	certVault := sqlite.NewCertificateVault(db, cipher, system.Clock{})
+	log.Print("api: durable encrypted-at-rest bank secret vault ENABLED (PAYMENT_BANK_VAULT_KEY set) — credentials/certificates survive a restart")
+	return credVault, certVault, nil
 }
 
 // newBankRegistry builds the multi-bank registry (SIN-66022): one ProviderSet per

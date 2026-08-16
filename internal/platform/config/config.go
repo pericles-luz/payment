@@ -30,7 +30,16 @@ type Config struct {
 	// (failure-closed). This is a secret — never log the ref or the full URL.
 	WebhookRefs map[string]string               // tenantRef -> tenantID
 	BankCreds   map[string]ports.BankCredential // tenantID -> credential
-	RabbitURL   string
+	// BankVaultKey is the hex-encoded AES-256 key-encryption key for the durable,
+	// encrypted-at-rest bank credential/certificate vault (SIN-69366). When set (64
+	// hex chars = 32 bytes), cmd wiring swaps the in-memory secret vaults for the
+	// SQLite-backed CredentialVault/CertificateVault, so a runtime-configured C6
+	// credential/cert survives a restart. When UNSET the in-memory vaults are used
+	// (previous behaviour, fully backward compatible). A set-but-malformed key fails
+	// the boot closed (secret.NewCipher rejects a non-32-byte key) rather than
+	// silently degrading to in-memory. This is a secret — it is never logged.
+	BankVaultKey string
+	RabbitURL    string
 	// SecureCookies controls the Secure attribute on cookies the HTTP adapter
 	// sets (CSRF token, and the admin-UI session cookie). It is a deployment fact,
 	// NOT a per-request decision: the service runs plaintext ListenAndServe behind
@@ -152,6 +161,7 @@ func FromEnv() Config {
 		OperatorTokens:        splitNonEmpty(os.Getenv("PAYMENT_OPERATOR_TOKENS")),
 		WebhookRefs:           parseKV(os.Getenv("PAYMENT_WEBHOOK_REFS")),
 		BankCreds:             bankCreds,
+		BankVaultKey:          os.Getenv("PAYMENT_BANK_VAULT_KEY"),
 		RabbitURL:             os.Getenv("PAYMENT_RABBIT_URL"),
 		SecureCookies:         getenvBool("PAYMENT_SECURE_COOKIES", true),
 		TrustedProxyHops:      getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
