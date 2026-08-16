@@ -272,7 +272,13 @@ func run() error {
 		// /admin/accounts/{id}/account-key (bootstrap). Backed by the same durable,
 		// hash-at-rest account-key store; the plaintext is returned once and never
 		// stored/logged (display-once).
-		AccountKeyMint: app.NewAccountKeyService(accountKeys, system.Clock{}),
+		// Audit the mint from the shared choke-point (SIN-69386) so both write
+		// surfaces (this admin bootstrap route + the HTML console) leave one
+		// account-scoped account.key_mint trail entry per real mint —
+		// who/which-Conta/when, never the secret. The durable SQLite store
+		// implements ports.AuditLog.
+		AccountKeyMint: app.NewAccountKeyService(accountKeys, system.Clock{},
+			app.WithAccountKeyAudit(store, system.IDProvider{})),
 		// Model (b) empresa-cliente provisioning (ADR-0011 §4 / SIN-69281): a reseller
 		// Conta creates a new empresa-cliente via POST /v1/clients, bound to the Account
 		// resolved from its account-key (server-side, never the body — A01/T6). Backed by
