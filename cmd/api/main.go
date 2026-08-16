@@ -71,7 +71,15 @@ func run() error {
 	// (previous behaviour, fully backward compatible) — runtime edits then do NOT
 	// survive a restart. A set-but-malformed key fails the boot closed rather than
 	// silently degrading to in-memory.
-	creds, certs, err := newBankVaults(ctx, cfg, db)
+	// Build the sealing cipher once (nil when PAYMENT_BANK_VAULT_KEY is unset) and
+	// share it across every encrypted-at-rest vault: the bank credential/cert vaults
+	// AND the durable console credential store (SIN-69432). One KEK for all secrets
+	// at rest; a set-but-malformed key fails the boot closed.
+	vaultCipher, err := newVaultCipher(cfg)
+	if err != nil {
+		return err
+	}
+	creds, certs, err := newBankVaults(ctx, cfg, db, vaultCipher)
 	if err != nil {
 		return err
 	}
@@ -199,14 +207,31 @@ func run() error {
 
 	// Self-contained console login (ADR-0001 Opção B, SIN-69265): username +
 	// password + TOTP over a first-party session cookie, so /console is reachable by
-	// a browser without the edge injecting a bearer. The store is in-memory behind
-	// the app ports — a restart drops sessions AND the provisioned credential (a
-	// documented trade-off; the durable sqlite-backed adapter is the follow-up).
-	// Bootstrap is failure-closed: with PAYMENT_CONSOLE_BOOTSTRAP_TOKEN unset,
-	// first-access provisioning is disabled entirely, so it can never be an
-	// anonymous land-grab. The existing admin Bearer transport keeps working.
-	consoleAuthStore := consoleauthstore.NewMemStore()
-	consoleAuth := app.NewConsoleAuthService(consoleAuthStore, consoleAuthStore, consoleAuthStore, system.Clock{}, app.ConsoleAuthConfig{
+	// a browser without the edge injecting a bearer. Bootstrap is failure-closed: with
+	// PAYMENT_CONSOLE_BOOTSTRAP_TOKEN unset, first-access provisioning is disabled
+	// entirely, so it can never be an anonymous land-grab. The existing admin Bearer
+	// transport keeps working.
+	//
+	// Durability (SIN-69432): with the vault cipher present (PAYMENT_BANK_VAULT_KEY
+	// set) the CREDENTIAL and TOTP replay guard are the durable, encrypted-at-rest
+	// SQLite adapters, so the provisioned credential SURVIVES a restart — the board's
+	// console access no longer breaks on every CD redeploy (caveat SIN-69261 closed).
+	// SESSIONS stay in-memory (losing a session on restart just means re-login, a
+	// minor annoyance; the credential is the load-bearing state). Without the cipher
+	// there is no KEK to seal the TOTP secret at rest, so we fall back to the fully
+	// in-memory store (previous behaviour) — a restart then re-drops the credential,
+	// which the bank-vault log line above already flags.
+	consoleSessions := consoleauthstore.NewMemStore()
+	var consoleCreds app.ConsoleCredentialStore = consoleSessions
+	var consoleReplay app.TOTPReplayStore = consoleSessions
+	if vaultCipher != nil {
+		consoleCreds = sqlite.NewConsoleCredentialVault(db, vaultCipher, system.Clock{})
+		consoleReplay = sqlite.NewConsoleReplayStore(db, system.Clock{})
+		log.Print("api: durable encrypted-at-rest console credential store ENABLED — the console login survives a restart")
+	} else {
+		log.Print("api: console credential store is IN-MEMORY (PAYMENT_BANK_VAULT_KEY unset) — /console/bootstrap must be re-run after each restart")
+	}
+	consoleAuth := app.NewConsoleAuthService(consoleCreds, consoleSessions, consoleReplay, system.Clock{}, app.ConsoleAuthConfig{
 		Username:       cfg.ConsoleUsername,
 		BootstrapToken: cfg.ConsoleBootstrapToken,
 	})
@@ -337,28 +362,41 @@ type certificateAdapter interface {
 	c6.CertProvider
 }
 
-// newBankVaults selects the bank credential + certificate vault adapters (SIN-69366).
-// When PAYMENT_BANK_VAULT_KEY is set it decodes the hex AES-256 KEK, builds the
-// sealing cipher (a wrong-size/garbage key fails the boot closed), and returns the
-// DURABLE, encrypted-at-rest SQLite vaults — seeding the credential vault from env
-// ONLY where a (tenant, bank) row is absent (env-as-bootstrap, DB-as-durable-source).
-// When the key is unset it returns the in-memory vaults (previous behaviour), logging
-// the restart-durability caveat so an operator running a real deployment without a
-// key sees it. The two vaults SHARE one cipher (one KEK for all bank secrets at rest).
-func newBankVaults(ctx context.Context, cfg config.Config, db *sql.DB) (credentialAdapter, certificateAdapter, error) {
+// newVaultCipher builds the AES-256-GCM sealing cipher from PAYMENT_BANK_VAULT_KEY,
+// the single KEK shared by every encrypted-at-rest vault (bank credentials, bank
+// certificates, and the console credential store — SIN-69432). It returns a nil
+// cipher (no error) when the key is UNSET, which every caller reads as "keep the
+// in-memory adapter" (previous behaviour, fully backward compatible). A SET-but-
+// malformed key (bad hex or wrong length) fails the boot CLOSED rather than silently
+// degrading to in-memory — a deployment that meant to encrypt at rest must not run
+// unencrypted by accident. The key value is never echoed in an error (it is key
+// material).
+func newVaultCipher(cfg config.Config) (*secret.Cipher, error) {
 	if cfg.BankVaultKey == "" {
-		log.Print("api: bank secret vault is IN-MEMORY (PAYMENT_BANK_VAULT_KEY unset) — runtime-configured credentials/certificates do NOT survive a restart")
-		return secret.NewStore(cfg.BankCreds), secret.NewCertStore(), nil
+		return nil, nil
 	}
 	key, err := hex.DecodeString(cfg.BankVaultKey)
 	if err != nil {
-		// Do not include the value in the error (it is key material).
-		return nil, nil, fmt.Errorf("api: PAYMENT_BANK_VAULT_KEY is not valid hex")
+		return nil, fmt.Errorf("api: PAYMENT_BANK_VAULT_KEY is not valid hex")
 	}
 	cipher, err := secret.NewCipher(key)
 	if err != nil {
-		// secret.ErrKeySize etc. — never echo the key.
-		return nil, nil, fmt.Errorf("api: PAYMENT_BANK_VAULT_KEY invalid: %w", err)
+		return nil, fmt.Errorf("api: PAYMENT_BANK_VAULT_KEY invalid: %w", err)
+	}
+	return cipher, nil
+}
+
+// newBankVaults selects the bank credential + certificate vault adapters (SIN-69366).
+// With a non-nil cipher (PAYMENT_BANK_VAULT_KEY set) it returns the DURABLE,
+// encrypted-at-rest SQLite vaults — seeding the credential vault from env ONLY where a
+// (tenant, bank) row is absent (env-as-bootstrap, DB-as-durable-source). With a nil
+// cipher it returns the in-memory vaults (previous behaviour), logging the
+// restart-durability caveat so an operator running a real deployment without a key
+// sees it. The cipher is built once by newVaultCipher and shared across all vaults.
+func newBankVaults(ctx context.Context, cfg config.Config, db *sql.DB, cipher *secret.Cipher) (credentialAdapter, certificateAdapter, error) {
+	if cipher == nil {
+		log.Print("api: bank secret vault is IN-MEMORY (PAYMENT_BANK_VAULT_KEY unset) — runtime-configured credentials/certificates do NOT survive a restart")
+		return secret.NewStore(cfg.BankCreds), secret.NewCertStore(), nil
 	}
 	credVault := sqlite.NewCredentialVault(db, cipher, system.Clock{})
 	if err := credVault.Seed(ctx, cfg.BankCreds); err != nil {
