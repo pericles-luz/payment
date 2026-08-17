@@ -118,7 +118,10 @@
   <tr class="empty-row"><td colspan="3"><div class="empty"><p class="muted">Sem consumo registrado para as empresas-clientes desta Conta no período.</p></div></td></tr>
   {{- end -}}
   </tbody>
-  {{if .Rows}}<tfoot><tr><th scope="row">Total da Conta</th><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td></tr></tfoot>{{end}}
+  {{/* Always render the grand total, even with zero records, so a valid Conta with
+       no billing shows an explicit "Total da Conta: R$ 0,00" (SIN-69506) rather than
+       reading as an error. */}}
+  <tfoot><tr><th scope="row">Total da Conta</th><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td></tr></tfoot>
 </table>
 {{end}}
 

@@ -360,6 +360,47 @@ func TestConsoleAccountsUnavailable(t *testing.T) {
 	}
 }
 
+// TestConsoleAccountConsumption_ExistenceCheck pins the SIN-69506 contract at the
+// use-case layer: a VALID account with zero ledger entries is a 200-shaped empty
+// report (TotalCents=0), never a 404 — while a NONEXISTENT account wraps
+// ErrNotFound so the screen 404s and account enumeration stays closed. The check
+// lives inside AccountConsumptionInRange (mirroring ConsumptionInRange for tenants)
+// so every caller — page, filter-swap partial, CSV export — inherits it.
+func TestConsoleAccountConsumption_ExistenceCheck(t *testing.T) {
+	t.Parallel()
+	svc, store := newAccountConsole()
+	ctx := context.Background()
+
+	// A valid, seeded account that has never billed a single call.
+	seedAccount(t, store, "verz-1", "Verz Pagamentos", true, 100)
+
+	rep, err := svc.AccountConsumptionInRange(ctx, "verz-1", app.ConsumptionRange{})
+	if err != nil {
+		t.Fatalf("valid account with zero records must not error: %v", err)
+	}
+	if rep.AccountID != "verz-1" || rep.TotalCalls != 0 || rep.TotalCents != 0 || len(rep.Tenants) != 0 {
+		t.Fatalf("zero-records report = %+v, want empty totals for verz-1", rep)
+	}
+
+	// AccountConsumption (unbounded convenience) behaves identically.
+	if r2, err := svc.AccountConsumption(ctx, "verz-1"); err != nil || r2.TotalCents != 0 {
+		t.Fatalf("AccountConsumption zero-records = %+v, %v", r2, err)
+	}
+
+	// A nonexistent account resolves to ErrNotFound (handler maps to 404) — the
+	// existence check now runs inside the use-case, not only at the handler.
+	if _, err := svc.AccountConsumptionInRange(ctx, "ghost", app.ConsumptionRange{}); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("nonexistent account err = %v, want ErrNotFound", err)
+	}
+
+	// Once the account bills something, the report reflects it (guard didn't
+	// swallow real data).
+	appendLedgerAcct(t, store, "verz-1", "t1", "POST /v1/charges", 250, 1)
+	if rep, err := svc.AccountConsumptionInRange(ctx, "verz-1", app.ConsumptionRange{}); err != nil || rep.TotalCents != 250 {
+		t.Fatalf("with one entry = %+v, %v, want 250 cents", rep, err)
+	}
+}
+
 // bindTenant re-parents a seeded tenant to an owning account by rehydrating it with
 // the owner (mirrors what CreateTenantUnderAccount persists), for list-count setup.
 func bindTenant(store *persistence.Store, tenantID, accountID string) error {

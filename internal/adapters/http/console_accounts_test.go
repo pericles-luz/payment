@@ -218,6 +218,36 @@ func TestConsoleAccountConsumptionAndCSV(t *testing.T) {
 	}
 }
 
+// TestConsoleAccountConsumptionZeroRecords is the SIN-69506 acceptance at the HTTP
+// boundary: a VALID account that has never billed a call renders 200 with a
+// R$ 0,00 total (not 404), while a NONEXISTENT account still 404s so account
+// enumeration stays closed. The fixture seeds "verz-1" but no ledger entries.
+func TestConsoleAccountConsumptionZeroRecords(t *testing.T) {
+	t.Parallel()
+	f := newAccountFixture(t)
+
+	// Valid account, zero ledger entries → 200 with a zero total.
+	rec := consoleGet(t, f.handler, "/console/accounts/verz-1/consumption?start_date=1970-01-01&end_date=1970-01-01", operatorToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("zero-records consumption = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Total da Conta") || !strings.Contains(body, "0,00") {
+		t.Fatalf("zero-records body missing R$ 0,00 total: %s", body)
+	}
+
+	// CSV export of a zero-records account is a valid 200 (empty rollup, headers only).
+	csv := consoleGet(t, f.handler, "/console/accounts/verz-1/consumption.csv?start_date=1970-01-01&end_date=1970-01-01", operatorToken)
+	if csv.Code != http.StatusOK {
+		t.Fatalf("zero-records csv = %d, want 200", csv.Code)
+	}
+
+	// A nonexistent account 404s (anti-enumeration preserved).
+	if miss := consoleGet(t, f.handler, "/console/accounts/ghost/consumption?start_date=1970-01-01&end_date=1970-01-01", operatorToken); miss.Code != http.StatusNotFound {
+		t.Fatalf("nonexistent account consumption = %d, want 404", miss.Code)
+	}
+}
+
 func TestConsoleAccountInvoicesBatch(t *testing.T) {
 	t.Parallel()
 	f := newAccountFixture(t)
