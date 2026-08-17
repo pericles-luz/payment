@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mrand "math/rand/v2"
 	stdhttp "net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	consoleauthstore "github.com/ia-dev-sindireceita/payment/internal/adapters/consoleauth"
 	httpadapter "github.com/ia-dev-sindireceita/payment/internal/adapters/http"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/messaging/inmemory"
+	"github.com/ia-dev-sindireceita/payment/internal/adapters/outbound"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
@@ -115,31 +117,50 @@ func run() error {
 	// bank gains PIX Automático (SIN-66022).
 	recReader, cobrReader := recurrenceReaders(registry)
 
+	// Outbound webhook attribution (SIN-69491, F1 of SIN-69486): on a settled inbound
+	// event, resolve the owning Conta SERVER-SIDE and materialise the event onto that
+	// Conta's durable outbox (or dead-letter it when unattributable). DARK behind the
+	// same PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK flag as F0 and best-effort — a no-op unless
+	// the flag is on. The outbox holds no secret/PII so it needs no cipher (unlike the
+	// F0 config store); it is always durable (sqlite over the shared db). The resolver
+	// reads the tenant's owning Account from the same store the choke-point uses, but
+	// surfaces read errors so an indeterminable owner fails-closed to a dead-letter.
+	outboundDeliveries := sqlite.NewOutboundDeliveryStore(db)
+	outboundAttributor := app.NewOutboundAttributor(app.OutboundAttributorDeps{
+		Enabled:     cfg.AccountOutboundWebhook,
+		Resolver:    app.NewStoreAccountResolver(store),
+		Queue:       outboundDeliveries,
+		DeadLetters: outboundDeliveries,
+		Clock:       system.Clock{},
+		IDs:         system.IDProvider{},
+	})
+
 	deps := app.Deps{
-		Payments:        store,
-		Tenants:         store,
-		Pricing:         store,
-		Ledger:          store,
-		Processed:       store,
-		Recs:            store,
-		CobRs:           store,
-		Bus:             inmemory.NewBus(),
-		Bank:            routers.Bank,
-		Pix:             routers.Pix,
-		PixDueCharge:    routers.PixDueCharge,
-		Checkout:        routers.Checkout,
-		Boleto:          routers.Boleto,
-		DDA:             routers.DDA,
-		Statement:       routers.Statement,
-		RecReader:       recReader,
-		CobRReader:      cobrReader,
-		Credentials:     creds,
-		CredWriter:      creds,
-		CertWriter:      certs,
-		CredInvalidator: credInvalidator,
-		Audit:           store,
-		Clock:           system.Clock{},
-		IDs:             system.IDProvider{},
+		Payments:           store,
+		Tenants:            store,
+		Pricing:            store,
+		Ledger:             store,
+		Processed:          store,
+		Recs:               store,
+		CobRs:              store,
+		Bus:                inmemory.NewBus(),
+		Bank:               routers.Bank,
+		Pix:                routers.Pix,
+		PixDueCharge:       routers.PixDueCharge,
+		Checkout:           routers.Checkout,
+		Boleto:             routers.Boleto,
+		DDA:                routers.DDA,
+		Statement:          routers.Statement,
+		RecReader:          recReader,
+		CobRReader:         cobrReader,
+		OutboundAttributor: outboundAttributor,
+		Credentials:        creds,
+		CredWriter:         creds,
+		CertWriter:         certs,
+		CredInvalidator:    credInvalidator,
+		Audit:              store,
+		Clock:              system.Clock{},
+		IDs:                system.IDProvider{},
 		// Transactional boundary for the multi-write use-cases (charge creation,
 		// webhook settlement) — required for financial integrity (SIN-64719).
 		UoW: store,
@@ -186,23 +207,56 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Per-Conta outbound webhook config store (SIN-69490, F0 of SIN-69486). Durable +
+	// encrypted-at-rest ONLY when the vault cipher is present (PAYMENT_BANK_VAULT_KEY
+	// set) — the HMAC signing secret must be sealed at rest, so with no KEK we leave
+	// the store nil and the use-cases return 503 (the feature is dark behind
+	// PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK anyway). Reuses the SAME KEK as the bank/console
+	// vaults.
+	var outboundWebhooks app.OutboundWebhookStore
+	if vaultCipher != nil {
+		outboundWebhooks = sqlite.NewOutboundWebhookVault(db, vaultCipher, system.Clock{})
+	}
+
+	// Outbound webhook FORWARD (SIN-69492, F2 of SIN-69486): a background consumer of the
+	// F1 outbox that delivers each attributed event to its owning Conta's endpoint, signed
+	// per-Conta over an SSRF-safe client (threat model SIN-69489). Best-effort and DARK
+	// behind the same PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK flag — the processor is inert unless
+	// the flag is on AND the config store exists (it needs the sealed signing secret, so it
+	// is nil without a KEK). Running out-of-band of the inbound handler keeps the C6 ACK
+	// fully decoupled from delivery (threat D3). The forwarder/limiter own all SSRF
+	// hardening (dial-time IP guard, no redirects, timeouts); this layer never touches net.
+	outboundProcessor := app.NewOutboundProcessor(app.OutboundProcessorDeps{
+		Enabled:     cfg.AccountOutboundWebhook,
+		Outbox:      outboundDeliveries,
+		Configs:     outboundWebhooks,
+		Forwarder:   outbound.NewForwarder(),
+		Limiter:     outbound.NewPerAccountLimiter(),
+		DeadLetters: outboundDeliveries,
+		Audit:       store,
+		Clock:       system.Clock{},
+		IDs:         system.IDProvider{},
+		Rand:        mrand.Float64,
+	})
+
 	console := app.NewConsoleService(app.ConsoleDeps{
-		Tenants:         store,
-		Accounts:        store,
-		Pricing:         store,
-		Ledger:          store,
-		CredWriter:      creds,
-		CreditorWriter:  creds,
-		CredReader:      creds,
-		CertWriter:      certs,
-		CertReader:      certs,
-		CredDeleter:     creds,
-		CertDeleter:     certs,
-		Invoices:        store,
-		CredInvalidator: credInvalidator,
-		Audit:           store,
-		Clock:           system.Clock{},
-		IDs:             system.IDProvider{},
+		Tenants:          store,
+		Accounts:         store,
+		Pricing:          store,
+		Ledger:           store,
+		CredWriter:       creds,
+		CreditorWriter:   creds,
+		CredReader:       creds,
+		CertWriter:       certs,
+		CertReader:       certs,
+		CredDeleter:      creds,
+		CertDeleter:      certs,
+		Invoices:         store,
+		OutboundWebhooks: outboundWebhooks,
+		CredInvalidator:  credInvalidator,
+		Audit:            store,
+		Clock:            system.Clock{},
+		IDs:              system.IDProvider{},
 	})
 
 	// Self-contained console login (ADR-0001 Opção B, SIN-69265): username +
@@ -304,6 +358,9 @@ func run() error {
 		// implements ports.AuditLog.
 		AccountKeyMint: app.NewAccountKeyService(accountKeys, system.Clock{},
 			app.WithAccountKeyAudit(store, system.IDProvider{})),
+		// Per-Conta outbound webhook config console CRUD (SIN-69490, F0 of SIN-69486),
+		// default-off dark-ship: off hides the card and leaves the routes unregistered.
+		AccountOutboundWebhook: cfg.AccountOutboundWebhook,
 		// Model (b) empresa-cliente provisioning (ADR-0011 §4 / SIN-69281): a reseller
 		// Conta creates a new empresa-cliente via POST /v1/clients, bound to the Account
 		// resolved from its account-key (server-side, never the body — A01/T6). Backed by
@@ -317,6 +374,11 @@ func run() error {
 		Handler:           srv.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	// F2 outbound-forward worker: tick the outbox consumer on a fixed interval, bound to
+	// the signal context so it stops cleanly on shutdown (no goroutine leak). The processor
+	// is a no-op while the flag is off, so this loop is inert until the feature is enabled.
+	go runOutboundForwardWorker(ctx, outboundProcessor, 2*time.Second)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -336,6 +398,26 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// runOutboundForwardWorker drives the F2 outbound-forward processor on a fixed interval
+// until ctx is cancelled. A per-tick error (e.g. a transient outbox read failure) is only
+// logged — the loop keeps ticking — and per-delivery failures never surface here (they are
+// dead-lettered inside the processor). When the flag is off the processor is inert, so this
+// loop costs one cheap claim per tick and originates no I/O.
+func runOutboundForwardWorker(ctx context.Context, p *app.OutboundProcessor, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := p.ProcessPending(ctx); err != nil {
+				log.Printf("api: outbound forward tick: %v", err)
+			}
+		}
+	}
 }
 
 // credentialAdapter is the union of bank OAuth-credential ports the wiring depends

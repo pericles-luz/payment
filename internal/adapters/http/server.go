@@ -75,6 +75,12 @@ type Server struct {
 	// accountKeyAuth wired); when nil the route is registered under that gate but
 	// fails closed (503). See Config.ClientProvisioner.
 	clientProvisioner ClientProvisioner
+	// accountOutboundWebhook gates the per-Conta OUTBOUND webhook config console CRUD
+	// (SIN-69490, F0 of SIN-69486). Default false (dark-ship): when off the "Webhook de
+	// saída" card is hidden and its set/rotate/remove routes are NOT registered, so the
+	// current flow is entirely unaffected and rollback is a config flip. Config only —
+	// no forwarding in F0. See Config.AccountOutboundWebhook.
+	accountOutboundWebhook bool
 }
 
 // Config wires a Server's dependencies. Console and UI back the HTML admin
@@ -178,35 +184,41 @@ type Config struct {
 	// (AccountKeySelector && AccountKeyAuth != nil); when this is nil the route fails
 	// closed (503). Optional: tests and model (a) deployments leave it nil.
 	ClientProvisioner ClientProvisioner
+	// AccountOutboundWebhook gates the per-Conta OUTBOUND webhook config console CRUD
+	// (SIN-69490, F0 of SIN-69486). Default false (dark-ship): off hides the card and
+	// leaves the set/rotate/remove routes unregistered, so the current flow is
+	// unaffected. Config only — no forwarding in F0.
+	AccountOutboundWebhook bool
 }
 
 // NewServer builds a Server from its config.
 func NewServer(c Config) *Server {
 	return &Server{
-		charges:             c.Charges,
-		pix:                 c.Pix,
-		pixCobV:             c.PixCobV,
-		checkout:            c.Checkout,
-		boleto:              c.Boleto,
-		dda:                 c.DDA,
-		statement:           c.Statement,
-		admin:               c.Admin,
-		console:             c.Console,
-		consoleAuth:         c.ConsoleAuth,
-		ui:                  c.UI,
-		webhooks:            c.Webhooks,
-		tenantAuth:          c.TenantAuth,
-		adminAuth:           c.AdminAuth,
-		webhookAuth:         c.WebhookAuth,
-		accountResolver:     c.AccountResolver,
-		csrf:                NewCSRFGuard(c.SecureCookies),
-		bankResolver:        c.BankResolver,
-		trustedProxyHops:    c.TrustedProxyHops,
-		selfServeCredIntake: c.SelfServeCredIntake,
-		accountKeyAuth:      c.AccountKeyAuth,
-		accountKeySelector:  c.AccountKeySelector,
-		accountKeyMint:      c.AccountKeyMint,
-		clientProvisioner:   c.ClientProvisioner,
+		charges:                c.Charges,
+		pix:                    c.Pix,
+		pixCobV:                c.PixCobV,
+		checkout:               c.Checkout,
+		boleto:                 c.Boleto,
+		dda:                    c.DDA,
+		statement:              c.Statement,
+		admin:                  c.Admin,
+		console:                c.Console,
+		consoleAuth:            c.ConsoleAuth,
+		ui:                     c.UI,
+		webhooks:               c.Webhooks,
+		tenantAuth:             c.TenantAuth,
+		adminAuth:              c.AdminAuth,
+		webhookAuth:            c.WebhookAuth,
+		accountResolver:        c.AccountResolver,
+		csrf:                   NewCSRFGuard(c.SecureCookies),
+		bankResolver:           c.BankResolver,
+		trustedProxyHops:       c.TrustedProxyHops,
+		selfServeCredIntake:    c.SelfServeCredIntake,
+		accountKeyAuth:         c.AccountKeyAuth,
+		accountKeySelector:     c.AccountKeySelector,
+		accountKeyMint:         c.AccountKeyMint,
+		clientProvisioner:      c.ClientProvisioner,
+		accountOutboundWebhook: c.AccountOutboundWebhook,
 	}
 }
 
@@ -523,6 +535,13 @@ func (s *Server) Router() http.Handler {
 				r.Get("/accounts/{acctId}/consumption/rows", s.consoleAccountConsumptionRows)
 				r.Get("/accounts/{acctId}/consumption.csv", s.consoleAccountConsumptionCSV)
 				r.Get("/accounts/{acctId}/invoices", s.consoleAccountInvoices)
+				// Webhook de saída por Conta (SIN-69490, F0 of SIN-69486), dark behind
+				// PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK: the read-only card fragment. Reads admit
+				// Operator+Admin; the config is account-scoped (resolved server-side). When
+				// the flag is off the route is not registered at all (rollback = config flip).
+				if s.accountOutboundWebhook {
+					r.Get("/accounts/{acctId}/webhook", s.consoleOutboundWebhookCard)
+				}
 				r.Get("/tenants", s.consoleListTenants)
 				r.Get("/tenants/rows", s.consoleTenantRows)
 				r.Get("/tenants/new", s.consoleNewTenantForm)
@@ -558,6 +577,15 @@ func (s *Server) Router() http.Handler {
 				// never touches the Bearer /admin/accounts/{id}/account-key route. Reuses
 				// the same accountKeyMint service; returns the plaintext display-once.
 				r.Post("/accounts/{acctId}/account-key", s.consoleMintAccountKey)
+				// Webhook de saída por Conta mutations (SIN-69490, F0 of SIN-69486), dark
+				// behind PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK: set/rotate-secret/remove. Session +
+				// CSRF (this admin mutation group); the signing secret is write-only
+				// (display-once on set/rotate, never read back). Not registered when off.
+				if s.accountOutboundWebhook {
+					r.Post("/accounts/{acctId}/webhook", s.consoleSetOutboundWebhook)
+					r.Post("/accounts/{acctId}/webhook/secret", s.consoleRotateOutboundWebhookSecret)
+					r.Delete("/accounts/{acctId}/webhook", s.consoleRemoveOutboundWebhook)
+				}
 				r.Post("/tenants", s.consoleCreateTenant)
 				r.Post("/tenants/{id}/suspend", s.consoleSuspendTenant)
 				r.Post("/tenants/{id}/activate", s.consoleActivateTenant)

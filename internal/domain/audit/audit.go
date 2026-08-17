@@ -114,6 +114,29 @@ const (
 	// (JSON admin bootstrap + HTML console) because it is emitted from the shared
 	// mint path; an idempotent replay (409) mints nothing and so emits no entry.
 	ActionMintAccountKey Action = "account.key_mint"
+
+	// ActionSetOutboundWebhook / ActionRotateOutboundWebhookSecret /
+	// ActionRemoveOutboundWebhook record the config lifecycle of a Conta's OUTBOUND
+	// webhook endpoint (SIN-69490, F0 of SIN-69486). They are ACCOUNT-scoped (the
+	// target is an Account, so accountID is explicit and tenant_id is empty, like the
+	// other account.* actions) and record the mutation as a FACT only — never the
+	// signing secret nor the URL by construction (the constructor has no such
+	// parameter; threat C1/C4). set covers both create and update of the endpoint;
+	// rotate_secret is the display-once secret rotation; remove is the hard-delete.
+	ActionSetOutboundWebhook          Action = "account.webhook.set"
+	ActionRotateOutboundWebhookSecret Action = "account.webhook.rotate_secret"
+	ActionRemoveOutboundWebhook       Action = "account.webhook.remove"
+
+	// ActionOutboundWebhookDelivered / ActionOutboundWebhookDeadLettered record the
+	// per-attempt RESULT of forwarding a Conta's event to its outbound endpoint
+	// (SIN-69492, F2 of SIN-69486; threat model SIN-69489 §3 R1 — non-repudiation). They
+	// are account-scoped and name which Conta and which inbound event_key (as the subject
+	// txID) the attempt concerned, plus its terminal outcome — delivered (2xx) or
+	// dead-lettered (endpoint inactive / retries exhausted). Like every audit action they
+	// record a FACT only: never the payload, never the signing secret, never the
+	// destination response body (the constructor has no such parameter).
+	ActionOutboundWebhookDelivered    Action = "account.webhook.delivered"
+	ActionOutboundWebhookDeadLettered Action = "account.webhook.dead_letter"
 )
 
 // recurrenceActionByStatus maps a recurrence.RecStatus string to the audit Action
@@ -140,7 +163,9 @@ func (a Action) valid() bool {
 		ActionActivateAccount, ActionRemoveBankConfig,
 		ActionSettlementAmountMismatch, ActionRecCreated, ActionRecApproved,
 		ActionRecRejected, ActionRecExpired, ActionRecCancelled, ActionCobRCreated,
-		ActionSetBankCertificate, ActionInvoiceGenerated, ActionMintAccountKey:
+		ActionSetBankCertificate, ActionInvoiceGenerated, ActionMintAccountKey,
+		ActionSetOutboundWebhook, ActionRotateOutboundWebhookSecret, ActionRemoveOutboundWebhook,
+		ActionOutboundWebhookDelivered, ActionOutboundWebhookDeadLettered:
 		return true
 	default:
 		return false
@@ -291,6 +316,95 @@ func NewAccountKeyMintEntry(id, operatorID, accountID string, at time.Time) (Ent
 		action:     ActionMintAccountKey,
 		at:         at,
 		accountID:  accountID,
+	}, nil
+}
+
+// outboundWebhookActionValid reports whether action is one of the account-scoped
+// outbound-webhook config actions NewOutboundWebhookEntry accepts (deny-by-default so
+// a tenant-scoped or money-movement action can never be smuggled through the
+// outbound-webhook constructor and land with an empty tenant_id).
+func outboundWebhookActionValid(action Action) bool {
+	switch action {
+	case ActionSetOutboundWebhook, ActionRotateOutboundWebhookSecret, ActionRemoveOutboundWebhook:
+		return true
+	default:
+		return false
+	}
+}
+
+// NewOutboundWebhookEntry builds the audit record for a Conta's outbound-webhook
+// config mutation (set / rotate_secret / remove; SIN-69490, F0 of SIN-69486).
+// Configuring an outbound delivery endpoint and rotating its signing secret are
+// privileged, security-relevant actions, so each MUST be attributable (OWASP A09):
+// the entry names who (operatorID), which Conta (accountID) and when. Like the other
+// account-scoped constructors the target is an Account, so it carries the account id
+// explicitly (AccountID() returns it) and leaves the tenant id empty — an Account is
+// not a tenant (ADR-0012 pattern). It records the mutation as a FACT only and NEVER
+// the signing secret nor the URL by construction — it has no such parameter (threat
+// C1/C4). Invariants: a non-empty id, a known outbound-webhook action and a non-empty
+// accountID; operatorID may be empty (a non-attributed internal caller).
+func NewOutboundWebhookEntry(id, operatorID string, action Action, accountID string, at time.Time) (Entry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Entry{}, shared.NewValidationError("id", "audit entry id is required")
+	}
+	if !outboundWebhookActionValid(action) {
+		return Entry{}, shared.NewValidationError("action", "unknown outbound webhook audit action")
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return Entry{}, shared.NewValidationError("account_id", "account id is required")
+	}
+	return Entry{
+		id:         id,
+		operatorID: strings.TrimSpace(operatorID),
+		action:     action,
+		at:         at,
+		accountID:  accountID,
+	}, nil
+}
+
+// outboundDeliveryActionValid reports whether action is one of the F2 per-attempt
+// delivery-result actions NewOutboundDeliveryEntry accepts (deny-by-default so a config
+// action or a foreign action can never be smuggled through the delivery constructor).
+func outboundDeliveryActionValid(action Action) bool {
+	switch action {
+	case ActionOutboundWebhookDelivered, ActionOutboundWebhookDeadLettered:
+		return true
+	default:
+		return false
+	}
+}
+
+// NewOutboundDeliveryEntry builds the per-attempt audit record for forwarding a Conta's
+// event to its outbound endpoint (SIN-69492, F2 of SIN-69486; threat model SIN-69489 §3
+// R1). It is account-scoped — the target is the owning Conta (accountID explicit,
+// tenant_id empty, like the other account.* actions) — and carries the inbound event_key
+// as the subject txID so the trail can be joined to the outbox/dead-letter and the
+// inbound processed-events barrier. It records the FACT and its RESULT (delivered /
+// dead-lettered) only, NEVER the payload, the signing secret or the destination's
+// response, by construction (no such parameter — threat R1/I3). operatorID is the system
+// actor (a forward has no human operator). Invariants: a non-empty id, a known delivery
+// action and a non-empty accountID; eventKey may be empty (an event that carried none).
+func NewOutboundDeliveryEntry(id, operatorID string, action Action, accountID, eventKey string, at time.Time) (Entry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Entry{}, shared.NewValidationError("id", "audit entry id is required")
+	}
+	if !outboundDeliveryActionValid(action) {
+		return Entry{}, shared.NewValidationError("action", "unknown outbound delivery audit action")
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return Entry{}, shared.NewValidationError("account_id", "account id is required")
+	}
+	return Entry{
+		id:         id,
+		operatorID: strings.TrimSpace(operatorID),
+		action:     action,
+		at:         at,
+		accountID:  accountID,
+		txID:       strings.TrimSpace(eventKey),
 	}, nil
 }
 

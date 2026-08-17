@@ -23,7 +23,8 @@ import (
 // error (accounts/invoices store absent) that must map to 503 at the boundary,
 // rather than a validation error rendered inline on a form.
 func isServiceError(err error) bool {
-	return errors.Is(err, app.ErrAccountsUnavailable) || errors.Is(err, app.ErrInvoicesUnavailable)
+	return errors.Is(err, app.ErrAccountsUnavailable) || errors.Is(err, app.ErrInvoicesUnavailable) ||
+		errors.Is(err, app.ErrOutboundWebhookUnavailable)
 }
 
 // console_accounts.go is the server-rendered HTMX console for the two-level
@@ -100,12 +101,17 @@ func (s *Server) consoleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// A freshly-created Conta has no webhook config yet: the card renders in its empty
+	// state (Configured false) when the dark flag is on. It is a real (non-self)
+	// account, so the flag alone decides visibility.
 	s.ui.BodyWithOOB(w, http.StatusOK, "account_detail",
 		adminweb.AccountDetailView{
-			Base:              s.consoleBase(r, a.Name(), "accounts"),
-			Account:           adminweb.ToAccountView(a),
-			AccountKeyEnabled: s.accountKeyCardEnabled(a),
-			AccountKeyToken:   newIdempotencyToken(),
+			Base:                   s.consoleBase(r, a.Name(), "accounts"),
+			Account:                adminweb.ToAccountView(a),
+			AccountKeyEnabled:      s.accountKeyCardEnabled(a),
+			AccountKeyToken:        newIdempotencyToken(),
+			OutboundWebhookEnabled: s.outboundWebhookCardEnabled(a),
+			WebhookCard:            adminweb.ToOutboundWebhookCardView(a.ID(), nil, false),
 		},
 		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: "Conta criada."}})
 }
@@ -124,13 +130,23 @@ func (s *Server) consoleAccountDetail(w http.ResponseWriter, r *http.Request) {
 		s.consoleError(w, err)
 		return
 	}
-	s.ui.Page(w, r, "account_detail", http.StatusOK, adminweb.AccountDetailView{
-		Base:              s.consoleBase(r, a.Name(), "accounts"),
-		Account:           adminweb.ToAccountView(a),
-		Tenants:           adminweb.ToTenantViews(tenants),
-		AccountKeyEnabled: s.accountKeyCardEnabled(a),
-		AccountKeyToken:   newIdempotencyToken(),
-	})
+	view := adminweb.AccountDetailView{
+		Base:                   s.consoleBase(r, a.Name(), "accounts"),
+		Account:                adminweb.ToAccountView(a),
+		Tenants:                adminweb.ToTenantViews(tenants),
+		AccountKeyEnabled:      s.accountKeyCardEnabled(a),
+		AccountKeyToken:        newIdempotencyToken(),
+		OutboundWebhookEnabled: s.outboundWebhookCardEnabled(a),
+	}
+	if view.OutboundWebhookEnabled {
+		card, err := s.outboundWebhookCardView(r.Context(), a.ID())
+		if err != nil {
+			s.consoleError(w, err)
+			return
+		}
+		view.WebhookCard = card
+	}
+	s.ui.Page(w, r, "account_detail", http.StatusOK, view)
 }
 
 // accountKeyCardEnabled reports whether the "Chave-de-Conta" card should render:

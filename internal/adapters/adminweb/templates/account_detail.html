@@ -47,6 +47,14 @@
 </div>
 {{end}}
 
+{{/* Webhook de saída por Conta (SIN-69490, F0 of SIN-69486): admin-only config of
+     WHERE this Conta's events are delivered (F2) + its HMAC signing secret. Rendered
+     only when the dark flag PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK is on AND the account is a
+     real Conta. The card region (#outbound-webhook-card) is swapped wholesale on
+     set/rotate/remove; the signing secret is write-only (shown display-once, never
+     rendered from a read). */}}
+{{if .OutboundWebhookEnabled}}{{template "outbound_webhook_card" .WebhookCard}}{{end}}
+
 <div class="topbar">
   <h2>Empresas-clientes</h2>
   <a class="btn btn--primary" href="/console/accounts/{{.Account.ID}}/tenants/new"

@@ -125,6 +125,20 @@ func ConsoleAAD(username string) []byte {
 	return appendLenPrefixed(out, username)
 }
 
+// OutboundWebhookAAD builds the additional authenticated data that cryptographically
+// binds a sealed outbound-webhook signing secret to its storage row (the owning
+// account id). Like RowAAD/ConsoleAAD it is NOT secret and is NOT stored — it is
+// reconstructed on read from the row's own account_id column. A sealed signing secret
+// copied to a different account's outbound_webhook_config row then fails to open
+// (defense in depth beyond the row lookup; SIN-69490, mirroring SIN-69369/69432). The
+// distinct domain tag keeps this binding from ever being confused with the bank-vault
+// or console-credential schemes.
+func OutboundWebhookAAD(accountID string) []byte {
+	// Tag documents the binding scheme and version; bump if the layout ever changes.
+	out := []byte("payment/outbound-webhook/row/v1")
+	return appendLenPrefixed(out, accountID)
+}
+
 // appendLenPrefixed appends an 8-byte big-endian length followed by s, so that a
 // concatenation of fields is unambiguous regardless of the fields' contents.
 func appendLenPrefixed(dst []byte, s string) []byte {
