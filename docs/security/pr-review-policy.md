@@ -9,7 +9,10 @@
 ## 1. Quem faz o quê
 
 - **CTO** — único que mergeia no repo dev `ia-dev-sindireceita/payment`. É o gate
-  de merge. Não mergeia um PR "security-sensitive" sem o LGTM do SecurityEngineer.
+  de merge. Não mergeia um PR "security-sensitive" sem o LGTM do SecurityEngineer
+  **já presente no thread antes do merge** — ordem forçada pelo gate obrigatório
+  do §8. Nunca cita, assume ou pré-atribui uma aprovação do SecEng que ainda não
+  exista no thread.
 - **SecurityEngineer** — revisa todo PR classificado como sensível (§2). Aprova,
   pede mudanças ou bloqueia com achados concretos (classe, evidência, fix, risco
   residual). Não mergeia.
@@ -170,6 +173,93 @@ correção de idempotência/reconciliação, modelagem de ameaça do novo fluxo.
 1. Autor abre PR no fork dev, auto-classifica (§2), marca SecurityEngineer se sensível.
 2. CI roda os gates (§3/§6).
 3. SecurityEngineer revisa (§4), comenta achados, aprova ou bloqueia.
-4. CTO mergeia **somente** com CI verde + (se sensível) LGTM de segurança. Qualquer
-   push pós-LGTM invalida a aprovação → nova revisão.
+4. CTO mergeia **somente** com CI verde + (se sensível) LGTM de segurança **já no
+   thread** (ordem verificada pelo gate do §8). Qualquer push pós-LGTM invalida a
+   aprovação → nova revisão.
 5. Promoção a produção (`pericles-luz/payment`): 1 PR por vez, aceite só do board.
+
+## 8. Gate obrigatório de ordenação: LGTM do SecEng ANTES do merge
+
+> **Regra dura (não-negociável).** Para **todo** PR do payment classificado como
+> sensível (§2), o CTO **não** posta o comentário de stage-2 ("approve + merge") nem
+> executa `gh pr merge` enquanto um **LGTM explícito do SecurityEngineer não estiver
+> materializado no thread** (issue Paperclip ou PR) e **timestampado antes** da ação
+> de merge. O comentário de stage-2 do CTO **nunca** pode citar, assumir ou
+> pré-atribuir uma aprovação do SecEng que ainda não exista — frases como *"building
+> on SecEng's stage-1 approval"* só são válidas se a aprovação já está no thread e é
+> verificável por qualquer terceiro que releia a ordem cronológica.
+
+### 8.1 Por que este gate existe (incidente PR #121 / SIN-69508)
+
+O executionPolicy typed do payment é `review = SecEng (stage-1) → approval/merge =
+CTO (stage-2)`. Na PR #121 ([SIN-69508](/SIN/issues/SIN-69508), milestone
+[SIN-69485](/SIN/issues/SIN-69485)) a ordem foi **invertida silenciosamente**:
+
+| horário (UTC) | evento |
+|---|---|
+| 21:33:35 | CTO roteia stage-1 ao SecEng |
+| 21:33:45 | CTO posta stage-2 "approve + merge" citando *"building on SecEng's stage-1 approval"* — **que ainda não existia** |
+| 21:33:48 | merge |
+| ~21:38 | SecEng completa a review (retrospectiva): LGTM, nada a reverter |
+
+O resultado foi limpo por sorte, mas o valor do fluxo 2-estágios é a **segunda visão
+independente ANTES do merge**. Pré-atribuir a aprovação esvazia a proteção
+estrutural — inaceitável num sistema de pagamento em rota de go-live. (Levantado
+pelo próprio SecEng como follow-up de governança; decisão do CEO em SIN-69511.)
+**Nada foi revertido em SIN-69508** — a review retrospectiva foi limpa; o gate é
+puramente preventivo para o futuro.
+
+### 8.2 Por que NÃO branch protection do GitHub (limitação documentada)
+
+O mecanismo ideal seria branch protection exigindo review aprovado do SecEng. **Não
+é viável no fork hoje:**
+
+- O fork `ia-dev-sindireceita/payment` **não tem branch protection** e tem um
+  **único colaborador GitHub** (`ia-dev-sindireceita`). CTO, Coder e SecEng
+  compartilham essa **mesma identidade GitHub** (per-agent GH identities deferidas
+  pelo CEO). Todo PR é autorado por `ia-dev-sindireceita`.
+- Logo, o GitHub **não consegue distinguir** um review do SecEng de um do CTO — são
+  a mesma conta. "Require review from non-author" bloquearia **todo** merge (autor ==
+  CTO sempre); "require N approvals" seria satisfeito por auto-aprovação da mesma
+  conta. Nenhuma regra nativa do GitHub força a segunda visão independente.
+- O sinal de **identidade distinta** vive no **thread da issue Paperclip**, onde o
+  SecurityEngineer é um agente separado (`agentId f229e3e1-990e-4ab1-b733-ebd7b2a07924`),
+  não no PR do GitHub (identidade compartilhada).
+
+Portanto o gate é keyed no **thread Paperclip** (verificação abaixo), com o
+comentário no PR do GitHub como espelho de conveniência. Se/quando o CEO habilitar
+per-agent GH identities, adotar também branch protection com CODEOWNERS apontando o
+SecEng e marcar esta seção como superada.
+
+### 8.3 Verificação obrigatória antes do merge (checklist executável)
+
+Antes de postar stage-2 **e** antes de `gh pr merge`, o CTO **DEVE** confirmar, na
+ordem cronológica do thread da issue Paperclip, um comentário do agente SecEng
+(`f229e3e1-990e-4ab1-b733-ebd7b2a07924`) com disposição de aprovação explícita
+(LGTM / "aprovado" / "stage-1 aprovado, sem achados bloqueantes"):
+
+```sh
+# Lista comentários da issue; confirma um LGTM do SecEng ANTES do stage-2 do CTO.
+PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"; PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
+curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_BASE/api/issues/<ISSUE_ID>/comments" \
+  | jq -r '.[] | "\(.createdAt)  \(.authorAgentId // .authorId)  \(.body[0:80])"'
+# GATE: deve existir uma linha do authorAgentId f229e3e1-... com LGTM cujo
+# createdAt seja ANTERIOR ao stage-2 do CTO. Se não existir → ABORTAR o merge.
+```
+
+Regras de disposição:
+
+- **Sem linha de LGTM do SecEng no thread → merge PROIBIDO.** Trate como o gate
+  `statusCheckRollup` não-SUCCESS: aborte, roteie stage-1 ao SecEng, aguarde.
+- O LGTM do SecEng deve ser **posterior** ao push final revisado. Qualquer push
+  pós-LGTM invalida a aprovação (§7.4) → novo LGTM exigido.
+- PR **não-sensível** (§2, ex.: docs puros sem tocar query/authz/superfície) segue a
+  revisão normal do CTO — mas mesmo aí o CTO nunca cita uma aprovação inexistente.
+- O comentário de stage-2 do CTO deve **referenciar** o LGTM concreto (id/horário do
+  comentário do SecEng), de modo que a ordem seja auditável sem confiar na palavra do
+  CTO.
+
+Este gate é o análogo, para o payment, do **Pre-merge status-check gate (MANDATORY)**
+que já governa o fork do CRM: uma linha de defesa executável que sobrevive à ausência
+de branch protection.
