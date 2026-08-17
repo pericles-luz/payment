@@ -306,7 +306,14 @@ func TestCheckoutCreateConcurrentSameKey(t *testing.T) {
 	}
 }
 
-func TestCheckoutCreateNoPrice(t *testing.T) {
+// TestCheckoutCreateNoPriceIsFree pins the SIN-69512 charge-time contract: a
+// tenant with NO configured checkout price is served for free (billed 0 cents),
+// not rejected; a single 0-cent ledger entry is written.
+//
+// Rule-3 disclosure: this test previously required an error for the unpriced case —
+// the exact behavior the CEO reframed in SIN-69508/SIN-69512. Its assertion is
+// updated to the new mandated contract; CTO ratifies at the review gate.
+func TestCheckoutCreateNoPriceIsFree(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.deps.Checkout = h.bank
@@ -317,7 +324,22 @@ func TestCheckoutCreateNoPrice(t *testing.T) {
 	}
 	h.deps.Credentials.(*secret.Store).Set(tn.ID(), ports.BankCredential{ClientID: "cid", Secret: "shh"})
 	svc := app.NewCheckoutService(h.deps)
-	if _, _, err := svc.CreateSession(context.Background(), baseCheckoutInput(tn.ID(), "k1")); err == nil {
-		t.Fatalf("want error when endpoint price is not configured")
+	p, _, err := svc.CreateSession(context.Background(), baseCheckoutInput(tn.ID(), "k1"))
+	if err != nil {
+		t.Fatalf("unpriced checkout should succeed (free), got %v", err)
+	}
+	if p == nil || p.TxID() == "" {
+		t.Fatal("checkout not created for unpriced (free) endpoint")
+	}
+	// Payment reserved normally under the free contract.
+	if _, err := h.store.FindPaymentByIdempotencyKey(context.Background(), tn.ID(), "k1"); err != nil {
+		t.Fatalf("free create must reserve a payment, got %v", err)
+	}
+	entries, err := h.store.ListLedgerEntries(context.Background(), tn.ID())
+	if err != nil {
+		t.Fatalf("list ledger: %v", err)
+	}
+	if len(entries) != 1 || entries[0].PriceCents() != 0 {
+		t.Fatalf("want 1 ledger entry billed 0 cents, got %+v", entries)
 	}
 }

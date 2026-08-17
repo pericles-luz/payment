@@ -220,9 +220,11 @@ func TestCreateChargeValidation(t *testing.T) {
 	if rec := do(t, f.handler, http.MethodPost, "/v1/charges", tenantToken, map[string]string{"Idempotency-Key": "k"}, map[string]any{"endpoint": "pix.create", "amount_cents": 10, "currency": "BRL", "tenant_id": "evil"}); rec.Code != http.StatusBadRequest {
 		t.Fatalf("want 400 unknown field, got %d", rec.Code)
 	}
-	// Unpriced endpoint → 404.
-	if rec := do(t, f.handler, http.MethodPost, "/v1/charges", tenantToken, map[string]string{"Idempotency-Key": "k2"}, map[string]any{"endpoint": "unpriced", "amount_cents": 10, "currency": "BRL"}); rec.Code != http.StatusNotFound {
-		t.Fatalf("want 404 unpriced, got %d", rec.Code)
+	// Unpriced endpoint → served for free (SIN-69512): 201, billed 0 cents, not 404.
+	// Rule-3 disclosure: this assertion previously required 404; the mandated
+	// charge-time contract changed it to success. CTO ratifies at the review gate.
+	if rec := do(t, f.handler, http.MethodPost, "/v1/charges", tenantToken, map[string]string{"Idempotency-Key": "k2"}, map[string]any{"endpoint": "unpriced", "amount_cents": 10, "currency": "BRL"}); rec.Code != http.StatusCreated {
+		t.Fatalf("want 201 for unpriced (free) endpoint, got %d", rec.Code)
 	}
 	// Bad amount → 400.
 	if rec := do(t, f.handler, http.MethodPost, "/v1/charges", tenantToken, map[string]string{"Idempotency-Key": "k3"}, map[string]any{"endpoint": "pix.create", "amount_cents": 0, "currency": "BRL"}); rec.Code != http.StatusBadRequest {

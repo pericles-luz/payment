@@ -81,10 +81,10 @@ func (s *ChargeService) CreateCharge(ctx context.Context, in CreateChargeInput) 
 		return nil, shared.NewValidationError("idempotency_key", "idempotency key is required")
 	}
 
-	// Resolve per-endpoint price (config error if the endpoint isn't priced).
-	price, err := s.pricing.GetEndpointPrice(ctx, in.TenantID, in.Endpoint)
+	// Unpriced endpoint = free (bill 0), not a rejection — see resolvePriceOrFree.
+	price, err := resolvePriceOrFree(ctx, s.pricing, in.TenantID, in.Endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("resolve price: %w", err)
+		return nil, err
 	}
 
 	// Idempotency: a prior request with the same key either completed (has a tx

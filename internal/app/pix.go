@@ -97,9 +97,10 @@ func (s *PixService) CreateImmediateCharge(ctx context.Context, in CreateImmedia
 		return nil, ports.PixChargeResult{}, err
 	}
 
-	price, err := s.pricing.GetEndpointPrice(ctx, in.TenantID, PixCreateEndpoint)
+	// Unpriced endpoint = free (bill 0), not a rejection — see resolvePriceOrFree.
+	price, err := resolvePriceOrFree(ctx, s.pricing, in.TenantID, PixCreateEndpoint)
 	if err != nil {
-		return nil, ports.PixChargeResult{}, fmt.Errorf("resolve price: %w", err)
+		return nil, ports.PixChargeResult{}, err
 	}
 
 	p, err := s.reservePayment(ctx, in)

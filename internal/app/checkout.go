@@ -112,9 +112,10 @@ func (s *CheckoutService) CreateSession(ctx context.Context, in CreateCheckoutSe
 		return nil, ports.CheckoutResult{}, err
 	}
 
-	price, err := s.pricing.GetEndpointPrice(ctx, in.TenantID, CheckoutCreateEndpoint)
+	// Unpriced endpoint = free (bill 0), not a rejection — see resolvePriceOrFree.
+	price, err := resolvePriceOrFree(ctx, s.pricing, in.TenantID, CheckoutCreateEndpoint)
 	if err != nil {
-		return nil, ports.CheckoutResult{}, fmt.Errorf("resolve price: %w", err)
+		return nil, ports.CheckoutResult{}, err
 	}
 
 	// Reserve the idempotency key (and the session total) before the PSP call. The
