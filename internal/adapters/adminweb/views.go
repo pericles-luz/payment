@@ -10,6 +10,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/billing"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/invoice"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/outboundwebhook"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
@@ -497,6 +498,13 @@ type AccountDetailView struct {
 	// collapses to a 409 (display-once, never a double-mint), while a fresh render
 	// carries a fresh nonce so a deliberate rotation always produces a new key.
 	AccountKeyToken string
+	// OutboundWebhookEnabled gates the "Webhook de saída" card (SIN-69490): true only
+	// when the dark feature flag PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK is on AND the account
+	// is a real Conta. Off hides the card entirely (zero effect on the current flow).
+	OutboundWebhookEnabled bool
+	// WebhookCard backs the "Webhook de saída" card region when OutboundWebhookEnabled
+	// is set. It never carries the signing secret (write-only).
+	WebhookCard OutboundWebhookCardView
 }
 
 // AccountKeyResultView backs the display-once success partial after a Conta-key
@@ -509,6 +517,64 @@ type AccountKeyResultView struct {
 	AccountID string
 	Secret    string
 	Token     string
+}
+
+// OutboundWebhookView is the console projection of a Conta's outbound webhook config
+// (SIN-69490, F0 of SIN-69486). It NEVER carries the signing secret: Configured
+// answers "is an endpoint set?", URL/Enabled are non-secret fields echoed back for the
+// operator, and the secret is write-only (shown display-once on set/rotate, never
+// rendered from a read). UpdatedAt drives the "last change" line.
+type OutboundWebhookView struct {
+	AccountID  string
+	URL        string
+	Enabled    bool
+	Configured bool
+	UpdatedAt  time.Time
+}
+
+// UpdatedAtBR renders the last-change date in Brazilian format (empty when unset).
+func (v OutboundWebhookView) UpdatedAtBR() string {
+	if v.UpdatedAt.IsZero() {
+		return ""
+	}
+	return v.UpdatedAt.Format("02/01/2006 15:04")
+}
+
+// ToOutboundWebhookView projects a Conta's config for rendering. cfg is nil (and
+// configured false) when the Conta has no endpoint yet — the empty state. The signing
+// secret on cfg is deliberately NOT read (write-only, never rendered).
+func ToOutboundWebhookView(accountID string, cfg *outboundwebhook.Config, configured bool) OutboundWebhookView {
+	v := OutboundWebhookView{AccountID: accountID, Configured: configured}
+	if cfg != nil {
+		v.URL = cfg.URL()
+		v.Enabled = cfg.Enabled()
+		v.UpdatedAt = cfg.UpdatedAt()
+	}
+	return v
+}
+
+// OutboundWebhookCardView backs the "Webhook de saída" card region on the account
+// detail (id #outbound-webhook-card), swapped wholesale on set/rotate/remove. Errors
+// carries per-field validation messages for the inline set form (nil on a normal
+// render). The signing secret is never in this view — it is write-only.
+type OutboundWebhookCardView struct {
+	Webhook OutboundWebhookView
+	Errors  map[string]string
+}
+
+// ToOutboundWebhookCardView assembles the card view from a Conta's config state.
+func ToOutboundWebhookCardView(accountID string, cfg *outboundwebhook.Config, configured bool) OutboundWebhookCardView {
+	return OutboundWebhookCardView{Webhook: ToOutboundWebhookView(accountID, cfg, configured)}
+}
+
+// OutboundWebhookResultView backs the display-once success partial after a Conta's
+// webhook signing secret is minted (first set) or rotated (SIN-69490). Secret carries
+// the plaintext EXACTLY once — rendered into this single HTMX response, never persisted
+// in a view beyond it, never logged, and no read path echoes it (write-only). Card is
+// the refreshed card body shown below the secret banner.
+type OutboundWebhookResultView struct {
+	Secret string
+	Card   OutboundWebhookCardView
 }
 
 // NewAccountTenantView backs the "create empresa-cliente under this account" form.

@@ -399,6 +399,82 @@
 </div>
 {{end}}
 
+{{/* outbound_webhook_card is the "Webhook de saída" card region (SIN-69490, F0 of
+     SIN-69486): the current config (when set) plus the set/edit form. It replaces
+     #outbound-webhook-card wholesale on set/rotate/remove. The signing secret is
+     WRITE-ONLY — it is NEVER rendered here; it is shown only display-once by
+     outbound_webhook_result. Data is an OutboundWebhookCardView. */}}
+{{define "outbound_webhook_card"}}
+<div id="outbound-webhook-card" class="card">
+  <h2>Webhook de saída</h2>
+  <p class="muted">Endpoint https para onde os eventos desta Conta serão enviados (modelo b). A entrega ainda <strong>não está ativa</strong> nesta fase — apenas a configuração. O segredo de assinatura é exibido <strong>apenas uma vez</strong> ao definir ou rotacionar.</p>
+  {{if .Webhook.Configured}}
+  <dl class="dl">
+    <dt>Endpoint</dt><dd><code>{{.Webhook.URL}}</code></dd>
+    <dt>Entrega</dt><dd>{{if .Webhook.Enabled}}habilitada{{else}}desabilitada{{end}}</dd>
+    <dt>Segredo de assinatura</dt><dd>configurado — não exibido</dd>
+    <dt>Última alteração</dt><dd>{{.Webhook.UpdatedAtBR}}</dd>
+  </dl>
+  <div class="form-actions">
+    <button class="btn btn--secondary" type="button"
+      hx-post="/console/accounts/{{.Webhook.AccountID}}/webhook/secret"
+      hx-target="#outbound-webhook-card" hx-swap="outerHTML"
+      hx-confirm="Rotacionar o segredo de assinatura? O segredo atual deixa de ser válido imediatamente e o novo é exibido apenas uma vez.">Rotacionar segredo</button>
+    <button class="btn btn--danger" type="button"
+      hx-delete="/console/accounts/{{.Webhook.AccountID}}/webhook"
+      hx-target="#outbound-webhook-card" hx-swap="outerHTML"
+      hx-confirm="Remover a configuração de webhook de saída desta Conta?">Remover</button>
+  </div>
+  {{end}}
+  <form class="form"
+        hx-post="/console/accounts/{{.Webhook.AccountID}}/webhook"
+        hx-target="#outbound-webhook-card" hx-swap="outerHTML">
+    <div class="field{{if .Errors.url}} has-error{{end}}">
+      <label for="f-webhook-url">URL do endpoint (https)</label>
+      <input id="f-webhook-url" name="url" type="url" value="{{.Webhook.URL}}" required maxlength="2048"
+             placeholder="https://exemplo.com/webhooks/sindireceita" autocomplete="off"
+             {{if .Errors.url}}aria-invalid="true" aria-describedby="e-webhook-url"{{end}}>
+      {{if .Errors.url}}<span class="error" id="e-webhook-url" role="alert">{{.Errors.url}}</span>{{end}}
+    </div>
+    <div class="field">
+      <label><input type="checkbox" name="enabled" value="on"{{if .Webhook.Enabled}} checked{{end}}> Habilitar entrega</label>
+    </div>
+    {{if .Errors.form}}<span class="error" role="alert">{{.Errors.form}}</span>{{end}}
+    <div class="form-actions"><button class="btn btn--primary" type="submit">{{if .Webhook.Configured}}Salvar alterações{{else}}Definir webhook{{end}}</button></div>
+  </form>
+</div>
+{{end}}
+
+{{/* outbound_webhook_result is the display-once success region after a Conta's webhook
+     signing secret is minted (first set) or rotated (SIN-69490). It replaces
+     #outbound-webhook-card and shows the plaintext EXACTLY once with a destructive-
+     action banner; there is no read path, so a refresh/back re-renders the plain card
+     (no secret). Data is an OutboundWebhookResultView. */}}
+{{define "outbound_webhook_result"}}
+<div id="outbound-webhook-card" class="card">
+  <h2>Webhook de saída</h2>
+  <div class="banner banner--danger" role="alert">
+    <strong>Segredo de assinatura gerado — mostrado apenas agora.</strong> Copie e guarde em local seguro:
+    ele <strong>não pode ser recuperado</strong> depois. Configure-o no seu receptor para validar a assinatura HMAC das entregas. O segredo anterior (se havia) foi invalidado.
+  </div>
+  <dl class="dl">
+    <dt>Segredo de assinatura</dt><dd><code>{{.Secret}}</code></dd>
+    <dt>Endpoint</dt><dd><code>{{.Card.Webhook.URL}}</code></dd>
+    <dt>Entrega</dt><dd>{{if .Card.Webhook.Enabled}}habilitada{{else}}desabilitada{{end}}</dd>
+  </dl>
+  <div class="form-actions">
+    <button class="btn btn--secondary" type="button"
+      hx-post="/console/accounts/{{.Card.Webhook.AccountID}}/webhook/secret"
+      hx-target="#outbound-webhook-card" hx-swap="outerHTML"
+      hx-confirm="Rotacionar novamente? O segredo que acabou de ser exibido deixa de ser válido imediatamente e um novo é exibido apenas uma vez.">Rotacionar novamente</button>
+    <button class="btn btn--danger" type="button"
+      hx-delete="/console/accounts/{{.Card.Webhook.AccountID}}/webhook"
+      hx-target="#outbound-webhook-card" hx-swap="outerHTML"
+      hx-confirm="Remover a configuração de webhook de saída desta Conta?">Remover</button>
+  </div>
+</div>
+{{end}}
+
 {{/* account_status_header_oob updates the account detail header (badge + toggle)
      out-of-band after a suspend/activate. Data is an AccountView. */}}
 {{define "account_status_header_oob"}}

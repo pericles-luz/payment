@@ -96,6 +96,16 @@ type Config struct {
 	// load-bearing; keep it off until the guard has been security-reviewed for a
 	// deployment. Set PAYMENT_ACCOUNT_KEY_SELECTOR truthy to enable.
 	AccountKeySelector bool
+	// AccountOutboundWebhook enables the per-Conta OUTBOUND webhook configuration
+	// console CRUD (SIN-69490, F0 of SIN-69486, model (b) ADR-0011). When on, the
+	// /console account detail shows the "Webhook de saída" card and its set/rotate/
+	// remove routes are registered, letting an operator point a Conta's events at an
+	// https receiver and manage its HMAC signing secret. It is CONFIG ONLY — there is
+	// NO forwarding in F0 (that is F2). Defaults to false (secure / dark-ship): when
+	// off the card is hidden and the routes are not registered, so the current flow is
+	// entirely unaffected and rollback is a config flip. Set
+	// PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK truthy to enable.
+	AccountOutboundWebhook bool
 	// C6 holds the C6 bank adapter transport configuration. Endpoints are
 	// per-environment and resolved from config (never hard-coded). The per-tenant
 	// OAuth2 credentials live in BankCreds / the secret store, not here.
@@ -172,22 +182,23 @@ func FromEnv() Config {
 	bankCreds := mergeCreditorKeys(parseBankCreds(os.Getenv("PAYMENT_BANK_CREDS"), logger), os.Getenv("PAYMENT_BANK_CREDITOR_KEYS"), logger)
 	logLoadedBankCreds(bankCreds, logger)
 	return Config{
-		HTTPAddr:              getenv("PAYMENT_HTTP_ADDR", ":8080"),
-		DBPath:                getenv("PAYMENT_DB_PATH", "payment.db"),
-		TenantTokens:          parseKV(os.Getenv("PAYMENT_TENANT_TOKENS")),
-		AdminTokens:           splitNonEmpty(os.Getenv("PAYMENT_ADMIN_TOKENS")),
-		OperatorTokens:        splitNonEmpty(os.Getenv("PAYMENT_OPERATOR_TOKENS")),
-		WebhookRefs:           parseKV(os.Getenv("PAYMENT_WEBHOOK_REFS")),
-		BankCreds:             bankCreds,
-		BankVaultKey:          os.Getenv("PAYMENT_BANK_VAULT_KEY"),
-		BankVaultKeyPrevious:  os.Getenv("PAYMENT_BANK_VAULT_KEY_PREVIOUS"),
-		RabbitURL:             os.Getenv("PAYMENT_RABBIT_URL"),
-		SecureCookies:         getenvBool("PAYMENT_SECURE_COOKIES", true),
-		TrustedProxyHops:      getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
-		SelfServeCredIntake:   getenvBool("PAYMENT_SELFSERVE_CRED_INTAKE", false),
-		AccountKeySelector:    getenvBool("PAYMENT_ACCOUNT_KEY_SELECTOR", false),
-		ConsoleUsername:       getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
-		ConsoleBootstrapToken: os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
+		HTTPAddr:               getenv("PAYMENT_HTTP_ADDR", ":8080"),
+		DBPath:                 getenv("PAYMENT_DB_PATH", "payment.db"),
+		TenantTokens:           parseKV(os.Getenv("PAYMENT_TENANT_TOKENS")),
+		AdminTokens:            splitNonEmpty(os.Getenv("PAYMENT_ADMIN_TOKENS")),
+		OperatorTokens:         splitNonEmpty(os.Getenv("PAYMENT_OPERATOR_TOKENS")),
+		WebhookRefs:            parseKV(os.Getenv("PAYMENT_WEBHOOK_REFS")),
+		BankCreds:              bankCreds,
+		BankVaultKey:           os.Getenv("PAYMENT_BANK_VAULT_KEY"),
+		BankVaultKeyPrevious:   os.Getenv("PAYMENT_BANK_VAULT_KEY_PREVIOUS"),
+		RabbitURL:              os.Getenv("PAYMENT_RABBIT_URL"),
+		SecureCookies:          getenvBool("PAYMENT_SECURE_COOKIES", true),
+		TrustedProxyHops:       getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
+		SelfServeCredIntake:    getenvBool("PAYMENT_SELFSERVE_CRED_INTAKE", false),
+		AccountKeySelector:     getenvBool("PAYMENT_ACCOUNT_KEY_SELECTOR", false),
+		AccountOutboundWebhook: getenvBool("PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK", false),
+		ConsoleUsername:        getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
+		ConsoleBootstrapToken:  os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
 		C6: C6Config{
 			BaseURL:           os.Getenv("PAYMENT_C6_BASE_URL"),
 			TokenURL:          os.Getenv("PAYMENT_C6_TOKEN_URL"),

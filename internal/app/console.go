@@ -57,6 +57,12 @@ type ConsoleService struct {
 	// invoice use-cases (GenerateInvoice/ListInvoices return ErrNotConfigured) so
 	// wiring-light tests that don't exercise billing keep working.
 	invoices InvoiceStore
+	// webhooks is the durable, encrypted-at-rest outbound-webhook config store per
+	// Conta (SIN-69490, F0 of SIN-69486). Optional: a nil store disables the
+	// outbound-webhook use-cases (they return ErrOutboundWebhookUnavailable, mapped to
+	// 503) so wiring-light tests and the vault-less fallback keep working. The whole
+	// surface is dark behind PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK at the HTTP boundary.
+	webhooks OutboundWebhookStore
 	audit    ports.AuditLog
 	clock    ports.Clock
 	ids      ports.IDProvider
@@ -160,6 +166,10 @@ type ConsoleDeps struct {
 	// Invoices is the append-only Fatura store (SIN-69121). Optional: nil disables
 	// the invoice use-cases (the rest of the console still works).
 	Invoices InvoiceStore
+	// OutboundWebhooks is the durable, encrypted-at-rest outbound-webhook config store
+	// per Conta (SIN-69490). Optional: nil disables the outbound-webhook use-cases
+	// (ErrOutboundWebhookUnavailable → 503). Dark behind PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK.
+	OutboundWebhooks OutboundWebhookStore
 	// CredInvalidator evicts cached state keyed on a tenant's credential (the C6
 	// OAuth2 token cache) right after a credential write, closing the
 	// token-revocation lag (ADR-0003). Optional: nil degrades to a no-op.
@@ -197,6 +207,7 @@ func NewConsoleService(d ConsoleDeps) *ConsoleService {
 		credDeleter:   d.CredDeleter,
 		certDeleter:   d.CertDeleter,
 		invoices:      d.Invoices,
+		webhooks:      d.OutboundWebhooks,
 		credEvictor:   ci,
 		audit:         a,
 		clock:         d.Clock,

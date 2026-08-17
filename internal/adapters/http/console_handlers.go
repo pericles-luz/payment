@@ -925,7 +925,8 @@ func (s *Server) consoleError(w http.ResponseWriter, err error) {
 		http.Error(w, "not found", http.StatusNotFound)
 	case errors.Is(err, shared.ErrValidation):
 		http.Error(w, "invalid request", http.StatusBadRequest)
-	case errors.Is(err, app.ErrInvoicesUnavailable), errors.Is(err, app.ErrAccountsUnavailable):
+	case errors.Is(err, app.ErrInvoicesUnavailable), errors.Is(err, app.ErrAccountsUnavailable),
+		errors.Is(err, app.ErrOutboundWebhookUnavailable):
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "internal error", http.StatusInternalServerError)

@@ -186,23 +186,34 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Per-Conta outbound webhook config store (SIN-69490, F0 of SIN-69486). Durable +
+	// encrypted-at-rest ONLY when the vault cipher is present (PAYMENT_BANK_VAULT_KEY
+	// set) — the HMAC signing secret must be sealed at rest, so with no KEK we leave
+	// the store nil and the use-cases return 503 (the feature is dark behind
+	// PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK anyway). Reuses the SAME KEK as the bank/console
+	// vaults.
+	var outboundWebhooks app.OutboundWebhookStore
+	if vaultCipher != nil {
+		outboundWebhooks = sqlite.NewOutboundWebhookVault(db, vaultCipher, system.Clock{})
+	}
 	console := app.NewConsoleService(app.ConsoleDeps{
-		Tenants:         store,
-		Accounts:        store,
-		Pricing:         store,
-		Ledger:          store,
-		CredWriter:      creds,
-		CreditorWriter:  creds,
-		CredReader:      creds,
-		CertWriter:      certs,
-		CertReader:      certs,
-		CredDeleter:     creds,
-		CertDeleter:     certs,
-		Invoices:        store,
-		CredInvalidator: credInvalidator,
-		Audit:           store,
-		Clock:           system.Clock{},
-		IDs:             system.IDProvider{},
+		Tenants:          store,
+		Accounts:         store,
+		Pricing:          store,
+		Ledger:           store,
+		CredWriter:       creds,
+		CreditorWriter:   creds,
+		CredReader:       creds,
+		CertWriter:       certs,
+		CertReader:       certs,
+		CredDeleter:      creds,
+		CertDeleter:      certs,
+		Invoices:         store,
+		OutboundWebhooks: outboundWebhooks,
+		CredInvalidator:  credInvalidator,
+		Audit:            store,
+		Clock:            system.Clock{},
+		IDs:              system.IDProvider{},
 	})
 
 	// Self-contained console login (ADR-0001 Opção B, SIN-69265): username +
@@ -304,6 +315,9 @@ func run() error {
 		// implements ports.AuditLog.
 		AccountKeyMint: app.NewAccountKeyService(accountKeys, system.Clock{},
 			app.WithAccountKeyAudit(store, system.IDProvider{})),
+		// Per-Conta outbound webhook config console CRUD (SIN-69490, F0 of SIN-69486),
+		// default-off dark-ship: off hides the card and leaves the routes unregistered.
+		AccountOutboundWebhook: cfg.AccountOutboundWebhook,
 		// Model (b) empresa-cliente provisioning (ADR-0011 §4 / SIN-69281): a reseller
 		// Conta creates a new empresa-cliente via POST /v1/clients, bound to the Account
 		// resolved from its account-key (server-side, never the body — A01/T6). Backed by
