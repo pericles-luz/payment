@@ -263,3 +263,48 @@ Regras de disposição:
 Este gate é o análogo, para o payment, do **Pre-merge status-check gate (MANDATORY)**
 que já governa o fork do CRM: uma linha de defesa executável que sobrevive à ausência
 de branch protection.
+
+### 8.4 Resposta a uma violação detectada (fechar o loop detecção→resposta)
+
+O gate §8.3 é **preventivo** (aborta antes do merge) e **detectivo** (a trilha
+cronológica do thread revela, depois, qualquer inversão). Um controle detectivo sem
+resposta definida é incompleto: se um merge sem LGTM prévio já ocorreu, o §8 até aqui
+não dizia o que fazer. Esta seção fecha o loop.
+
+**Gatilho.** É violação do gate qualquer merge de PR sensível (§2) do payment em que o
+checklist §8.3, aplicado retroativamente, **não** encontre uma linha de LGTM do SecEng
+(`f229e3e1-990e-4ab1-b733-ebd7b2a07924`) com `createdAt` **anterior** à ação de merge —
+inclui o caso da PR #121 (stage-2 citou aprovação inexistente). Detecção tipicamente
+por: SecEng em heartbeat, auditoria de governança, ou qualquer terceiro relendo a ordem
+cronológica.
+
+**Resposta (ordem obrigatória):**
+
+1. **Registrar a violação** no thread da issue e do PR: classe (falha de *Separation of
+   Duties* + *Repudiation* — aprovação citada/assumida antes de existir), timeline com
+   timestamps, e o commit/PR mergeado. Sem registro a inversão fica silenciosa —
+   exatamente o que o gate combate.
+2. **A review de segurança retrospectiva do SecEng é OBRIGATÓRIA e o merge é tratado como
+   não-confiável até ela concluir.** Diferente do fluxo normal (a review precede o
+   merge), aqui ela é corretiva: o código já está em `main`/deploy. Não é opcional nem "a
+   critério"; enquanto pendente, o commit é risco não-avaliado.
+3. **Disposição pela review retro:**
+   - **Achado bloqueante →** revert imediato do commit (ou hotfix, se o revert quebrar
+     algo pior), e escalar ao CEO com o *blast radius* na primeira linha (regra "Escalate
+     production risk immediately").
+   - **Limpa (como em SIN-69508) →** registrar o LGTM retrospectivo com timestamp e
+     seguir; **não** reverter apenas pela violação de processo (instrução do CEO em
+     SIN-69508: código limpo não se reverte).
+4. **Escalar ao CEO independentemente do resultado do código.** A violação é falha de
+   **controle de processo/governança**, não necessariamente de código; o CEO detém a
+   autoridade de review independente (razão de ser do 2-estágios). Registrar como
+   incidente de governança **mesmo quando a review retro é limpa** — senão a reincidência
+   não é rastreada. (A própria PR #121 foi a origem deste §8.)
+5. **Reincidência.** Duas violações detectadas do gate elevam a prioridade da superação
+   estrutural (§8.2: per-agent GH identities → CODEOWNERS + branch protection nativa), que
+   remove a dependência de disciplina procedural.
+
+**Resultado.** O §8 passa a cobrir o ciclo completo: **prevenção** (§8.3 aborta o merge)
+→ **detecção** (trilha cronológica auditável) → **resposta** (esta seção: registrar,
+review retro obrigatória, reverter-se-achado, escalar CEO). Um merge fora de ordem deixa
+de ser um evento sem consequência definida.
