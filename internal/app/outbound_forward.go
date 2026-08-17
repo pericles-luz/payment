@@ -25,8 +25,9 @@ import (
 // Security bar (SIN-69489 §7 blocking checklist), enforced here:
 //   - A01 isolation: the endpoint is loaded by the delivery's OWN server-side accountID
 //     (never anything from a payload), so an event is only ever delivered to its Conta.
-//   - Fail-closed: no active endpoint (missing config / disabled) ⇒ dead-letter, never a
-//     forward, never a fallback to another Conta.
+//   - Fail-closed: a deliberately-disabled endpoint ⇒ dead-letter; a Conta with NO endpoint
+//     configured at all ⇒ Info log + terminal settle (SIN-69508, a normal operational state,
+//     not a failure). Either way: never a forward, never a fallback to another Conta.
 //   - Best-effort / D3: the whole path runs OUT-OF-BAND of the inbound C6 ACK (a
 //     background consumer, not the webhook handler), so a forward failure can never turn
 //     into an error response to C6 — it becomes a bounded retry then a dead-letter.
@@ -238,8 +239,14 @@ func (p *OutboundProcessor) deliverOne(ctx context.Context, d *outboundqueue.Del
 		// Configured but switched off ⇒ fail-closed park (never forward a disabled Conta).
 		return p.parkAndSettle(ctx, d, outboundqueue.ReasonEndpointInactive)
 	case errors.Is(err, shared.ErrNotFound):
-		// No endpoint at all ⇒ fail-closed park (A01: never fall back to another Conta).
-		return p.parkAndSettle(ctx, d, outboundqueue.ReasonEndpointInactive)
+		// No endpoint configured at all ⇒ NOT a failure (SIN-69508). This is a valid
+		// reseller Conta that simply never set up an outbound webhook: the board wants that
+		// treated as a normal, observable operational condition — emit ONE Info log and
+		// settle terminally, WITHOUT a dead-letter/audit/retry. This is deliberately DISTINCT
+		// from the !cfg.Enabled() branch above (an operator switched an existing endpoint
+		// off), which still parks for visibility. A01 is preserved either way: no fallback to
+		// another Conta, and there is no URL/secret to leak here (none is configured).
+		return p.settleNoConfig(ctx, d)
 	default:
 		// Transient store error: leave on the outbox for the next tick (fail-safe). Do NOT
 		// dead-letter (the owner may be perfectly valid) and do NOT forward (no endpoint).
@@ -321,6 +328,29 @@ func (p *OutboundProcessor) backoff(attempt int) time.Duration {
 	half := d / 2
 	jitter := time.Duration(p.rand() * float64(half))
 	return half + jitter
+}
+
+// settleNoConfig handles a delivery whose owning Conta has NO outbound endpoint configured
+// (shared.ErrNotFound). Per SIN-69508 this is a normal, observable operational condition —
+// not a failure: emit ONE structured Info log identifying the Conta by accountID (plus the
+// non-PII routing IDs event_key/tx_id) and remove the delivery from the outbox terminally
+// (settle). No dead-letter, no audit, no retry — distinct from a deliberately-disabled
+// endpoint, which parks. The Conta is identified only by ID; there is no URL or secret to
+// leak (none is configured), matching the SSRF-7 redaction the rest of the file follows.
+// The delivery MUST be removed from the outbox: otherwise it is re-claimed every tick,
+// spamming the log and keeping the outbox dirty.
+func (p *OutboundProcessor) settleNoConfig(ctx context.Context, d *outboundqueue.Delivery) bool {
+	slog.InfoContext(ctx, "outbound forward: no endpoint configured for account, nothing to forward",
+		"event", "outbound.forward.no_endpoint_configured",
+		"account_id", d.AccountID(),
+		"event_type", d.EventType(),
+		"event_key", d.EventKey(),
+		"tx_id", d.TxID())
+	if err := p.outbox.DeleteDelivery(ctx, d.ID()); err != nil {
+		slog.ErrorContext(ctx, "outbound forward: could not remove no-config event",
+			"event", "outbound.forward.error", "account_id", d.AccountID(), "err", err)
+	}
+	return true
 }
 
 // settleDelivered removes a delivered event from the outbox and records the per-attempt
