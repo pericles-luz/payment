@@ -93,6 +93,56 @@ func (s *OutboundDeliveryStore) PendingDeliveries(ctx context.Context, accountID
 	return out, nil
 }
 
+// ClaimPendingDeliveries returns up to limit pending outbox deliveries ACROSS all Contas,
+// oldest first — the batch F2's processor forwards on each tick. It is the cross-account
+// consumer read (contrast the account-scoped PendingDeliveries used for inspection); A01
+// is preserved downstream because the processor loads each Conta's endpoint by the row's
+// own account_id, never crosses it. A non-positive limit yields an empty batch.
+func (s *OutboundDeliveryStore) ClaimPendingDeliveries(ctx context.Context, limit int) ([]*outboundqueue.Delivery, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, account_id, tenant_id, event_key, tx_id, event_type, status, created_at
+		   FROM account_outbound_delivery
+		  WHERE status = ?
+		  ORDER BY created_at ASC, id ASC
+		  LIMIT ?`,
+		string(outboundqueue.StatusPending), limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim pending deliveries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*outboundqueue.Delivery
+	for rows.Next() {
+		var id, acct, tenantID, eventKey, txID, eventType, status, createdAt string
+		if err := rows.Scan(&id, &acct, &tenantID, &eventKey, &txID, &eventType, &status, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan pending delivery: %w", err)
+		}
+		out = append(out, outboundqueue.RehydrateDelivery(
+			id, acct, tenantID, eventKey, txID, eventType,
+			outboundqueue.DeliveryStatus(status), parseTime(createdAt)))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending deliveries: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteDelivery removes a delivery from the outbox by id — the terminal step F2 takes
+// once a delivery is settled (forwarded 2xx, or given up and dead-lettered). The outbox
+// is a work queue, so a settled row leaves it; the audit trail (delivered / dead_letter)
+// is the durable record of the outcome. It is idempotent: deleting an absent id is a
+// no-op.
+func (s *OutboundDeliveryStore) DeleteDelivery(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM account_outbound_delivery WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete outbound delivery: %w", err)
+	}
+	return nil
+}
+
 // DeadLetters returns all parked dead-letters, oldest first, for operator inspection /
 // replay. The park has no Conta owner by definition, so it is not account-scoped.
 func (s *OutboundDeliveryStore) DeadLetters(ctx context.Context) ([]*outboundqueue.DeadLetter, error) {

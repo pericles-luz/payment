@@ -126,6 +126,17 @@ const (
 	ActionSetOutboundWebhook          Action = "account.webhook.set"
 	ActionRotateOutboundWebhookSecret Action = "account.webhook.rotate_secret"
 	ActionRemoveOutboundWebhook       Action = "account.webhook.remove"
+
+	// ActionOutboundWebhookDelivered / ActionOutboundWebhookDeadLettered record the
+	// per-attempt RESULT of forwarding a Conta's event to its outbound endpoint
+	// (SIN-69492, F2 of SIN-69486; threat model SIN-69489 §3 R1 — non-repudiation). They
+	// are account-scoped and name which Conta and which inbound event_key (as the subject
+	// txID) the attempt concerned, plus its terminal outcome — delivered (2xx) or
+	// dead-lettered (endpoint inactive / retries exhausted). Like every audit action they
+	// record a FACT only: never the payload, never the signing secret, never the
+	// destination response body (the constructor has no such parameter).
+	ActionOutboundWebhookDelivered    Action = "account.webhook.delivered"
+	ActionOutboundWebhookDeadLettered Action = "account.webhook.dead_letter"
 )
 
 // recurrenceActionByStatus maps a recurrence.RecStatus string to the audit Action
@@ -153,7 +164,8 @@ func (a Action) valid() bool {
 		ActionSettlementAmountMismatch, ActionRecCreated, ActionRecApproved,
 		ActionRecRejected, ActionRecExpired, ActionRecCancelled, ActionCobRCreated,
 		ActionSetBankCertificate, ActionInvoiceGenerated, ActionMintAccountKey,
-		ActionSetOutboundWebhook, ActionRotateOutboundWebhookSecret, ActionRemoveOutboundWebhook:
+		ActionSetOutboundWebhook, ActionRotateOutboundWebhookSecret, ActionRemoveOutboundWebhook,
+		ActionOutboundWebhookDelivered, ActionOutboundWebhookDeadLettered:
 		return true
 	default:
 		return false
@@ -349,6 +361,50 @@ func NewOutboundWebhookEntry(id, operatorID string, action Action, accountID str
 		action:     action,
 		at:         at,
 		accountID:  accountID,
+	}, nil
+}
+
+// outboundDeliveryActionValid reports whether action is one of the F2 per-attempt
+// delivery-result actions NewOutboundDeliveryEntry accepts (deny-by-default so a config
+// action or a foreign action can never be smuggled through the delivery constructor).
+func outboundDeliveryActionValid(action Action) bool {
+	switch action {
+	case ActionOutboundWebhookDelivered, ActionOutboundWebhookDeadLettered:
+		return true
+	default:
+		return false
+	}
+}
+
+// NewOutboundDeliveryEntry builds the per-attempt audit record for forwarding a Conta's
+// event to its outbound endpoint (SIN-69492, F2 of SIN-69486; threat model SIN-69489 §3
+// R1). It is account-scoped — the target is the owning Conta (accountID explicit,
+// tenant_id empty, like the other account.* actions) — and carries the inbound event_key
+// as the subject txID so the trail can be joined to the outbox/dead-letter and the
+// inbound processed-events barrier. It records the FACT and its RESULT (delivered /
+// dead-lettered) only, NEVER the payload, the signing secret or the destination's
+// response, by construction (no such parameter — threat R1/I3). operatorID is the system
+// actor (a forward has no human operator). Invariants: a non-empty id, a known delivery
+// action and a non-empty accountID; eventKey may be empty (an event that carried none).
+func NewOutboundDeliveryEntry(id, operatorID string, action Action, accountID, eventKey string, at time.Time) (Entry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Entry{}, shared.NewValidationError("id", "audit entry id is required")
+	}
+	if !outboundDeliveryActionValid(action) {
+		return Entry{}, shared.NewValidationError("action", "unknown outbound delivery audit action")
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return Entry{}, shared.NewValidationError("account_id", "account id is required")
+	}
+	return Entry{
+		id:         id,
+		operatorID: strings.TrimSpace(operatorID),
+		action:     action,
+		at:         at,
+		accountID:  accountID,
+		txID:       strings.TrimSpace(eventKey),
 	}, nil
 }
 

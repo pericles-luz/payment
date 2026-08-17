@@ -47,6 +47,13 @@ const (
 	// to its Conta and waiting on the outbox for F2 to forward. It is the ONLY status
 	// F1 writes.
 	StatusPending DeliveryStatus = "pending"
+
+	// StatusDelivered is the terminal success state F2 reaches when the Conta's endpoint
+	// accepts a forward (2xx). F2 consumes the outbox as a work queue — a delivered row
+	// leaves the queue — so this value is used to describe/audit the transition rather
+	// than persisted long-term; it is defined here so the lifecycle vocabulary lives with
+	// the aggregate.
+	StatusDelivered DeliveryStatus = "delivered"
 )
 
 // Reason is the closed set of causes for parking an inbound event as a DeadLetter.
@@ -59,15 +66,28 @@ const (
 	// ReasonUnresolvable marks an inbound event whose owning Conta could not be
 	// determined at attribution time (the tenant→account resolution failed). It is a
 	// fail-closed outcome: the event is parked for inspection/replay rather than
-	// forwarded to a guessed Conta.
+	// forwarded to a guessed Conta. F1 produces this one.
 	ReasonUnresolvable Reason = "unresolvable"
+
+	// ReasonEndpointInactive marks an attributed event whose owning Conta has no active
+	// outbound endpoint at forward time (no config, or config disabled). It is a
+	// fail-closed outcome from F2: the event is parked rather than forwarded anywhere
+	// (there is nothing legitimate to forward to) and, critically, never to another
+	// Conta's endpoint (A01).
+	ReasonEndpointInactive Reason = "endpoint_inactive"
+
+	// ReasonDeliveryExhausted marks an attributed event whose forward failed on every
+	// bounded attempt (the endpoint kept erroring or timing out). It is F2's terminal
+	// give-up: the event leaves the outbox and is parked for inspection/replay instead
+	// of being retried forever (threat D1 — no infinite retry loop).
+	ReasonDeliveryExhausted Reason = "delivery_exhausted"
 )
 
 // valid reports whether r is a known reason. Guards the DeadLetter constructor so a
 // caller cannot persist an arbitrary/empty reason string.
 func (r Reason) valid() bool {
 	switch r {
-	case ReasonUnresolvable:
+	case ReasonUnresolvable, ReasonEndpointInactive, ReasonDeliveryExhausted:
 		return true
 	default:
 		return false
@@ -213,6 +233,24 @@ func NewDeadLetter(id, tenantID, eventKey, txID, eventType string, reason Reason
 		reason:    reason,
 		createdAt: now,
 	}, nil
+}
+
+// DeadLetterFromDelivery parks an already-attributed Delivery that F2 could not deliver
+// (its endpoint is inactive, or every bounded forward attempt failed). It carries the
+// Delivery's tenant/event_key/tx_id/event_type across to the park with the given F2
+// reason (ReasonEndpointInactive / ReasonDeliveryExhausted). The park deliberately keeps
+// NO account_id (the dead-letter table has no such column — an unattributable F1 event
+// has no owner) — the owning Conta is recoverable from the audit trail and the shared
+// event_key, so the park stays a single uniform shape. A non-F2 reason is rejected so a
+// caller cannot mislabel a delivery failure.
+func DeadLetterFromDelivery(id string, d *Delivery, reason Reason, now time.Time) (*DeadLetter, error) {
+	if d == nil {
+		return nil, shared.NewValidationError("delivery", "delivery is required")
+	}
+	if reason != ReasonEndpointInactive && reason != ReasonDeliveryExhausted {
+		return nil, shared.NewValidationError("reason", "reason is not an F2 delivery-failure reason")
+	}
+	return NewDeadLetter(id, d.tenantID, d.eventKey, d.txID, d.eventType, reason, now)
 }
 
 // RehydrateDeadLetter rebuilds a DeadLetter from persisted state (adapters only).

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mrand "math/rand/v2"
 	stdhttp "net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	consoleauthstore "github.com/ia-dev-sindireceita/payment/internal/adapters/consoleauth"
 	httpadapter "github.com/ia-dev-sindireceita/payment/internal/adapters/http"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/messaging/inmemory"
+	"github.com/ia-dev-sindireceita/payment/internal/adapters/outbound"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
@@ -215,6 +217,28 @@ func run() error {
 	if vaultCipher != nil {
 		outboundWebhooks = sqlite.NewOutboundWebhookVault(db, vaultCipher, system.Clock{})
 	}
+
+	// Outbound webhook FORWARD (SIN-69492, F2 of SIN-69486): a background consumer of the
+	// F1 outbox that delivers each attributed event to its owning Conta's endpoint, signed
+	// per-Conta over an SSRF-safe client (threat model SIN-69489). Best-effort and DARK
+	// behind the same PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK flag — the processor is inert unless
+	// the flag is on AND the config store exists (it needs the sealed signing secret, so it
+	// is nil without a KEK). Running out-of-band of the inbound handler keeps the C6 ACK
+	// fully decoupled from delivery (threat D3). The forwarder/limiter own all SSRF
+	// hardening (dial-time IP guard, no redirects, timeouts); this layer never touches net.
+	outboundProcessor := app.NewOutboundProcessor(app.OutboundProcessorDeps{
+		Enabled:     cfg.AccountOutboundWebhook,
+		Outbox:      outboundDeliveries,
+		Configs:     outboundWebhooks,
+		Forwarder:   outbound.NewForwarder(),
+		Limiter:     outbound.NewPerAccountLimiter(),
+		DeadLetters: outboundDeliveries,
+		Audit:       store,
+		Clock:       system.Clock{},
+		IDs:         system.IDProvider{},
+		Rand:        mrand.Float64,
+	})
+
 	console := app.NewConsoleService(app.ConsoleDeps{
 		Tenants:          store,
 		Accounts:         store,
@@ -351,6 +375,11 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// F2 outbound-forward worker: tick the outbox consumer on a fixed interval, bound to
+	// the signal context so it stops cleanly on shutdown (no goroutine leak). The processor
+	// is a no-op while the flag is off, so this loop is inert until the feature is enabled.
+	go runOutboundForwardWorker(ctx, outboundProcessor, 2*time.Second)
+
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("api: listening on %s", cfg.HTTPAddr)
@@ -369,6 +398,26 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// runOutboundForwardWorker drives the F2 outbound-forward processor on a fixed interval
+// until ctx is cancelled. A per-tick error (e.g. a transient outbox read failure) is only
+// logged — the loop keeps ticking — and per-delivery failures never surface here (they are
+// dead-lettered inside the processor). When the flag is off the processor is inert, so this
+// loop costs one cheap claim per tick and originates no I/O.
+func runOutboundForwardWorker(ctx context.Context, p *app.OutboundProcessor, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := p.ProcessPending(ctx); err != nil {
+				log.Printf("api: outbound forward tick: %v", err)
+			}
+		}
+	}
 }
 
 // credentialAdapter is the union of bank OAuth-credential ports the wiring depends

@@ -116,6 +116,49 @@ func (s *OutboundDeliveryStore) PendingDeliveries(_ context.Context, accountID s
 	return out, nil
 }
 
+// ClaimPendingDeliveries returns up to limit pending deliveries ACROSS all Contas in
+// insertion order (oldest first) — the cross-account batch F2's processor forwards. It
+// mirrors the sqlite adapter's cross-account claim; A01 is preserved downstream by the
+// processor loading each Conta's endpoint by the row's own account_id. A non-positive
+// limit yields an empty batch.
+func (s *OutboundDeliveryStore) ClaimPendingDeliveries(_ context.Context, limit int) ([]*outboundqueue.Delivery, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*outboundqueue.Delivery
+	for _, r := range s.deliveries {
+		if r.status != outboundqueue.StatusPending {
+			continue
+		}
+		out = append(out, outboundqueue.RehydrateDelivery(
+			r.id, r.accountID, r.tenantID, r.eventKey, r.txID, r.eventType, r.status, r.createdAt))
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// DeleteDelivery removes a delivery from the outbox by id (terminal step once F2 has
+// settled it). Idempotent: an absent id is a no-op. The (accountID,eventKey) dedup key is
+// also cleared so a legitimate later re-attribution of the SAME event can re-enqueue —
+// matching the sqlite adapter where the row (and thus the unique index entry) is gone.
+func (s *OutboundDeliveryStore) DeleteDelivery(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, r := range s.deliveries {
+		if r.id != id {
+			continue
+		}
+		delete(s.seenDeliver, r.accountID+"|"+r.eventKey)
+		s.deliveries = append(s.deliveries[:i], s.deliveries[i+1:]...)
+		return nil
+	}
+	return nil
+}
+
 // DeadLetters returns all parked dead-letters in insertion order.
 func (s *OutboundDeliveryStore) DeadLetters(_ context.Context) ([]*outboundqueue.DeadLetter, error) {
 	s.mu.RLock()
