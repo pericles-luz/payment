@@ -111,6 +111,20 @@ func RowAAD(tenantID, bankID string) []byte {
 	return out
 }
 
+// ConsoleAAD builds the additional authenticated data that cryptographically binds a
+// sealed console-credential blob (the TOTP secret) to its storage row (the operator
+// username). Like RowAAD it is NOT secret and is NOT stored — it is reconstructed on
+// read from the row's own username column. A sealed TOTP secret copied to a
+// differently-named console_credential row then fails to open (defense in depth
+// beyond the row lookup; SIN-69432, mirroring the bank vault's SIN-69369 binding).
+// The distinct domain tag keeps this binding from ever being confused with the
+// bank-vault RowAAD scheme.
+func ConsoleAAD(username string) []byte {
+	// Tag documents the binding scheme and version; bump if the layout ever changes.
+	out := []byte("payment/console-cred/row/v1")
+	return appendLenPrefixed(out, username)
+}
+
 // appendLenPrefixed appends an 8-byte big-endian length followed by s, so that a
 // concatenation of fields is unambiguous regardless of the fields' contents.
 func appendLenPrefixed(dst []byte, s string) []byte {

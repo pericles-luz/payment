@@ -1,0 +1,26 @@
+name: OpenAPI lint
+
+# Validates the machine-readable API contract (docs/api/openapi.yaml) on every
+# change to it. Doc-only guard for the "venda da API" surface (SIN-69429): the
+# spec is the source of truth integrators (1º cliente Verz) code against, so a
+# malformed spec must fail CI before it ships. Reversible: delete this file to
+# drop the check. Runs only when the spec changes, so it adds no latency to
+# ordinary Go PRs.
+on:
+  push:
+    branches: [main]
+    paths: [docs/api/openapi.yaml]
+  pull_request:
+    paths: [docs/api/openapi.yaml]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: redocly lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: redocly lint (OpenAPI 3.1)
+        run: npx --yes @redocly/cli@1 lint docs/api/openapi.yaml

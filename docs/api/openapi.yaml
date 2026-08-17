@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: API de Pagamentos Sindireceita
-  version: "1.0.0"
+  version: "1.1.0"
   summary: Cobrança e conciliação (PIX, boleto, checkout, DDA) sobre bancos do cliente.
   description: |
     API REST `/v1` que empresas usam como meio de cobrança sobre a **sua própria**
@@ -9,6 +9,13 @@ info:
     da empresa). Primeiro banco em produção: **C6**.
 
     Guia de integração/onboarding: `integration-guide.md` (mesma pasta).
+    Manual de casos de uso end-to-end (cookbook com `curl` por caso):
+    `manual.md` (mesma pasta) — cada caso referencia o `operationId` daqui.
+
+    Além do plano `/v1` cliente-facing, este contrato documenta o **plano
+    administrativo `/admin/*`** (tag `admin`, autenticado por token de admin —
+    NÃO por token de empresa-cliente) e o **webhook inbound** de liquidação do
+    C6 (tag `Webhooks`), do ponto de vista do integrador.
 
     Convenções globais:
     - **Autenticação:** `Authorization: Bearer <token>` em toda rota `/v1`. A
@@ -72,6 +79,20 @@ tags:
       (flag-gated `PAYMENT_SELFSERVE_CRED_INTAKE`, default-off): credencial PSP e
       certificado mTLS enviados pela API, tenant = chamador autenticado (sem
       seletor → A01 eliminado por construção).
+  - name: admin
+    description: >-
+      Plano administrativo `/admin/*` (interno — operado pela Sindireceita, NÃO
+      exposto a empresas-clientes). Autenticado por **token de admin**
+      (`adminAuth`), segregado do plano `/v1`: um token de empresa-cliente nunca
+      resolve papel e é rejeitado (deny-by-default). Mutações exigem o papel
+      `admin` completo; `operator` é somente-leitura. Cadastro de tenants, preço
+      por rota (bilhetagem), material bancário e bootstrap de chave-de-Conta.
+  - name: Webhooks
+    description: >-
+      Callback inbound de liquidação do C6 (`POST /webhooks/c6/{tenantRef}`).
+      Documentado do ponto de vista do integrador/operador: autenticidade pela
+      ref opaca no path, dedup e isolamento por tenant. Não é chamado pelas
+      empresas-clientes — é o C6 que chama a Sindireceita.
 
 paths:
   /healthz:
@@ -676,6 +697,234 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  # ---------------------------------------------------------------------------
+  # Plano administrativo /admin/* (interno). adminAuth; mutações exigem papel
+  # `admin`. Segregado do plano /v1 — um token de empresa-cliente é rejeitado.
+  # ---------------------------------------------------------------------------
+  /admin/tenants:
+    post:
+      operationId: adminCreateTenant
+      tags: [admin]
+      summary: Cadastrar uma empresa-cliente (tenant)
+      description: >-
+        Cria uma empresa-cliente no plano administrativo (modelo a / bootstrap).
+        No modelo (b) a Conta provisiona suas próprias empresas-clientes via
+        `POST /v1/clients` (operationId `provisionClient`).
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTenantRequest" }
+      responses:
+        "201":
+          description: Empresa-cliente criada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /admin/tenants/{tenantID}/pricing:
+    post:
+      operationId: adminSetPrice
+      tags: [admin]
+      summary: Definir o preço (bilhetagem) de uma rota para a empresa-cliente
+      description: >-
+        Define o custo em centavos de um `endpoint` para a empresa-cliente
+        (bilhetagem por rota × cliente). O consumo é medido no plano `/v1` e
+        consolidado em faturas (console `/console`).
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PathTenantID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetPriceRequest" }
+      responses:
+        "200":
+          description: Preço definido.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Price" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /admin/tenants/{tenantID}/bank-credential:
+    put:
+      operationId: adminSetBankCredential
+      tags: [admin]
+      summary: Gravar/rotacionar a credencial bancária de uma empresa-cliente
+      description: >-
+        Grava a credencial PSP (`client_id` + `secret`) da empresa-cliente para
+        um banco. Equivalente admin do intake self-serve
+        (`setSelfServeBankCredential`). O `secret` é **write-only**: nunca é
+        retornado, logado ou ecoado — a resposta traz só campos não-secretos.
+        `bank` opcional (default `c6`); banco desconhecido → `400`.
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PathTenantID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdminSetBankCredentialRequest" }
+      responses:
+        "200":
+          description: Credencial gravada (metadados não-secretos; sem o secret).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BankCredentialView" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /admin/tenants/{tenantID}/bank-certificate:
+    put:
+      operationId: adminSetBankCertificate
+      tags: [admin]
+      summary: Gravar/rotacionar o certificado mTLS de uma empresa-cliente
+      description: >-
+        Grava o par certificado/chave mTLS (`cert_pem`/`key_pem`) da
+        empresa-cliente para um banco. Equivalente admin do intake self-serve
+        (`setSelfServeBankCertificate`). A **chave privada** é **write-only**:
+        validada server-side (parse x509, casamento cert/chave, rejeição de
+        expirado → `400`) e nunca retornada — a resposta traz só metadados
+        públicos. `bank` opcional (default `c6`); banco desconhecido → `400`.
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PathTenantID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdminSetBankCertificateRequest" }
+      responses:
+        "200":
+          description: Certificado gravado (só metadados públicos; nunca a chave privada).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BankCertificateView" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /admin/accounts/{accountID}/account-key:
+    post:
+      operationId: adminMintAccountKey
+      tags: [admin]
+      summary: Emitir a 1ª chave-de-Conta (bootstrap, modelo b)
+      description: |
+        **Bootstrap admin (modelo b — ADR-0011 §3).** Um admin emite a PRIMEIRA
+        chave-de-Conta de uma Conta nomeada (é assim que o board provisiona a
+        1ª chave do Verz), entregue depois por canal seguro (nunca comentário
+        público). Depois disso a Conta se auto-rotaciona via
+        `POST /v1/account-key` (operationId `rotateAccountKey`).
+
+        Usa o MESMO caminho `create==rotate`: chamar numa Conta que já tem chave
+        **rotaciona** (override admin intencional). `Idempotency-Key`
+        obrigatório; replay sob a mesma chave → `409` SEM o segredo
+        (display-once). Se o emissor não estiver montado → `503`.
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PathAccountID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "201":
+          description: Chave emitida; segredo exibido UMA vez.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountKeyIssued" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: >-
+            Idempotency-Key já usado; o segredo é exibido só uma vez — rotacione
+            com uma Idempotency-Key nova para um segredo novo.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "idempotency key already used; the secret is shown only once — rotate with a fresh Idempotency-Key for a new secret" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503":
+          description: Emissão de chave-de-Conta indisponível (emissor não montado).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "account key issuance unavailable" }
+
+  # ---------------------------------------------------------------------------
+  # Webhook inbound de liquidação do C6. Chamado pelo C6, não pelo integrador.
+  # ---------------------------------------------------------------------------
+  /webhooks/c6/{tenantRef}:
+    post:
+      operationId: c6Webhook
+      tags: [Webhooks]
+      summary: Callback de liquidação do C6 (inbound, unsigned)
+      description: |
+        Notificação de liquidação enviada **pelo C6** para a Sindireceita. Não é
+        chamado pelas empresas-clientes — está aqui para o integrador/operador
+        entender o modelo de reconciliação.
+
+        **Autenticidade:** o C6 não assina o callback (ADR-0002/F4); a
+        autenticidade é a **ref opaca por-tenant no path** (`{tenantRef}`), um
+        capability secret. Ref ausente/desconhecida/malformada → **`401`**
+        uniforme (sem oráculo de existência de tenant). A ref NUNCA deve ir para
+        log de proxy — mascare o segmento no ingress.
+
+        **Corpo:** cap de 64 KiB (acima → `413`); JSON com campos desconhecidos
+        rejeitado (`400`). O tenant vem SEMPRE da ref (canal), nunca do corpo;
+        se o corpo trouxer um `client_id` divergente do canal → `401` (indicador
+        de ataque, logado sem a ref/corpo). `external_id` vazio → `400`.
+
+        **Dedup + reconcile-before-settle:** `event_key =
+        external_id|service|status`; redeliveries exatas são suprimidas
+        (`processed_events`, retenção indefinida — o contrato não assina
+        timestamp). `service` seleciona o que reconciliar (`checkout`, `rec`,
+        `cobr`, ou PIX/charge por padrão). `status` é **advisory** — a
+        liquidação é decidida pela reconciliação autoritativa, nunca pelo corpo.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/PathTenantRef"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/C6WebhookNotification" }
+      responses:
+        "202":
+          description: Aceito; reconciliação/liquidação já tentada de forma síncrona.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookAccepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: Corpo acima do limite de 64 KiB.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "request body too large" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -691,6 +940,15 @@ components:
         empresa-cliente. Exige o header `X-Client-Tenant` a cada chamada `/v1`
         para escolher a empresa-cliente-alvo (mediado pelo guard §2). Emitida/
         rotacionada via `POST /v1/account-key`.
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Token de **admin** do plano `/admin/*` (interno). Deny-by-default: um
+        token de empresa-cliente ou uma chave-de-Conta nunca resolve papel de
+        admin e é rejeitado. O papel `admin` autoriza mutações; `operator` é
+        somente-leitura. Distribuído fora de banda pela Sindireceita; nunca
+        em URL/log.
 
   parameters:
     ClientSelector:
@@ -722,6 +980,27 @@ components:
       in: path
       required: true
       schema: { type: string }
+    PathTenantID:
+      name: tenantID
+      in: path
+      required: true
+      description: Identificador da empresa-cliente (tenant) alvo da operação administrativa.
+      schema: { type: string }
+    PathAccountID:
+      name: accountID
+      in: path
+      required: true
+      description: Identificador da Conta (revendedor) alvo do bootstrap de chave.
+      schema: { type: string }
+    PathTenantRef:
+      name: tenantRef
+      in: path
+      required: true
+      description: >-
+        Ref opaca por tenant do callback (capability secret). É a ÚNICA
+        credencial do webhook (o C6 não assina). Nunca deve aparecer em log de
+        proxy/acesso.
+      schema: { type: string }
 
   responses:
     BadRequest:
@@ -738,6 +1017,14 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: "unauthorized" }
+    Forbidden:
+      description: >-
+        Autenticado mas sem papel suficiente (ex.: token `operator` numa mutação
+        do plano admin, que exige papel `admin`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "forbidden" }
     NotFound:
       description: Recurso inexistente ou pertencente a outra empresa (mesma resposta, para não vazar existência).
       content:
@@ -771,16 +1058,18 @@ components:
       type: object
       description: >-
         Resultado da emissão/rotação da chave-de-Conta (modelo b). O campo
-        `account_key` traz o segredo em claro e aparece **uma única vez** — não
-        é retornado em nenhuma outra chamada nem registrado em log.
-      required: [account_key, account_id]
+        `secret` traz o segredo em claro e aparece **uma única vez** — não é
+        retornado em nenhuma outra chamada nem registrado em log. Uma emissão e
+        uma rotação têm resposta byte-idêntica (`status: created`), sem oráculo
+        de "a Conta já tinha chave".
+      required: [account_id, secret, status]
       properties:
-        account_key:
+        account_id: { type: string, description: Identificador da Conta dona da chave. }
+        secret:
           type: string
           description: Segredo em claro `ak_…` (≥256-bit). Guardar em cofre no ato; exibido só aqui.
           example: "ak_9f2c…redigido…"
-        account_id: { type: string, description: Identificador da Conta dona da chave. }
-        rotated: { type: boolean, description: "true se invalidou uma chave anterior; false na 1ª emissão." }
+        status: { type: string, enum: [created], description: "Sempre `created` (create==rotate; sem oráculo)." }
 
     CreateClientRequest:
       type: object
@@ -1103,3 +1392,86 @@ components:
         entries:
           type: array
           items: { $ref: "#/components/schemas/StatementEntry" }
+
+    # --- Plano administrativo /admin/* ---
+    CreateTenantRequest:
+      type: object
+      description: Cadastro de empresa-cliente pelo plano admin.
+      required: [name]
+      properties:
+        name: { type: string, description: Nome/label da empresa-cliente. }
+    Tenant:
+      type: object
+      properties:
+        id: { type: string, description: Identificador da empresa-cliente. }
+        name: { type: string }
+        active: { type: boolean }
+    SetPriceRequest:
+      type: object
+      description: Preço (bilhetagem) de uma rota para a empresa-cliente.
+      required: [endpoint, price_cents]
+      properties:
+        endpoint: { type: string, description: "Identificador da rota tarifada (ex.: `pix.create`)." }
+        price_cents: { type: integer, format: int64, description: Custo em centavos por chamada da rota. }
+    Price:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        endpoint: { type: string }
+        price_cents: { type: integer, format: int64 }
+    AdminSetBankCredentialRequest:
+      type: object
+      description: >-
+        Credencial PSP de uma empresa-cliente (plano admin). `secret` é
+        write-only — nunca retornado, logado ou ecoado.
+      required: [client_id, secret]
+      properties:
+        bank:
+          type: string
+          description: Slug do banco (opcional, default `c6`; desconhecido → 400).
+          example: c6
+        client_id: { type: string, description: Client id da credencial OAuth2 do PSP. }
+        secret: { type: string, description: Secret da credencial. Write-only. }
+    AdminSetBankCertificateRequest:
+      type: object
+      description: >-
+        Certificado cliente mTLS de uma empresa-cliente (plano admin). `key_pem`
+        é write-only — validado server-side e nunca retornado.
+      required: [cert_pem, key_pem]
+      properties:
+        bank:
+          type: string
+          description: Slug do banco (opcional, default `c6`; desconhecido → 400).
+          example: c6
+        cert_pem: { type: string, description: Certificado leaf PÚBLICO em PEM. }
+        key_pem: { type: string, description: Chave privada em PEM. Write-only; envie só sobre TLS. }
+
+    # --- Webhook inbound do C6 ---
+    C6WebhookNotification:
+      type: object
+      description: >-
+        Corpo do callback de liquidação do C6. O tenant vem da ref no path, não
+        daqui. Campos desconhecidos são rejeitados (`400`).
+      required: [external_id]
+      properties:
+        external_id:
+          type: string
+          description: Id da cobrança no C6 (chave de reconciliação / txid).
+        client_id:
+          type: string
+          description: >-
+            Id do merchant no C6. Cross-checado contra o canal, nunca confiado;
+            divergência → 401.
+        service:
+          type: string
+          description: >-
+            Seleciona o que reconciliar. Vazio/desconhecido → PIX/charge; valores
+            especiais `checkout`, `rec`, `cobr`.
+          example: pix
+        status:
+          type: string
+          description: Advisory apenas — nunca decide a liquidação (reconciliação é autoritativa).
+    WebhookAccepted:
+      type: object
+      properties:
+        status: { type: string, enum: [accepted], description: Sempre `accepted` quando a reconciliação síncrona não falhou. }
