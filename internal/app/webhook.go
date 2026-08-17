@@ -38,6 +38,10 @@ type WebhookService struct {
 	// recurrence dispatch unwired: HandleRecEvent/HandleCobREvent then fail closed.
 	recReader  ports.RecProvider
 	cobrReader ports.CobRProvider
+	// attributor materialises a settled event onto its owning Conta's outbound-delivery
+	// outbox (SIN-69491, F1 of SIN-69486). Nil / disabled ⇒ the feature is dark and
+	// settlement is unchanged. Its calls are best-effort: never affect the ACK to C6.
+	attributor *OutboundAttributor
 }
 
 // NewWebhookService wires a WebhookService from the provided ports. A nil
@@ -60,6 +64,7 @@ func NewWebhookService(d Deps) *WebhookService {
 		ids:        d.IDs,
 		recReader:  d.RecReader,
 		cobrReader: d.CobRReader,
+		attributor: d.OutboundAttributor,
 	}
 }
 
@@ -251,5 +256,13 @@ func (s *WebhookService) publishSettled(ctx context.Context, settled *payment.Pa
 		IdempotencyKey: ev.EventKey,
 		Payload:        payload,
 	})
+	// F1 (SIN-69491): attribute the settled event to its owning Conta and materialise
+	// it on that Conta's outbound-delivery outbox for F2 to forward. Best-effort and
+	// dark: the attributor is a no-op unless PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK is on and
+	// it is fully wired, and it NEVER returns an error — an attribution failure must not
+	// turn a settled payment into a webhook error to C6 (threat D3). The tenant is the
+	// settled payment's own tenant (server-side authoritative), the dedup key is the
+	// inbound event_key, and the business event type is payment.paid.
+	s.attributor.Attribute(ctx, settled.TenantID(), ev.EventKey, settled.TxID(), TopicPaymentPaid)
 	return nil
 }

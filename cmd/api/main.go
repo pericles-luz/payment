@@ -115,31 +115,50 @@ func run() error {
 	// bank gains PIX Automático (SIN-66022).
 	recReader, cobrReader := recurrenceReaders(registry)
 
+	// Outbound webhook attribution (SIN-69491, F1 of SIN-69486): on a settled inbound
+	// event, resolve the owning Conta SERVER-SIDE and materialise the event onto that
+	// Conta's durable outbox (or dead-letter it when unattributable). DARK behind the
+	// same PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK flag as F0 and best-effort — a no-op unless
+	// the flag is on. The outbox holds no secret/PII so it needs no cipher (unlike the
+	// F0 config store); it is always durable (sqlite over the shared db). The resolver
+	// reads the tenant's owning Account from the same store the choke-point uses, but
+	// surfaces read errors so an indeterminable owner fails-closed to a dead-letter.
+	outboundDeliveries := sqlite.NewOutboundDeliveryStore(db)
+	outboundAttributor := app.NewOutboundAttributor(app.OutboundAttributorDeps{
+		Enabled:     cfg.AccountOutboundWebhook,
+		Resolver:    app.NewStoreAccountResolver(store),
+		Queue:       outboundDeliveries,
+		DeadLetters: outboundDeliveries,
+		Clock:       system.Clock{},
+		IDs:         system.IDProvider{},
+	})
+
 	deps := app.Deps{
-		Payments:        store,
-		Tenants:         store,
-		Pricing:         store,
-		Ledger:          store,
-		Processed:       store,
-		Recs:            store,
-		CobRs:           store,
-		Bus:             inmemory.NewBus(),
-		Bank:            routers.Bank,
-		Pix:             routers.Pix,
-		PixDueCharge:    routers.PixDueCharge,
-		Checkout:        routers.Checkout,
-		Boleto:          routers.Boleto,
-		DDA:             routers.DDA,
-		Statement:       routers.Statement,
-		RecReader:       recReader,
-		CobRReader:      cobrReader,
-		Credentials:     creds,
-		CredWriter:      creds,
-		CertWriter:      certs,
-		CredInvalidator: credInvalidator,
-		Audit:           store,
-		Clock:           system.Clock{},
-		IDs:             system.IDProvider{},
+		Payments:           store,
+		Tenants:            store,
+		Pricing:            store,
+		Ledger:             store,
+		Processed:          store,
+		Recs:               store,
+		CobRs:              store,
+		Bus:                inmemory.NewBus(),
+		Bank:               routers.Bank,
+		Pix:                routers.Pix,
+		PixDueCharge:       routers.PixDueCharge,
+		Checkout:           routers.Checkout,
+		Boleto:             routers.Boleto,
+		DDA:                routers.DDA,
+		Statement:          routers.Statement,
+		RecReader:          recReader,
+		CobRReader:         cobrReader,
+		OutboundAttributor: outboundAttributor,
+		Credentials:        creds,
+		CredWriter:         creds,
+		CertWriter:         certs,
+		CredInvalidator:    credInvalidator,
+		Audit:              store,
+		Clock:              system.Clock{},
+		IDs:                system.IDProvider{},
 		// Transactional boundary for the multi-write use-cases (charge creation,
 		// webhook settlement) — required for financial integrity (SIN-64719).
 		UoW: store,

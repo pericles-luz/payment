@@ -101,6 +101,12 @@ type Deps struct {
 	// no-op recorder (unit tests) — a footgun: production MUST wire a real
 	// append-only recorder so PII reads are recorded for LGPD compliance.
 	PIIAccess ports.PIIAccessRecorder
-	Clock     ports.Clock
-	IDs       ports.IDProvider
+	// OutboundAttributor materialises a settled inbound event onto its owning Conta's
+	// outbound-delivery outbox (SIN-69491, F1 of SIN-69486). When nil (or disabled via
+	// the PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK flag) the WebhookService simply does not
+	// attribute — the feature is dark and the settle path is unchanged. It is
+	// best-effort: an attribution failure never affects the webhook ACK to the bank.
+	OutboundAttributor *OutboundAttributor
+	Clock              ports.Clock
+	IDs                ports.IDProvider
 }
