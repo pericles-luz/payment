@@ -96,6 +96,31 @@ type AccountKeyStore interface {
 	AuthenticateAccountKey(ctx context.Context, secret string) (accountID string, ok bool)
 }
 
+// WebhookRefStore persists and resolves the durable per-tenant C6 webhook callback
+// reference (tenantRef), phase F1 of SIN-69558 / SIN-69557. The ref is the per-tenant
+// credential (the C6 webhook is unsigned — ADR-0002 / F4), so this port follows the
+// SAME hash-at-rest discipline as AccountKeyStore: the plaintext ref NEVER crosses the
+// port, only its SHA-256 (refSHA) does. It is deliberately separate from every other
+// store — a webhook ref is a capability secret, not a financial aggregate, so it stays
+// out of the payment unit-of-work.
+//
+// Signatures carry opaque SHA-256 bytes (not the ref) so the secret is never a port
+// argument, and the interface stays swappable (in-memory <-> durable sqlite) with
+// identical behaviour.
+type WebhookRefStore interface {
+	// PutWebhookRef binds a minted ref (identified only by refSHA) to tenantID. The
+	// caller has already generated the plaintext ref and returned it display-once; only
+	// its hash reaches here. Persisting a ref for an unknown tenant fails (referential
+	// integrity), so a ref can never dangle.
+	PutWebhookRef(ctx context.Context, refSHA []byte, tenantID string) error
+	// LookupWebhookRef resolves a ref's SHA-256 to its owning tenant id. It returns
+	// ("", false, nil) for an unregistered ref — a non-oracle miss identical to the
+	// in-memory map's miss, so the authenticator answers the same uniform 401. A
+	// non-nil error signals an infrastructure failure (the caller fails closed on it,
+	// never open); it is never used to distinguish "no such ref" from a real error.
+	LookupWebhookRef(ctx context.Context, refSHA []byte) (tenantID string, ok bool, err error)
+}
+
 // PricingRepository resolves and stores per-endpoint pricing. The admin-console
 // listing (ListEndpointPrices) is declared by app.PricingStore, keeping this
 // port narrow (the concrete stores implement both).

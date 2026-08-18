@@ -6,10 +6,8 @@ package http
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"net/http"
 	"strings"
@@ -18,6 +16,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/domain/account"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/accountkey"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/webhookref"
 )
 
 // clientSelectorHeader is the request header that an account-key caller uses to
@@ -238,6 +237,27 @@ type WebhookAuthenticator interface {
 	AuthenticateWebhook(tenantRef string) (WebhookIdentity, bool)
 }
 
+// ContextualWebhookAuthenticator is the context-aware superset of WebhookAuthenticator
+// (SIN-69559 / F1). It exists because resolving a ref may now consult a DURABLE store
+// (env-as-bootstrap / DB-as-durable), and a store read needs the request context for
+// cancellation / deadline propagation — which the legacy context-free AuthenticateWebhook
+// signature cannot carry. The webhook handler prefers this method when the wired
+// authenticator implements it and falls back to AuthenticateWebhook otherwise, so an
+// authenticator without a store keeps working unchanged. Same failure-closed / no-oracle
+// contract as AuthenticateWebhook.
+type ContextualWebhookAuthenticator interface {
+	AuthenticateWebhookCtx(ctx context.Context, tenantRef string) (WebhookIdentity, bool)
+}
+
+// webhookRefLookup is the narrow slice of ports.WebhookRefStore the authenticator
+// consumes (accept-narrow — it only needs to RESOLVE a ref, never to mint one). It is
+// the durable fallback the bootstrap map defers to: on a map miss the authenticator
+// asks the store, so a ref minted after boot (POST /v1/clients) authenticates without a
+// restart. Satisfied by the in-memory and sqlite WebhookRefStore adapters.
+type webhookRefLookup interface {
+	LookupWebhookRef(ctx context.Context, refSHA []byte) (tenantID string, ok bool, err error)
+}
+
 // StaticTokenAuth is a config-driven authenticator: opaque tokens map to tenant
 // ids; admin tokens map to roles; opaque per-tenant webhook refs map to a tenant
 // identity. Tokens/secrets come from config, not code. Suitable for the
@@ -245,7 +265,21 @@ type WebhookAuthenticator interface {
 type StaticTokenAuth struct {
 	tenantTokens map[string]string          // token -> tenantID
 	adminRoles   map[string]Role            // admin token -> role
-	webhookRefs  map[string]WebhookIdentity // sha256(tenantRef) -> identity
+	webhookRefs  map[string]WebhookIdentity // sha256(tenantRef) -> identity (env bootstrap)
+	// refStore is the OPTIONAL durable webhook-ref fallback (SIN-69559 / F1). nil keeps
+	// the previous env-only behaviour (retrocompat); when wired, a ref absent from the
+	// bootstrap map is resolved from the store, so a client provisioned after boot
+	// authenticates without a restart.
+	refStore webhookRefLookup
+}
+
+// WithWebhookRefStore wires the durable webhook-ref fallback and returns the receiver
+// for a fluent wiring call (SIN-69559 / F1). It follows the env-as-bootstrap /
+// DB-as-durable pattern: PAYMENT_WEBHOOK_REFS still seeds the in-memory map at boot, and
+// this store serves refs minted afterwards. Passing nil is a no-op (env-only).
+func (a *StaticTokenAuth) WithWebhookRefStore(store webhookRefLookup) *StaticTokenAuth {
+	a.refStore = store
+	return a
 }
 
 // NewStaticTokenAuth builds a StaticTokenAuth where every admin token has the
@@ -375,61 +409,67 @@ func deriveOperatorID(token string) string {
 // "no such tenant" from "wrong ref" (no enumeration oracle). The lookup is an O(1)
 // map keyed by the ref's sha256 — the raw ref is never compared or stored, and the
 // uniform deny makes lookup timing irrelevant to existence.
+//
+// It delegates to AuthenticateWebhookCtx with a background context so callers on the
+// legacy context-free interface keep working; with no durable store wired the two are
+// behaviourally identical (env bootstrap map only).
 func (a *StaticTokenAuth) AuthenticateWebhook(tenantRef string) (WebhookIdentity, bool) {
-	if !validTenantRef(tenantRef) {
-		return WebhookIdentity{}, false // failure-closed
-	}
-	id, ok := a.webhookRefs[hashTenantRef(tenantRef)]
-	if !ok {
-		return WebhookIdentity{}, false
-	}
-	return id, true
+	return a.AuthenticateWebhookCtx(context.Background(), tenantRef)
 }
 
-// tenantRefBytes is the entropy of a minted tenantRef: 32 bytes (256 bits) makes
-// the capability URL infeasible to guess.
-const tenantRefBytes = 32
-
-// tenantRefLen is the fixed length of a tenantRef once base64url-encoded (no
-// padding): ceil(32*8/6) = 43 characters.
-const tenantRefLen = 43
+// AuthenticateWebhookCtx is the context-aware resolution (SIN-69559 / F1). It first
+// enforces the structural ref shape (rejecting path-traversal / percent-encoded inputs
+// BEFORE any lookup), then checks the env bootstrap map, then — only on a map miss and
+// only when a durable store is wired — falls back to the store for a ref minted after
+// boot. Every failure mode collapses to the SAME (zero, false): a malformed ref, an
+// unregistered ref, and even a store READ ERROR all deny identically, so there is no
+// enumeration oracle and an infrastructure fault fails CLOSED (never open). The raw ref
+// is never stored or compared — only its sha256 is.
+func (a *StaticTokenAuth) AuthenticateWebhookCtx(ctx context.Context, tenantRef string) (WebhookIdentity, bool) {
+	if !validTenantRef(tenantRef) {
+		return WebhookIdentity{}, false // failure-closed, before any lookup
+	}
+	if id, ok := a.webhookRefs[hashTenantRef(tenantRef)]; ok {
+		return id, true
+	}
+	if a.refStore == nil {
+		return WebhookIdentity{}, false // env-only (retrocompat)
+	}
+	// Durable fallback: resolve the ref's sha256 in the store. A miss OR any read error
+	// denies identically (no oracle, fail-closed). The store yields only the tenant id;
+	// ClientID stays empty, so the body cross-check in the handler is skipped and the
+	// channel remains authoritative (defense-in-depth item 3, safe to skip).
+	sum := webhookref.Sum(tenantRef)
+	tenantID, ok, err := a.refStore.LookupWebhookRef(ctx, sum[:])
+	if err != nil || !ok || tenantID == "" {
+		return WebhookIdentity{}, false
+	}
+	return WebhookIdentity{TenantID: tenantID}, true
+}
 
 // GenerateTenantRef mints a fresh, unguessable per-tenant callback reference: 32
 // random bytes (256 bits) encoded base64url without padding (43 chars). It is the
 // secret embedded in a tenant's webhook URL (/webhooks/c6/{tenantRef}); register
 // the returned value and hand the full URL to C6. Returns an error only if the
-// system CSPRNG fails.
+// system CSPRNG fails. Thin wrapper over the shared domain crypto (webhookref) so the
+// HTTP bootstrap path and the durable mint path use ONE implementation.
 func GenerateTenantRef() (string, error) {
-	b := make([]byte, tenantRefBytes)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
+	return webhookref.Generate()
 }
 
-// validTenantRef reports whether ref is structurally a tenantRef: exactly
-// tenantRefLen base64url characters ([A-Za-z0-9_-], no padding). Enforcing a fixed
-// shape before any lookup rejects path-traversal/percent-encoded inputs uniformly
-// (same 401) and keeps a malformed ref from ever reaching the credential map.
+// validTenantRef reports whether ref is structurally a tenantRef: exactly 43 base64url
+// characters ([A-Za-z0-9_-], no padding). Enforcing a fixed shape before any lookup
+// rejects path-traversal/percent-encoded inputs uniformly (same 401) and keeps a
+// malformed ref from ever reaching the credential map. Delegates to webhookref.Valid.
 func validTenantRef(ref string) bool {
-	if len(ref) != tenantRefLen {
-		return false
-	}
-	for i := 0; i < len(ref); i++ {
-		c := ref[i]
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
-		default:
-			return false
-		}
-	}
-	return true
+	return webhookref.Valid(ref)
 }
 
 // hashTenantRef maps a tenantRef to the hex sha256 used as the credential-map key,
-// so the raw capability secret is never stored in memory.
+// so the raw capability secret is never stored in memory. It shares webhookref.Sum
+// with the durable store, so the same ref hashes identically in the map and the DB.
 func hashTenantRef(ref string) string {
-	sum := sha256.Sum256([]byte(ref))
+	sum := webhookref.Sum(ref)
 	return hex.EncodeToString(sum[:])
 }
 

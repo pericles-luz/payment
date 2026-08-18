@@ -11,10 +11,22 @@
 // embeds a secret per-tenant ref (/webhooks/c6/{ref}) and is NEVER logged; only
 // non-sensitive identifiers (tenant id, a masked PIX key) and the outcome are
 // emitted.
+//
+// Durable sources (SIN-69561 / F3). A self-serve client provisioned via the model-(b)
+// self-serve flow keeps its OAuth credential AND its PIX creditor key in the durable,
+// encrypted vault (migration 0012), and its webhook ref binding in the durable
+// WebhookRefStore (migration 0016 / F1) — not in the bootstrap envs. When
+// PAYMENT_BANK_VAULT_KEY is set this command opens that vault and resolves BOTH the
+// bearer-token credential and the chave from it FIRST, falling back to the env bootstrap
+// (PAYMENT_BANK_CREDS / PAYMENT_BANK_CREDITOR_KEYS) — so the command sees self-serve
+// clients too. The plaintext ref stays operator-supplied via PAYMENT_WEBHOOK_REFS (the
+// durable store holds only the ref's hash, by F1's bearer-capability design); each such
+// ref is bound to its AUTHORITATIVE tenant via the durable store before registration.
 package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -23,9 +35,14 @@ import (
 	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank/c6"
+	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
+	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
+	"github.com/ia-dev-sindireceita/payment/internal/app"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
+	"github.com/ia-dev-sindireceita/payment/migrations"
 )
 
 // defaultWebhookBaseURL is the receiver's public origin. The callback path is
@@ -59,6 +76,16 @@ func run(logger *log.Logger) error {
 		return errors.New("PAYMENT_WEBHOOK_REFS empty: nothing to register (provisioning gate)")
 	}
 
+	// Resolve credentials from the durable vault FIRST (self-serve clients) and the env
+	// bootstrap SECOND. When no vault KEK is configured this collapses to the env-only
+	// store, preserving the pre-F3 behaviour. refResolver is nil in that case, so refs
+	// resolve to their env-declared tenant unchanged.
+	credStore, refResolver, closeDB, err := durableSources(context.Background(), cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+
 	httpc, err := c6.MTLSHTTPClient(cfg.C6.ClientCertPath, cfg.C6.ClientKeyPath, cfg.C6.Timeout)
 	if err != nil {
 		return err
@@ -69,7 +96,7 @@ func run(logger *log.Logger) error {
 		Scope:      cfg.C6.Scope,
 		Timeout:    cfg.C6.Timeout,
 		HTTPClient: httpc,
-	}, secret.NewStore(cfg.BankCreds))
+	}, credStore)
 	if err != nil {
 		return err
 	}
@@ -79,20 +106,25 @@ func run(logger *log.Logger) error {
 		baseURL = defaultWebhookBaseURL
 	}
 
-	// cfg.BankCreds is now keyed by the composite (tenant, bank) pair (ADR-0007).
-	// register-webhook targets the C6 PIX webhook only, so project each tenant's C6
-	// credential into a tenant-keyed map for registerAll, which resolves the chave
-	// per tenant for the single (C6) bank.
-	c6Creds := make(map[string]ports.BankCredential, len(cfg.BankCreds))
-	for _, cred := range cfg.BankCreds {
-		if cred.BankID == ports.BankIDC6 {
-			c6Creds[cred.TenantID] = cred
-		}
-	}
+	// Bind each operator-supplied plaintext ref to its authoritative tenant via the
+	// durable store (falling back to the env-declared tenant), producing the effective
+	// ref -> tenant map both registration passes consume. A durable-store fault fails the
+	// affected ref closed rather than registering against a possibly-wrong binding.
+	effectiveRefs, resolveFailures := resolveEffectiveRefs(context.Background(), refResolver, cfg.WebhookRefs, logger)
+
+	// Pre-resolve each tenant's C6 credential (including the chave) from the vault-first
+	// store into a tenant-keyed map, exactly the shape registerAll consumes. A self-serve
+	// tenant resolves from the durable vault; an env bootstrap tenant from the fallback. A
+	// store fault is logged masked and drops the tenant from the map (registerAll then
+	// reports the provisioning gap, failing that tenant closed).
+	c6Creds := resolveCredsForTenants(context.Background(), credStore, effectiveRefs, logger)
 
 	ctx := context.Background()
 	var errs []error
-	if err := registerAll(ctx, provider, cfg.WebhookRefs, c6Creds, baseURL, logger); err != nil {
+	if resolveFailures > 0 {
+		errs = append(errs, fmt.Errorf("%d webhook ref(s) could not be resolved to a tenant", resolveFailures))
+	}
+	if err := registerAll(ctx, provider, effectiveRefs, c6Creds, baseURL, logger); err != nil {
 		errs = append(errs, err)
 	}
 	// PIX Automático (recorrência) callbacks (SIN-66036): the two singleton
@@ -102,10 +134,104 @@ func run(logger *log.Logger) error {
 	// by the tenant (no chave), so registerRecurrenceAll only needs the ref→tenant
 	// map. Failures are aggregated with the PIX pass so one stream's gap does not
 	// hide the other's outcome.
-	if err := registerRecurrenceAll(ctx, provider, cfg.WebhookRefs, baseURL, logger); err != nil {
+	if err := registerRecurrenceAll(ctx, provider, effectiveRefs, baseURL, logger); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// durableSources builds the credential store and webhook-ref resolver the command reads
+// from. When PAYMENT_BANK_VAULT_KEY is set it opens the durable SQLite vault + ref store
+// (migrations 0012 / 0016) and returns a vault-first credential store (self-serve clients
+// resolve from the vault, env bootstrap as fallback) plus a resolver over the durable ref
+// store. When the KEK is unset it returns the plain env-only store and a nil resolver, so
+// the command keeps working in pure-bootstrap mode. The returned closer is always safe to
+// call (a no-op when no DB was opened).
+func durableSources(ctx context.Context, cfg config.Config, logger *log.Logger) (ports.CredentialStore, *app.WebhookRefResolver, func(), error) {
+	envStore := secret.NewStore(cfg.BankCreds)
+	if cfg.BankVaultKey == "" {
+		logger.Printf("durable vault disabled (PAYMENT_BANK_VAULT_KEY unset): resolving credentials and refs from env bootstrap only")
+		return envStore, nil, func() {}, nil
+	}
+	cipher, err := decodeCipher(cfg.BankVaultKey)
+	if err != nil {
+		return nil, nil, func() {}, fmt.Errorf("PAYMENT_BANK_VAULT_KEY invalid: %w", err)
+	}
+	db, err := sqlite.Open(cfg.DBPath)
+	if err != nil {
+		return nil, nil, func() {}, err
+	}
+	closer := func() { _ = db.Close() }
+	if err := sqlite.Migrate(ctx, db, migrations.FS); err != nil {
+		closer()
+		return nil, nil, func() {}, err
+	}
+	clock := system.Clock{}
+	// Vault first, env bootstrap second: a self-serve client resolves from the vault; an
+	// env-only bootstrap tenant still resolves via the fallback (SIN-69366 discipline).
+	credStore := secret.NewFallbackStore(sqlite.NewCredentialVault(db, cipher, clock), envStore)
+	refResolver := app.NewWebhookRefResolver(sqlite.NewWebhookRefStore(db, clock))
+	logger.Printf("durable vault enabled: resolving credentials from the encrypted vault and ref bindings from the durable store, env as fallback")
+	return credStore, refResolver, closer, nil
+}
+
+// resolveEffectiveRefs maps each env-declared (ref -> tenant) entry to its effective
+// tenant using the durable store (authoritative), falling back to the env tenant. It
+// returns the resolved ref -> tenant map and the count of refs that could NOT be resolved
+// (a durable-store fault or an unbound ref) — those are dropped from the map so no webhook
+// is registered against an unknown/uncertain tenant (fail closed). Neither the ref nor any
+// URL is ever logged; a binding mismatch is reported by tenant id only.
+func resolveEffectiveRefs(ctx context.Context, resolver *app.WebhookRefResolver, envRefs map[string]string, logger *log.Logger) (map[string]string, int) {
+	if resolver == nil {
+		// No durable store wired: env mapping is authoritative as-is.
+		return envRefs, 0
+	}
+	resolved := make(map[string]string, len(envRefs))
+	var failures int
+	for ref, envTenant := range envRefs {
+		res, err := resolver.Resolve(ctx, ref, envTenant)
+		if err != nil {
+			logger.Printf("ref (masked): FAILED to resolve tenant binding from durable store: %v", err)
+			failures++
+			continue
+		}
+		if res.TenantID == "" {
+			logger.Printf("ref (masked): FAILED — not bound to any tenant (unregistered ref)")
+			failures++
+			continue
+		}
+		if res.Mismatch {
+			logger.Printf("ref (masked): env-declared tenant=%s DIFFERS from durable binding tenant=%s — using the durable binding (source of truth)", envTenant, res.TenantID)
+		}
+		resolved[ref] = res.TenantID
+	}
+	return resolved, failures
+}
+
+// resolveCredsForTenants pre-resolves the C6 credential (identity + secret + chave) for
+// every distinct tenant referenced by refs, reading from the vault-first credential store
+// (durable vault for self-serve clients, env bootstrap as fallback). It returns a
+// tenant-keyed map in exactly the shape registerAll consumes. A tenant absent from the
+// store (shared.ErrNotFound) is simply omitted — registerAll then reports the provisioning
+// gap. Any OTHER store error (an infrastructure fault, e.g. a decrypt failure) is logged
+// masked and the tenant is omitted, so the command fails that tenant CLOSED rather than
+// registering against an unresolved credential. No secret ever reaches the log.
+func resolveCredsForTenants(ctx context.Context, store ports.CredentialStore, refs map[string]string, logger *log.Logger) map[string]ports.BankCredential {
+	out := make(map[string]ports.BankCredential, len(refs))
+	for _, tenantID := range refs {
+		if _, done := out[tenantID]; done {
+			continue
+		}
+		cred, err := store.GetBankCredential(ctx, tenantID, ports.BankIDC6)
+		if err != nil {
+			if !errors.Is(err, shared.ErrNotFound) {
+				logger.Printf("tenant=%s: credential store error resolving C6 credential: %v", tenantID, err)
+			}
+			continue
+		}
+		out[tenantID] = cred
+	}
+	return out
 }
 
 // registerAll registers and confirms the webhook for every (tenantRef -> tenantID)
@@ -221,6 +347,20 @@ func registerRecurrenceAll(ctx context.Context, reg ports.RecurrenceWebhookRegis
 	}
 	logger.Printf("all recurrence webhook(s) registered and confirmed for %d tenant(s)", len(tenantRefs))
 	return nil
+}
+
+// decodeCipher builds an AES-256-GCM sealing cipher from a hex-encoded 32-byte KEK,
+// without ever echoing the key material into an error (mirrors cmd/vault-reseal).
+func decodeCipher(hexKey string) (*secret.Cipher, error) {
+	key, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return nil, fmt.Errorf("not valid hex")
+	}
+	c, err := secret.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // maskKey renders a PIX key for logs without exposing the full routing-sensitive
