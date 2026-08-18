@@ -201,6 +201,15 @@ func (s *Server) handleSetBankCredential(w http.ResponseWriter, r *http.Request)
 		writeDomainError(w, err)
 		return
 	}
+	// A credential write may complete the cred+PIX-key pair — attempt the in-flow C6
+	// webhook registration exactly as the self-serve path does (SIN-69588 / B3). Prod
+	// creds are provisioned through THIS admin Bearer intake (runbook), so without this
+	// the go-live registration path was uncovered. Best-effort by contract: TryRegister
+	// never errors, so a PSP failure cannot turn this successful write into a failure for
+	// the operator. When unwired (nil) or the pair is not yet complete it is a no-op.
+	if s.webhookReg != nil {
+		s.webhookReg.TryRegister(r.Context(), tenantID)
+	}
 	// Echo only non-secret fields so the secret never leaves the secret store.
 	writeJSON(w, http.StatusOK, bankCredentialView{TenantID: tenantID, Bank: bank, ClientID: req.ClientID, Status: "ok"})
 }
@@ -249,6 +258,13 @@ func (s *Server) handleSetBankCertificate(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		writeDomainError(w, err)
 		return
+	}
+	// A certificate write may complete the mTLS half needed to reach C6 — attempt the
+	// in-flow webhook registration like the self-serve path (SIN-69588 / B3). Best-effort:
+	// TryRegister never errors, so a PSP failure cannot fail this successful write. No-op
+	// when unwired (nil) or the cred+key pair is not yet complete.
+	if s.webhookReg != nil {
+		s.webhookReg.TryRegister(r.Context(), tenantID)
 	}
 	// Echo only the public certificate metadata; the private key never leaves the
 	// vault and is never serialized into a response.

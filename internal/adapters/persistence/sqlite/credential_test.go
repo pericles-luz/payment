@@ -337,3 +337,45 @@ func TestCredentialVaultSeedBootstrap(t *testing.T) {
 		t.Fatalf("env re-seed clobbered the durable runtime edit: %q", got.Secret)
 	}
 }
+
+// TestCredentialVaultListTenantsWithC6Credential verifies the enumerator returns only
+// C6-credentialed tenants, without exposing secrets.
+func TestCredentialVaultListTenantsWithC6Credential(t *testing.T) {
+	ctx := context.Background()
+	_, db := openVaultDB(t)
+	v := newCredentialVault(t, db)
+
+	// Empty initially.
+	ids, err := v.ListTenantsWithC6Credential(ctx)
+	if err != nil {
+		t.Fatalf("list empty: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected empty, got %v", ids)
+	}
+
+	// Add two C6 tenants.
+	if err := v.SetBankCredential(ctx, "tnt-a", "c6", "cid-a", "sec-a"); err != nil {
+		t.Fatalf("set tnt-a: %v", err)
+	}
+	if err := v.SetBankCredential(ctx, "tnt-b", "c6", "cid-b", "sec-b"); err != nil {
+		t.Fatalf("set tnt-b: %v", err)
+	}
+
+	ids, err = v.ListTenantsWithC6Credential(ctx)
+	if err != nil {
+		t.Fatalf("list after inserts: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 tenants, got %v", ids)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	for _, want := range []string{"tnt-a", "tnt-b"} {
+		if !got[want] {
+			t.Errorf("missing %q in result", want)
+		}
+	}
+}

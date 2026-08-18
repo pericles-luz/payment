@@ -90,6 +90,20 @@ func (s *Store) GetBankCredential(_ context.Context, tenantID, bankID string) (p
 	return c, nil
 }
 
+// ListTenantsWithC6Credential returns every tenant id for which a C6 credential
+// exists in the store. It exposes ONLY tenant ids — no secret, no creditor key.
+func (s *Store) ListTenantsWithC6Credential(_ context.Context) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0)
+	for _, c := range s.creds {
+		if defaultBankID(c.BankID) == ports.BankIDC6 && c.ClientID != "" {
+			out = append(out, c.TenantID)
+		}
+	}
+	return out, nil
+}
+
 // Set stores/replaces a credential for the (tenantID, c.BankID) pair (used by the
 // admin plane / config reload). It stamps the tenant id and normalises an empty
 // bank to the default BankIDC6.

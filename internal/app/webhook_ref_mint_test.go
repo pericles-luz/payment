@@ -71,6 +71,12 @@ func (faultyRefStore) LookupWebhookRef(context.Context, []byte) (string, bool, e
 	return "", false, nil
 }
 
+// RevokeWebhookRefs satisfies the widened ports.WebhookRefStore (SIN-69588 / B1). This
+// fake is only exercised through Put, so revoke is an inert stub.
+func (faultyRefStore) RevokeWebhookRefs(context.Context, string) (int, error) {
+	return 0, nil
+}
+
 // TestProvisionClientWithWebhookMintsOnCreate proves the webhook variant returns a
 // durable ref on a genuine create and that the ref resolves to the new tenant.
 func TestProvisionClientWithWebhookMintsOnCreate(t *testing.T) {

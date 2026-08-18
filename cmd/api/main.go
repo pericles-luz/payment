@@ -216,7 +216,8 @@ func run() error {
 	// the vault-gated credential stores). The authenticator falls back to it on a map miss.
 	webhookRefStore := sqlite.NewWebhookRefStore(db, system.Clock{})
 	auth := httpadapter.NewStaticTokenAuthWithRoles(cfg.TenantTokens, adminRoles, webhookRefs).
-		WithWebhookRefStore(webhookRefStore)
+		WithWebhookRefStore(webhookRefStore).
+		WithCredentialStore(creds) // B4 (SIN-69585): populate ClientID on durable-ref path
 
 	// Admin HTML console (SIN-64727): parse templates up-front so a bad template
 	// fails startup, not the first request.
@@ -327,6 +328,13 @@ func run() error {
 		return err
 	}
 
+	// Webhook registration service: shared between the in-flow server hooks (F2) and
+	// the periodic reconcile sweep (B2 / SIN-69585). Built here so both consumers
+	// reference the same instance (idempotent GET-gate keeps concurrent calls safe).
+	webhookRegSvc := app.NewWebhookRegistrationService(
+		creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
+		webhookCallbackBaseURL(), slog.Default())
+
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:     app.NewChargeService(deps),
 		Pix:         app.NewPixService(deps),
@@ -396,9 +404,7 @@ func run() error {
 		// regresses the write. Wired only in real-C6 mode (webhookRegistrar is nil for the
 		// stub, which makes the service inert). The callback base origin mirrors
 		// cmd/register-webhook (PAYMENT_WEBHOOK_BASE_URL, default the receiver VPS).
-		WebhookRegistrar: app.NewWebhookRegistrationService(
-			creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
-			webhookCallbackBaseURL(), slog.Default()),
+		WebhookRegistrar: webhookRegSvc,
 	})
 
 	httpServer := &stdhttp.Server{
@@ -411,6 +417,14 @@ func run() error {
 	// the signal context so it stops cleanly on shutdown (no goroutine leak). The processor
 	// is a no-op while the flag is off, so this loop is inert until the feature is enabled.
 	go runOutboundForwardWorker(ctx, outboundProcessor, 2*time.Second)
+
+	// B2 webhook reconcile worker (SIN-69585): periodic sweep that re-attempts C6 PIX
+	// webhook registration for every tenant with a C6 credential. Fixes the silent-failure
+	// gap: if in-flow TryRegister (F2) failed due to a transient C6 outage, the next sweep
+	// picks it up. Inert when PAYMENT_WEBHOOK_RECONCILE is false. No goroutine leak
+	// (honours ctx). Shares the same WebhookRegistrationService as the in-flow path.
+	reconcileWorker := app.NewWebhookReconcileWorker(cfg.WebhookReconcile, creds, webhookRegSvc, slog.Default())
+	go runWebhookReconcileWorker(ctx, reconcileWorker, cfg.WebhookReconcileInterval)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -430,6 +444,24 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// runWebhookReconcileWorker drives the B2 webhook-reconcile sweep on a fixed interval
+// until ctx is cancelled (SIN-69585). When the flag is off Sweep() is a cheap no-op so
+// this goroutine is always safe to start.
+func runWebhookReconcileWorker(ctx context.Context, w *app.WebhookReconcileWorker, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := w.Sweep(ctx); err != nil {
+				log.Printf("api: webhook reconcile sweep error: %v", err)
+			}
+		}
+	}
 }
 
 // runOutboundForwardWorker drives the F2 outbound-forward processor on a fixed interval
@@ -460,6 +492,7 @@ type credentialAdapter interface {
 	ports.CredentialWriter
 	ports.CredentialDeleter
 	ports.CreditorKeyWriter
+	ports.CredentialEnumerator
 }
 
 // certificateAdapter is the union of mTLS-certificate ports the wiring depends on.

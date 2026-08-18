@@ -40,3 +40,38 @@ func TestStoreIsolatesPerTenant(t *testing.T) {
 		t.Fatal("set mismatch")
 	}
 }
+
+func TestStoreListTenantsWithC6Credential(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty store.
+	st := secret.NewStore(nil)
+	ids, err := st.ListTenantsWithC6Credential(ctx)
+	if err != nil {
+		t.Fatalf("empty list: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected empty, got %v", ids)
+	}
+
+	// Seed two C6 tenants.
+	st.Set("tnt-1", ports.BankCredential{BankID: ports.BankIDC6, ClientID: "cid-1", Secret: "s1"})
+	st.Set("tnt-2", ports.BankCredential{BankID: ports.BankIDC6, ClientID: "cid-2", Secret: "s2"})
+
+	ids, err = st.ListTenantsWithC6Credential(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2, got %v", ids)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	for _, want := range []string{"tnt-1", "tnt-2"} {
+		if !got[want] {
+			t.Errorf("missing %q", want)
+		}
+	}
+}
