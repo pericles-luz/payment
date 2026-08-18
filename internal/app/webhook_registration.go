@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/webhookref"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
@@ -50,8 +51,56 @@ type WebhookRegistrationService struct {
 	creds     ports.CredentialStore
 	registrar ports.PixWebhookRegistrar
 	minter    webhookRefMinter
+	refs      webhookRefLookup
 	baseURL   string
 	logger    *slog.Logger
+}
+
+// webhookRefLookup is the narrow slice of ports.WebhookRefStore the idempotency gate
+// needs: resolve a ref's sha256 to its owning tenant. Revoked refs do not resolve, which
+// is exactly the property the gate relies on to tell a live registration from a stale one.
+type webhookRefLookup interface {
+	LookupWebhookRef(ctx context.Context, refSHA []byte) (tenantID string, ok bool, err error)
+}
+
+// registrationState classifies what C6 currently holds for a tenant's PIX key.
+type registrationState int
+
+const (
+	// registrationLive: the registered URL carries an ACTIVE ref of this tenant, so
+	// callbacks through it authenticate. Nothing to do.
+	registrationLive registrationState = iota
+	// registrationStale: no ref, a foreign origin, a revoked/superseded ref, or a ref
+	// owned by another tenant. Callbacks through it are dead — replace the registration.
+	registrationStale
+	// registrationUnknown: the ref store could not answer. Neither conclusion is safe.
+	registrationUnknown
+)
+
+// registrationState reports whether the URL C6 holds is one this tenant can actually be
+// reached through. With no ref lookup wired it degrades to the historical prefix check, so
+// a deployment without the durable store behaves exactly as before.
+func (s *WebhookRegistrationService) registrationState(ctx context.Context, tenantID, registeredURL string) registrationState {
+	prefix := s.baseURL + webhookCallbackPathPrefix
+	if !strings.HasPrefix(registeredURL, prefix) {
+		return registrationStale
+	}
+	ref := strings.TrimPrefix(registeredURL, prefix)
+	if ref == "" {
+		return registrationStale
+	}
+	if s.refs == nil {
+		return registrationLive // pre-F1 behaviour: origin prefix is all we can check
+	}
+	sum := webhookref.Sum(ref)
+	owner, ok, err := s.refs.LookupWebhookRef(ctx, sum[:])
+	if err != nil {
+		return registrationUnknown
+	}
+	if !ok || owner != tenantID {
+		return registrationStale
+	}
+	return registrationLive
 }
 
 // NewWebhookRegistrationService wires the in-flow registrar over the credential store
@@ -73,6 +122,17 @@ func NewWebhookRegistrationService(creds ports.CredentialStore, registrar ports.
 	}
 }
 
+// WithRefLookup wires the durable ref store so the idempotency gate can tell a LIVE
+// registration (active ref of this tenant) from a stale one (revoked, superseded or
+// foreign ref). Optional by design: without it the gate keeps the historical
+// origin-prefix behaviour, so existing wiring and tests are unaffected.
+func (s *WebhookRegistrationService) WithRefLookup(refs webhookRefLookup) *WebhookRegistrationService {
+	if s != nil {
+		s.refs = refs
+	}
+	return s
+}
+
 // ready reports whether every dependency needed to attempt a registration is wired.
 // When false TryRegister returns immediately (no-op), so callers can invoke it
 // unconditionally without a nil check.
@@ -86,11 +146,12 @@ func (s *WebhookRegistrationService) ready() bool {
 //
 //  1. Resolve the tenant's C6 credential from the vault. ErrNotFound (no credential yet)
 //     or an empty creditor key means the cred+key pair is not complete — skip silently.
-//  2. GET the currently-registered webhook for the key. If C6 already holds a callback
-//     under our base origin, the registration is already in place — skip WITHOUT minting
-//     (idempotent, bounds ref proliferation). A NotFound or a foreign URL means we
-//     (re)register; any other GET error is ambiguous, so we skip rather than risk minting
-//     a duplicate ref.
+//  2. GET the currently-registered webhook for the key. Skip WITHOUT minting only when
+//     the registered URL carries an ACTIVE ref of THIS tenant (idempotent, bounds ref
+//     proliferation). A NotFound, a foreign origin, or a ref that is revoked/superseded/
+//     owned by someone else means callbacks through it are dead, so we replace it. Any
+//     other GET error — or a ref-store fault — is ambiguous, so we skip rather than mint
+//     a ref on every pass.
 //  3. Mint a fresh ref (hash persisted by F1), build the callback URL, PUT it, then GET
 //     to confirm the readback matches. Every failure is logged (masked key, NEVER the
 //     ref/URL) and swallowed.
@@ -120,11 +181,24 @@ func (s *WebhookRegistrationService) TryRegister(ctx context.Context, tenantID s
 		return
 	}
 
-	// Idempotency gate: if C6 already holds a callback under our origin for this key,
-	// the webhook is registered — do nothing (and mint nothing).
+	// Idempotency gate: skip only when C6 holds a callback that this tenant can actually
+	// be reached through — i.e. one whose ref is an ACTIVE ref of this tenant. A URL that
+	// merely sits under our origin is not enough (SIN-69580): a revoked, superseded or
+	// foreign ref would satisfy a prefix check while every callback through it 404s at the
+	// receiver, and the registration could then never self-heal — defeating the reconcile
+	// sweep it is supposed to make idempotent.
 	if existing, gerr := s.registrar.GetWebhook(ctx, tenantID, chave); gerr == nil {
-		if strings.HasPrefix(existing.WebhookURL, s.baseURL+webhookCallbackPathPrefix) {
+		switch s.registrationState(ctx, tenantID, existing.WebhookURL) {
+		case registrationLive:
 			return
+		case registrationUnknown:
+			// Ref-store fault: re-registering would mint a fresh ref on every sweep
+			// (churn). Skip; the next sweep re-evaluates.
+			s.logger.WarnContext(ctx, "webhook in-flow registration: ref lookup failed, skipping",
+				slog.String("tenant_id", tenantID), slog.String("pix_key", maskPixKey(chave)))
+			return
+		case registrationStale:
+			// Registered URL is not reachable for this tenant — fall through and replace it.
 		}
 	} else if !errors.Is(gerr, shared.ErrNotFound) {
 		// Ambiguous PSP state (transport/5xx): do not mint a ref against an unknown

@@ -331,9 +331,14 @@ func run() error {
 	// Webhook registration service: shared between the in-flow server hooks (F2) and
 	// the periodic reconcile sweep (B2 / SIN-69585). Built here so both consumers
 	// reference the same instance (idempotent GET-gate keeps concurrent calls safe).
+	// WithRefLookup lets the idempotency gate distinguish a LIVE registration (the URL C6
+	// holds carries an active ref of this tenant) from a stale one (revoked, superseded or
+	// foreign ref). Without it a prefix match alone would mark a dead registration as done,
+	// and neither a self-serve write nor the reconcile sweep could ever heal it (SIN-69580).
 	webhookRegSvc := app.NewWebhookRegistrationService(
 		creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
-		webhookCallbackBaseURL(), slog.Default())
+		webhookCallbackBaseURL(), slog.Default()).
+		WithRefLookup(webhookRefStore)
 
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:     app.NewChargeService(deps),

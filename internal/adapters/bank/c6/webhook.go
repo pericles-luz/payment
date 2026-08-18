@@ -38,6 +38,23 @@ const (
 	// GET. It is an RFC3339 timestamp; parsed best-effort (it is a cosmetic echo,
 	// never settlement money, so a malformed value must not fail the read).
 	webhookCriacaoLayout = time.RFC3339
+
+	// webhookRegistrationAccept is the Accept header the C6 webhook REGISTRATION PUTs
+	// require. C6 rejects the default "application/json" on these operations with
+	// 400 RequisicaoInvalida and the detail:
+	//
+	//	Request Accept header '[application/json]' does not match any defined
+	//	response types. Must be one of: [application/problem+json].
+	//
+	// Live-verified against the real C6 (SIN-69580): the identical request differing
+	// ONLY in this header returns 400 with application/json and 200 with
+	// application/problem+json, on all three registration PUTs — /v2/pix/webhook/{chave},
+	// /v2/pix/webhookrec and /v2/pix/webhookcobr.
+	//
+	// Deliberately scoped to the registration PUTs. The webhook GET readback and every
+	// other C6 surface (cob PUT, statement, DDA…) work with the default and are left
+	// alone, so this narrow quirk does not leak into the shared request builder.
+	webhookRegistrationAccept = "application/problem+json"
 )
 
 // compile-time assertion that Provider satisfies the webhook-registrar port.
@@ -112,6 +129,7 @@ func (p *Provider) RegisterWebhook(ctx context.Context, tenantID, pixKey, webhoo
 	if err != nil {
 		return err
 	}
+	httpReq.Header.Set("Accept", webhookRegistrationAccept)
 	// The PSP answers a successful PUT with 200/201/204 and an empty or echo body;
 	// the registration outcome is the status, so the body is not decoded here.
 	return p.doStatus(httpReq, "register_webhook")
