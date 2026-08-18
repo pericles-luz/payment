@@ -318,7 +318,17 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	//    (the C6 webhook is unsigned). Unknown and malformed refs both yield the
 	//    SAME generic 401 — no tenant-existence oracle. The ref is a capability
 	//    secret: it is never written to logs (only the resolved tenant id is).
-	id, ok := s.webhookAuth.AuthenticateWebhook(chi.URLParam(r, "tenantRef"))
+	//    Prefer the context-aware resolution (SIN-69559 / F1) so a ref minted after
+	//    boot is resolved from the durable store with the request context propagated;
+	//    fall back to the legacy context-free method for authenticators without a store.
+	ref := chi.URLParam(r, "tenantRef")
+	var id WebhookIdentity
+	var ok bool
+	if ca, isCtx := s.webhookAuth.(ContextualWebhookAuthenticator); isCtx {
+		id, ok = ca.AuthenticateWebhookCtx(r.Context(), ref)
+	} else {
+		id, ok = s.webhookAuth.AuthenticateWebhook(ref)
+	}
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
