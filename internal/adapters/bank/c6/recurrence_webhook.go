@@ -91,6 +91,9 @@ func (p *Provider) registerRecurrenceWebhook(ctx context.Context, tenantID, webh
 	if err != nil {
 		return err
 	}
+	// Same PSP quirk as the immediate-PIX webhook registration: C6 rejects these PUTs
+	// with 400 unless Accept is application/problem+json (see webhookRegistrationAccept).
+	httpReq.Header.Set("Accept", webhookRegistrationAccept)
 	return p.doStatus(httpReq, op)
 }
 
