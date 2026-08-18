@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	mrand "math/rand/v2"
 	stdhttp "net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -99,6 +101,13 @@ func run() error {
 	registry, err := newBankRegistry(cfg, creds, certs)
 	if err != nil {
 		return err
+	}
+	// Derive the C6 PIX-webhook registrar from the wired registry for the self-serve
+	// in-flow registration (SIN-69560 / F2). Nil for the stub (no webhook wire), which
+	// makes the registration service inert — exactly the safe default in dev/tests.
+	var webhookRegistrar ports.PixWebhookRegistrar
+	if set, ok := registry.Get(ports.BankIDC6); ok {
+		webhookRegistrar = set.PixWebhook
 	}
 	// The per-port routers dispatch each request to the bank resolved at the HTTP
 	// boundary (carried on the context). The application services depend on these,
@@ -379,6 +388,17 @@ func run() error {
 		// gap (SIN-69557): the new client can receive webhooks immediately, no restart.
 		ClientProvisioner: app.NewClientProvisioningService(deps.Tenants, deps.IDs, system.Clock{}).
 			WithWebhookRefMinter(app.NewWebhookRefMintService(webhookRefStore)),
+		// In-flow C6 webhook registration (SIN-69560 / F2 of SIN-69558): the moment a
+		// self-serve client's credential + PIX key complete (a self-serve credential/
+		// certificate write or an operator PIX-key set), register its PIX settlement
+		// webhook with C6, resolving the PIX key from the SAME durable credential vault
+		// the API charges with and confirming by GET. Best-effort — a PSP failure never
+		// regresses the write. Wired only in real-C6 mode (webhookRegistrar is nil for the
+		// stub, which makes the service inert). The callback base origin mirrors
+		// cmd/register-webhook (PAYMENT_WEBHOOK_BASE_URL, default the receiver VPS).
+		WebhookRegistrar: app.NewWebhookRegistrationService(
+			creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
+			webhookCallbackBaseURL(), slog.Default()),
 	})
 
 	httpServer := &stdhttp.Server{
@@ -501,6 +521,23 @@ func newBankVaults(ctx context.Context, cfg config.Config, db *sql.DB, cipher *s
 	return credVault, certVault, nil
 }
 
+// defaultWebhookCallbackBaseURL is the receiver's public origin the in-flow C6
+// webhook callback URL (/webhooks/c6/{ref}) is built from. It mirrors
+// cmd/register-webhook's default so the one-shot cmd (F3) and the in-flow registration
+// (F2) target the same origin. Overridable via PAYMENT_WEBHOOK_BASE_URL for staging.
+const defaultWebhookCallbackBaseURL = "https://payment.lmhost.com.br"
+
+// webhookCallbackBaseURL resolves the public callback origin for the in-flow C6
+// webhook registration (SIN-69560), reading PAYMENT_WEBHOOK_BASE_URL and falling back
+// to the receiver VPS. The trailing slash is trimmed so the app service can append the
+// canonical /webhooks/c6/{ref} path.
+func webhookCallbackBaseURL() string {
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("PAYMENT_WEBHOOK_BASE_URL")), "/"); v != "" {
+		return v
+	}
+	return defaultWebhookCallbackBaseURL
+}
+
 // newBankRegistry builds the multi-bank registry (SIN-66022): one ProviderSet per
 // wired bank. Today the platform integrates a single bank, C6 — the real adapter
 // when its endpoints are configured (OAuth2 + HTTPS transport + error mapping),
@@ -619,6 +656,12 @@ func buildProviderSet(generic ports.BankProvider, raw ports.PixProvider) bank.Pr
 	}
 	if v, ok := generic.(ports.CredentialInvalidator); ok {
 		set.CredInvalidator = v
+	}
+	// The C6 raw provider satisfies ports.PixWebhookRegistrar (the stub does not); expose
+	// it so the self-serve in-flow webhook registration (SIN-69560 / F2) can PUT/GET the
+	// PSP webhook over the same transport. Nil for the stub ⇒ registration is a no-op.
+	if v, ok := raw.(ports.PixWebhookRegistrar); ok {
+		set.PixWebhook = v
 	}
 	return set
 }

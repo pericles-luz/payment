@@ -428,6 +428,14 @@ func (s *Server) consoleSetCreditorKey(w http.ResponseWriter, r *http.Request) {
 		card(http.StatusUnprocessableEntity, info, creditorErrors(err), false)
 		return
 	}
+	// Setting the PIX key is the operator-plane half of the cred+key pair (the
+	// self-serve credential is the tenant-plane half). Completing it here may be what
+	// finally lets the client be registered with C6 — attempt the in-flow registration
+	// (SIN-69560 / F2). Best-effort: TryRegister never errors, so the card still renders
+	// its success state regardless of the PSP outcome; unwired (nil) is a no-op.
+	if s.webhookReg != nil {
+		s.webhookReg.TryRegister(r.Context(), tv.ID)
+	}
 	info, err := s.console.GetBank(r.Context(), tv.ID, ports.BankIDC6)
 	if err != nil {
 		s.consoleError(w, err)

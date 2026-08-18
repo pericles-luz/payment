@@ -74,6 +74,13 @@ func (s *Server) handleTenantSetBankCredential(w http.ResponseWriter, r *http.Re
 		writeDomainError(w, err)
 		return
 	}
+	// A credential write may complete the cred+PIX-key pair — attempt the in-flow C6
+	// webhook registration (SIN-69560 / F2). Best-effort: TryRegister never errors, so a
+	// PSP failure cannot turn this successful write into a failure for the caller. When
+	// unwired (nil) or the pair is not yet complete it is a silent no-op.
+	if s.webhookReg != nil {
+		s.webhookReg.TryRegister(r.Context(), tenantID)
+	}
 	// Echo only non-secret fields — identical shape to the admin path — so create
 	// and rotate are indistinguishable (Q5) and the secret never leaves the store.
 	writeJSON(w, http.StatusOK, bankCredentialView{TenantID: tenantID, Bank: bank, ClientID: req.ClientID, Status: "ok"})

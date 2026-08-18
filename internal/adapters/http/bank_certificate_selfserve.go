@@ -62,6 +62,13 @@ func (s *Server) handleTenantSetBankCertificate(w http.ResponseWriter, r *http.R
 		writeDomainError(w, err)
 		return
 	}
+	// The mTLS cert is what lets the live C6 handshake succeed, so a cert write can be
+	// the last piece enabling the in-flow webhook registration (SIN-69560 / F2).
+	// Best-effort: TryRegister never errors; unwired (nil) or an incomplete cred+key
+	// pair is a silent no-op.
+	if s.webhookReg != nil {
+		s.webhookReg.TryRegister(r.Context(), tenantID)
+	}
 	// Echo ONLY the public certificate metadata — identical shape to the admin path.
 	// The private key never leaves the vault and is never serialized into a response,
 	// so create and rotate are indistinguishable and the key is never exposed.

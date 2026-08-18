@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -81,6 +82,20 @@ type Server struct {
 	// current flow is entirely unaffected and rollback is a config flip. Config only —
 	// no forwarding in F0. See Config.AccountOutboundWebhook.
 	accountOutboundWebhook bool
+	// webhookReg registers a self-serve client's PIX settlement webhook with C6 in-flow
+	// once its credential + PIX key complete (SIN-69560 / F2). Best-effort: a failure
+	// never affects the write response. When nil (stub bank / feature not wired) the
+	// self-serve write paths skip the registration entirely. See Config.WebhookRegistrar.
+	webhookReg WebhookInFlowRegistrar
+}
+
+// WebhookInFlowRegistrar is the narrow slice of app.WebhookRegistrationService the
+// self-serve write handlers invoke to register a client's PIX webhook with C6 the
+// moment its credential + PIX key are both in place (SIN-69560 / F2). It is
+// best-effort by contract: TryRegister returns nothing, so a PSP failure can never
+// turn a successful credential/certificate/key write into an error for the caller.
+type WebhookInFlowRegistrar interface {
+	TryRegister(ctx context.Context, tenantID string)
 }
 
 // Config wires a Server's dependencies. Console and UI back the HTML admin
@@ -189,6 +204,13 @@ type Config struct {
 	// leaves the set/rotate/remove routes unregistered, so the current flow is
 	// unaffected. Config only — no forwarding in F0.
 	AccountOutboundWebhook bool
+	// WebhookRegistrar registers a self-serve empresa-cliente's PIX settlement webhook
+	// with C6 in-flow the moment its credential + PIX key complete (SIN-69560 / F2 of
+	// SIN-69558). Built over app.NewWebhookRegistrationService atop the credential vault,
+	// the C6 registrar, and the F1 ref minter. Best-effort by contract. Optional: when
+	// nil (stub bank / feature not wired, e.g. tests and stub deployments) the self-serve
+	// write paths skip the registration entirely.
+	WebhookRegistrar WebhookInFlowRegistrar
 }
 
 // NewServer builds a Server from its config.
@@ -219,6 +241,7 @@ func NewServer(c Config) *Server {
 		accountKeyMint:         c.AccountKeyMint,
 		clientProvisioner:      c.ClientProvisioner,
 		accountOutboundWebhook: c.AccountOutboundWebhook,
+		webhookReg:             c.WebhookRegistrar,
 	}
 }
 

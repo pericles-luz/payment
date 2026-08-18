@@ -24,6 +24,11 @@ type ProviderSet struct {
 	// OAuth2 token cache) after a credential write. Nil when the bank caches nothing
 	// (the in-memory stub). Aggregated across banks by the composite invalidator.
 	CredInvalidator ports.CredentialInvalidator
+	// PixWebhook registers/reads this bank's PIX settlement webhook by chave (PUT/GET
+	// /v2/pix/webhook/{chave}). It backs the self-serve in-flow webhook registration
+	// (SIN-69560 / F2). Nil when the bank does not speak the webhook wire (the in-memory
+	// stub), which makes the in-flow registration an inert no-op.
+	PixWebhook ports.PixWebhookRegistrar
 }
 
 // Registry maps a non-secret bank slug to its ProviderSet. It is the closed set of
