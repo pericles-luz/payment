@@ -143,9 +143,10 @@ func (s *BoletoService) RegisterBoleto(ctx context.Context, in RegisterBoletoInp
 		return nil, ports.BoletoResult{}, err
 	}
 
-	price, err := s.pricing.GetEndpointPrice(ctx, in.TenantID, BoletoCreateEndpoint)
+	// Unpriced endpoint = free (bill 0), not a rejection — see resolvePriceOrFree.
+	price, err := resolvePriceOrFree(ctx, s.pricing, in.TenantID, BoletoCreateEndpoint)
 	if err != nil {
-		return nil, ports.BoletoResult{}, fmt.Errorf("resolve price: %w", err)
+		return nil, ports.BoletoResult{}, err
 	}
 
 	p, err := s.reservePayment(ctx, in.TenantID, in.IdempotencyKey, principal)

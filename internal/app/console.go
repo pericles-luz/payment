@@ -1006,6 +1006,14 @@ func (s *ConsoleService) AccountConsumptionInRange(ctx context.Context, accountI
 	if accountID == "" {
 		return AccountConsumptionReport{}, shared.NewValidationError("account_id", "account id is required")
 	}
+	// The account must exist so the screen 404s cleanly and enumeration stays
+	// closed, mirroring ConsumptionInRange (tenant). A valid account with no
+	// ledger entries still returns an empty report (TotalCents=0), never 404.
+	if s.accounts != nil {
+		if _, err := s.accounts.FindAccountByID(ctx, accountID); err != nil {
+			return AccountConsumptionReport{}, fmt.Errorf("resolve account: %w", err)
+		}
+	}
 	entries, err := s.ledger.ListLedgerEntriesByAccount(ctx, accountID)
 	if err != nil {
 		return AccountConsumptionReport{}, fmt.Errorf("list ledger by account: %w", err)

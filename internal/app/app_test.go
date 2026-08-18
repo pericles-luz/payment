@@ -184,9 +184,24 @@ func TestCreateChargeErrors(t *testing.T) {
 		t.Fatalf("want validation for missing idem, got %v", err)
 	}
 
-	// Endpoint not priced.
-	if _, err := charges.CreateCharge(context.Background(), app.CreateChargeInput{TenantID: tn.ID(), Endpoint: "unpriced", AmountCents: 10, Currency: "BRL", IdempotencyKey: "k"}); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("want not found for unpriced endpoint, got %v", err)
+	// Endpoint not priced → free (SIN-69512): served, billed 0 cents, NOT rejected.
+	// (Rule-3 disclosure: this sub-assertion previously required ErrNotFound; the
+	// mandated charge-time contract changed it to success. CTO ratifies at the gate.)
+	if _, err := charges.CreateCharge(context.Background(), app.CreateChargeInput{TenantID: tn.ID(), Endpoint: "unpriced", AmountCents: 10, Currency: "BRL", IdempotencyKey: "kfree"}); err != nil {
+		t.Fatalf("unpriced endpoint should succeed (free), got %v", err)
+	}
+	freeEntries, _ := h.store.ListLedgerEntries(context.Background(), tn.ID())
+	var sawFree bool
+	for _, e := range freeEntries {
+		if e.Endpoint() == "unpriced" {
+			sawFree = true
+			if e.PriceCents() != 0 {
+				t.Fatalf("unpriced endpoint must bill 0 cents, got %d", e.PriceCents())
+			}
+		}
+	}
+	if !sawFree {
+		t.Fatal("expected a 0-cent ledger entry for the unpriced endpoint")
 	}
 
 	// Bad money.

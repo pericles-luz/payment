@@ -157,19 +157,50 @@ func TestPixCreateInactiveTenant(t *testing.T) {
 	}
 }
 
-func TestPixCreateUnpricedEndpoint(t *testing.T) {
+// TestPixCreateUnpricedEndpointFree pins the SIN-69512 charge-time contract: an
+// endpoint with NO configured price is served for free (billed 0 cents), NOT
+// rejected. It asserts the three invariants of the free contract: (a) success,
+// (b) a ledger entry written at 0 cents, and (c) the payment reserved normally.
+// A ledger entry is still written (at 0) so the per-Conta rollup stays consistent
+// (complements the read-side SIN-69509).
+//
+// NOTE (Quality-bar rule 3 disclosure): this test previously asserted
+// ErrNotFound for an unpriced endpoint — the exact behavior the CEO reframed in
+// SIN-69508/SIN-69512. Its assertion is updated here to the new mandated contract;
+// see the task thread for CTO ratification at the review gate.
+func TestPixCreateUnpricedEndpointFree(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.deps.Pix = h.bank
 	admin := app.NewAdminService(h.deps)
 	tn, _ := admin.CreateTenant(context.Background(), "Acme")
 	h.deps.Credentials.(*secret.Store).Set(tn.ID(), ports.BankCredential{ClientID: "cid", Secret: "shh"})
-	// No price set for pix.create.
+	// No price set for pix.create → free.
 	svc := app.NewPixService(h.deps)
-	if _, _, err := svc.CreateImmediateCharge(context.Background(), app.CreateImmediateChargeInput{
+	// (a) success.
+	p, _, err := svc.CreateImmediateCharge(context.Background(), app.CreateImmediateChargeInput{
 		TenantID: tn.ID(), AmountCents: 100, Currency: "BRL", IdempotencyKey: "k",
-	}); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("want ErrNotFound for unpriced endpoint, got %v", err)
+	})
+	if err != nil {
+		t.Fatalf("unpriced endpoint should succeed (free), got %v", err)
+	}
+	if p == nil || p.TxID() == "" {
+		t.Fatal("charge not created for unpriced (free) endpoint")
+	}
+	// (c) payment reserved normally.
+	if _, err := h.store.FindPaymentByIdempotencyKey(context.Background(), tn.ID(), "k"); err != nil {
+		t.Fatalf("free create must reserve a payment, got %v", err)
+	}
+	// (b) exactly one ledger entry, billed 0 cents.
+	entries, err := h.store.ListLedgerEntries(context.Background(), tn.ID())
+	if err != nil {
+		t.Fatalf("list ledger: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 ledger entry for free charge, got %d", len(entries))
+	}
+	if entries[0].PriceCents() != 0 {
+		t.Fatalf("free charge must bill 0 cents, got %d", entries[0].PriceCents())
 	}
 }
 

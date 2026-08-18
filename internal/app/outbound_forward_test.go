@@ -232,45 +232,71 @@ func TestProcessIsolatesPerAccount(t *testing.T) {
 	}
 }
 
-// T-ISO-unassigned / fail-closed: no active endpoint (missing config OR disabled) ⇒
-// dead-letter endpoint_inactive, ZERO forward, row removed, audit dead_letter.
+// T-ISO-disabled / fail-closed: a deliberately-DISABLED endpoint (!cfg.Enabled()) ⇒
+// dead-letter endpoint_inactive, ZERO forward, row removed, audit dead_letter. (The
+// "no endpoint configured at all" case is now handled by TestProcessNoConfigLogsAndSettles
+// below, per SIN-69508 — an operator switching an endpoint OFF is a distinct, deliberate
+// state that still merits a dead-letter for visibility.)
 func TestProcessDeadLettersInactiveEndpoint(t *testing.T) {
-	cases := []struct {
-		name   string
-		reader *fwdConfigReader
-	}{
-		{"missing config", &fwdConfigReader{cfgs: map[string]*outboundwebhook.Config{}}},
-		{"disabled config", &fwdConfigReader{cfgs: map[string]*outboundwebhook.Config{
-			"acct-A": mustConfig(t, "acct-A", "https://a.example.com/hook", "whsec_a", false),
-		}}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			fwd := &fakeForwarder{results: []fwdResult{{status: 200}}}
-			h := newProcHarness(t, true, tc.reader, fwd)
-			h.enqueue(t, "d1", "acct-A", "ek-1")
+	reader := &fwdConfigReader{cfgs: map[string]*outboundwebhook.Config{
+		"acct-A": mustConfig(t, "acct-A", "https://a.example.com/hook", "whsec_a", false),
+	}}
+	fwd := &fakeForwarder{results: []fwdResult{{status: 200}}}
+	h := newProcHarness(t, true, reader, fwd)
+	h.enqueue(t, "d1", "acct-A", "ek-1")
 
-			n, err := h.proc.ProcessPending(context.Background())
-			if err != nil {
-				t.Fatalf("process: %v", err)
-			}
-			if n != 1 {
-				t.Fatalf("settled = %d, want 1 (dead-lettered)", n)
-			}
-			if fwd.callCount() != 0 {
-				t.Fatalf("forwarder must NOT be called for an inactive endpoint, calls=%d", fwd.callCount())
-			}
-			dls, _ := h.outbox.DeadLetters(context.Background())
-			if len(dls) != 1 || dls[0].Reason() != outboundqueue.ReasonEndpointInactive {
-				t.Fatalf("want 1 endpoint_inactive dead-letter, got %+v", dls)
-			}
-			if left, _ := h.outbox.ClaimPendingDeliveries(context.Background(), 10); len(left) != 0 {
-				t.Fatalf("outbox should be empty, got %d", len(left))
-			}
-			if acts := h.audit.actions(); len(acts) != 1 || acts[0] != audit.ActionOutboundWebhookDeadLettered {
-				t.Fatalf("audit = %v, want [dead_letter]", acts)
-			}
-		})
+	n, err := h.proc.ProcessPending(context.Background())
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("settled = %d, want 1 (dead-lettered)", n)
+	}
+	if fwd.callCount() != 0 {
+		t.Fatalf("forwarder must NOT be called for a disabled endpoint, calls=%d", fwd.callCount())
+	}
+	dls, _ := h.outbox.DeadLetters(context.Background())
+	if len(dls) != 1 || dls[0].Reason() != outboundqueue.ReasonEndpointInactive {
+		t.Fatalf("want 1 endpoint_inactive dead-letter, got %+v", dls)
+	}
+	if left, _ := h.outbox.ClaimPendingDeliveries(context.Background(), 10); len(left) != 0 {
+		t.Fatalf("outbox should be empty, got %d", len(left))
+	}
+	if acts := h.audit.actions(); len(acts) != 1 || acts[0] != audit.ActionOutboundWebhookDeadLettered {
+		t.Fatalf("audit = %v, want [dead_letter]", acts)
+	}
+}
+
+// SIN-69508: a delivery attributed to a valid (reseller) Conta that has NO outbound webhook
+// configured (GetOutboundWebhook ⇒ shared.ErrNotFound) is a normal operational condition,
+// not a failure: exactly ZERO forwards, ZERO dead-letters, ZERO audit entries, and the row
+// is REMOVED from the outbox (settled — so it is not re-claimed and re-logged every tick).
+// The Info log itself is not asserted here (slog has no injected sink), but the terminal
+// settle + absence of any dead-letter/forward/audit pins down the mandated behaviour.
+func TestProcessNoConfigLogsAndSettles(t *testing.T) {
+	reader := &fwdConfigReader{cfgs: map[string]*outboundwebhook.Config{}} // no config for anyone
+	fwd := &fakeForwarder{results: []fwdResult{{status: 200}}}
+	h := newProcHarness(t, true, reader, fwd)
+	h.enqueue(t, "d1", "acct-A", "ek-1")
+
+	n, err := h.proc.ProcessPending(context.Background())
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("settled = %d, want 1 (terminal, no dead-letter)", n)
+	}
+	if fwd.callCount() != 0 {
+		t.Fatalf("forwarder must NOT be called when no endpoint is configured, calls=%d", fwd.callCount())
+	}
+	if dls, _ := h.outbox.DeadLetters(context.Background()); len(dls) != 0 {
+		t.Fatalf("no-config must NOT dead-letter, got %d", len(dls))
+	}
+	if acts := h.audit.actions(); len(acts) != 0 {
+		t.Fatalf("no-config must NOT write an audit entry, got %v", acts)
+	}
+	if left, _ := h.outbox.ClaimPendingDeliveries(context.Background(), 10); len(left) != 0 {
+		t.Fatalf("delivery MUST be removed from the outbox (settled), got %d still pending", len(left))
 	}
 }
 

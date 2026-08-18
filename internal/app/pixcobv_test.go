@@ -140,9 +140,15 @@ func TestCobvCreateInactiveTenant(t *testing.T) {
 	}
 }
 
-// A tenant without a configured cobv price cannot create a charge (no silent free
-// charge) and nothing is reserved.
-func TestCobvCreateNoPriceConfigured(t *testing.T) {
+// TestCobvCreateNoPriceIsFree pins the SIN-69512 charge-time contract: a tenant
+// without a configured cobv price is served for free (billed 0 cents), not
+// rejected; the payment IS reserved and a single 0-cent ledger entry is written.
+//
+// Rule-3 disclosure: this test previously required ErrNotFound and no reservation
+// for the unpriced case — the exact behavior the CEO reframed in
+// SIN-69508/SIN-69512. Its assertion is updated to the new mandated contract; CTO
+// ratifies at the review gate.
+func TestCobvCreateNoPriceIsFree(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.deps.PixDueCharge = h.bank
@@ -153,11 +159,23 @@ func TestCobvCreateNoPriceConfigured(t *testing.T) {
 	}
 	h.deps.Credentials.(*secret.Store).Set(tn.ID(), ports.BankCredential{ClientID: "cid", Secret: "shh"})
 	svc := app.NewPixDueChargeService(h.deps)
-	if _, _, err := svc.CreateDueCharge(context.Background(), cobvInput(tn.ID())); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("missing price must surface ErrNotFound, got %v", err)
+	p, _, err := svc.CreateDueCharge(context.Background(), cobvInput(tn.ID()))
+	if err != nil {
+		t.Fatalf("unpriced cobv should succeed (free), got %v", err)
 	}
-	if _, err := h.store.FindPaymentByIdempotencyKey(context.Background(), tn.ID(), "k1"); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("no-price create must not reserve a payment, got %v", err)
+	if p == nil || p.TxID() == "" {
+		t.Fatal("cobv not created for unpriced (free) endpoint")
+	}
+	// The payment IS reserved under the free contract.
+	if _, err := h.store.FindPaymentByIdempotencyKey(context.Background(), tn.ID(), "k1"); err != nil {
+		t.Fatalf("free create must reserve a payment, got %v", err)
+	}
+	entries, err := h.store.ListLedgerEntries(context.Background(), tn.ID())
+	if err != nil {
+		t.Fatalf("list ledger: %v", err)
+	}
+	if len(entries) != 1 || entries[0].PriceCents() != 0 {
+		t.Fatalf("want 1 ledger entry billed 0 cents, got %+v", entries)
 	}
 }
 

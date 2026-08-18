@@ -118,7 +118,10 @@
   <tr class="empty-row"><td colspan="3"><div class="empty"><p class="muted">Sem consumo registrado para as empresas-clientes desta Conta no período.</p></div></td></tr>
   {{- end -}}
   </tbody>
-  {{if .Rows}}<tfoot><tr><th scope="row">Total da Conta</th><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td></tr></tfoot>{{end}}
+  {{/* Always render the grand total, even with zero records, so a valid Conta with
+       no billing shows an explicit "Total da Conta: R$ 0,00" (SIN-69506) rather than
+       reading as an error. */}}
+  <tfoot><tr><th scope="row">Total da Conta</th><td>{{.TotalCalls}}</td><td>{{.TotalReais}}</td></tr></tfoot>
 </table>
 {{end}}
 
@@ -407,7 +410,7 @@
 {{define "outbound_webhook_card"}}
 <div id="outbound-webhook-card" class="card">
   <h2>Webhook de saída</h2>
-  <p class="muted">Endpoint https para onde os eventos desta Conta serão enviados (modelo b). A entrega ainda <strong>não está ativa</strong> nesta fase — apenas a configuração. O segredo de assinatura é exibido <strong>apenas uma vez</strong> ao definir ou rotacionar.</p>
+  <p class="muted">Endpoint https para onde os eventos desta Conta são enviados (modelo b). Com a entrega habilitada (e o recurso ligado no servidor), os eventos da Conta são <strong>efetivamente entregues</strong> a este endpoint, assinados por HMAC com o segredo. O segredo de assinatura é exibido <strong>apenas uma vez</strong> ao definir ou rotacionar.</p>
   {{if .Webhook.Configured}}
   <dl class="dl">
     <dt>Endpoint</dt><dd><code>{{.Webhook.URL}}</code></dd>

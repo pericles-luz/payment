@@ -104,9 +104,10 @@ func (s *PixDueChargeService) CreateDueCharge(ctx context.Context, in DueChargeI
 		return nil, ports.PixDueChargeResult{}, err
 	}
 
-	price, err := s.pricing.GetEndpointPrice(ctx, in.TenantID, PixCobVCreateEndpoint)
+	// Unpriced endpoint = free (bill 0), not a rejection — see resolvePriceOrFree.
+	price, err := resolvePriceOrFree(ctx, s.pricing, in.TenantID, PixCobVCreateEndpoint)
 	if err != nil {
-		return nil, ports.PixDueChargeResult{}, fmt.Errorf("resolve price: %w", err)
+		return nil, ports.PixDueChargeResult{}, err
 	}
 
 	p, err := s.reservePayment(ctx, in.TenantID, in.IdempotencyKey, principal)
