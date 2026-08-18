@@ -17,6 +17,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/domain/accountkey"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/webhookref"
+	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
 // clientSelectorHeader is the request header that an account-key caller uses to
@@ -271,6 +272,18 @@ type StaticTokenAuth struct {
 	// bootstrap map is resolved from the store, so a client provisioned after boot
 	// authenticates without a restart.
 	refStore webhookRefLookup
+	// credStore is OPTIONAL; when wired, the durable-path resolution also populates
+	// WebhookIdentity.ClientID from the credential vault so the body cross-check in
+	// the handler (defense-in-depth item 3) is preserved for refs resolved from the
+	// durable store (SIN-69585 / B4). Never surfaced in logs or errors.
+	credStore webhookCredLookup
+}
+
+// webhookCredLookup is the narrow credential-read capability the webhook auth path
+// needs to populate ClientID on the durable-store path (B4). Only GetBankCredential
+// is required; the full CredentialStore interface satisfies it.
+type webhookCredLookup interface {
+	GetBankCredential(ctx context.Context, tenantID, bankID string) (ports.BankCredential, error)
 }
 
 // WithWebhookRefStore wires the durable webhook-ref fallback and returns the receiver
@@ -279,6 +292,16 @@ type StaticTokenAuth struct {
 // this store serves refs minted afterwards. Passing nil is a no-op (env-only).
 func (a *StaticTokenAuth) WithWebhookRefStore(store webhookRefLookup) *StaticTokenAuth {
 	a.refStore = store
+	return a
+}
+
+// WithCredentialStore wires the credential reader so the durable-ref auth path can
+// populate ClientID (SIN-69585 / B4). Passing nil is a no-op. The lookup is
+// best-effort: a miss or vault error leaves ClientID empty, which the handler
+// treats as "skip cross-check" rather than a hard failure (preserving the
+// defence-in-depth layering — the channel ref is always the authoritative gate).
+func (a *StaticTokenAuth) WithCredentialStore(store webhookCredLookup) *StaticTokenAuth {
+	a.credStore = store
 	return a
 }
 
@@ -436,15 +459,23 @@ func (a *StaticTokenAuth) AuthenticateWebhookCtx(ctx context.Context, tenantRef 
 		return WebhookIdentity{}, false // env-only (retrocompat)
 	}
 	// Durable fallback: resolve the ref's sha256 in the store. A miss OR any read error
-	// denies identically (no oracle, fail-closed). The store yields only the tenant id;
-	// ClientID stays empty, so the body cross-check in the handler is skipped and the
-	// channel remains authoritative (defense-in-depth item 3, safe to skip).
+	// denies identically (no oracle, fail-closed).
 	sum := webhookref.Sum(tenantRef)
 	tenantID, ok, err := a.refStore.LookupWebhookRef(ctx, sum[:])
 	if err != nil || !ok || tenantID == "" {
 		return WebhookIdentity{}, false
 	}
-	return WebhookIdentity{TenantID: tenantID}, true
+	identity := WebhookIdentity{TenantID: tenantID}
+	// B4 (SIN-69585): populate ClientID from the credential vault so the handler's
+	// body cross-check (defense-in-depth item 3) is preserved on the durable path.
+	// Best-effort: a miss or vault error leaves ClientID empty, which the handler
+	// treats as "skip cross-check" — the channel ref is always the authoritative gate.
+	if a.credStore != nil {
+		if cred, cerr := a.credStore.GetBankCredential(ctx, tenantID, ports.BankIDC6); cerr == nil {
+			identity.ClientID = cred.ClientID
+		}
+	}
+	return identity, true
 }
 
 // GenerateTenantRef mints a fresh, unguessable per-tenant callback reference: 32

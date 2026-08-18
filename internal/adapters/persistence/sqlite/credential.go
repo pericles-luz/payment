@@ -41,10 +41,11 @@ func NewCredentialVault(db *sql.DB, cipher *secret.Cipher, clock ports.Clock) *C
 
 // Compile-time checks that the adapter satisfies every port the in-memory Store does.
 var (
-	_ ports.CredentialStore   = (*CredentialVault)(nil)
-	_ ports.CredentialWriter  = (*CredentialVault)(nil)
-	_ ports.CredentialDeleter = (*CredentialVault)(nil)
-	_ ports.CreditorKeyWriter = (*CredentialVault)(nil)
+	_ ports.CredentialStore      = (*CredentialVault)(nil)
+	_ ports.CredentialWriter     = (*CredentialVault)(nil)
+	_ ports.CredentialDeleter    = (*CredentialVault)(nil)
+	_ ports.CreditorKeyWriter    = (*CredentialVault)(nil)
+	_ ports.CredentialEnumerator = (*CredentialVault)(nil)
 )
 
 // Seed inserts each env-provided credential ONLY when its (tenant, bank) row is
@@ -218,6 +219,30 @@ func (v *CredentialVault) SetCreditorKey(ctx context.Context, tenantID, creditor
 		return shared.ErrNotFound
 	}
 	return nil
+}
+
+// ListTenantsWithC6Credential returns every tenant_id that has a C6 credential row,
+// WITHOUT decrypting or returning any secret — only the non-secret tenant_id column
+// is read (SIN-69585 / B2 reconciler enumerator).
+func (v *CredentialVault) ListTenantsWithC6Credential(ctx context.Context) ([]string, error) {
+	rows, err := v.db.QueryContext(ctx,
+		`SELECT tenant_id FROM bank_credentials WHERE bank_id = ?`, ports.BankIDC6)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants with c6 credential: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan tenant id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tenants with c6 credential: %w", err)
+	}
+	return ids, nil
 }
 
 // now returns the current instant formatted as RFC3339-UTC (the adapter-wide layout).

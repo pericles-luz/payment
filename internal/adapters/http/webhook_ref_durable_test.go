@@ -10,9 +10,11 @@ import (
 
 	httpadapter "github.com/ia-dev-sindireceita/payment/internal/adapters/http"
 	persistence "github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/inmemory"
+	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/webhookref"
+	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
 // countingRefStore records how many times LookupWebhookRef is called so a test can
@@ -210,5 +212,63 @@ func TestProvisionClientReturnsDurableWebhookRef(t *testing.T) {
 	}
 	if v2.WebhookRef != "" {
 		t.Fatalf("replay must omit webhook_ref (display-once), got %q", v2.WebhookRef)
+	}
+}
+
+// TestWebhookAuthDurablePathPopulatesClientID is the B4 acceptance (SIN-69585): when a
+// cred store is wired, the durable-store resolution populates ClientID so the handler's
+// body cross-check (defense-in-depth item 3) is preserved for refs resolved from the DB.
+func TestWebhookAuthDurablePathPopulatesClientID(t *testing.T) {
+	t.Parallel()
+	store := persistence.NewWebhookRefStore()
+	ref, _ := webhookref.Generate()
+	sum := webhookref.Sum(ref)
+	if err := store.PutWebhookRef(context.Background(), sum[:], "emp-b4"); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+
+	// Seed the credential store with a known ClientID.
+	credStore := secret.NewStore(map[string]ports.BankCredential{
+		"emp-b4": {TenantID: "emp-b4", BankID: ports.BankIDC6, ClientID: "c6-client-b4", Secret: "s"},
+	})
+
+	auth := httpadapter.NewStaticTokenAuthWithRoles(nil, nil, nil).
+		WithWebhookRefStore(store).
+		WithCredentialStore(credStore)
+
+	id, ok := auth.AuthenticateWebhookCtx(context.Background(), ref)
+	if !ok {
+		t.Fatal("durable ref must authenticate")
+	}
+	if id.TenantID != "emp-b4" {
+		t.Fatalf("tenant = %q, want emp-b4", id.TenantID)
+	}
+	if id.ClientID != "c6-client-b4" {
+		t.Fatalf("ClientID = %q, want c6-client-b4 (B4 cross-check restored)", id.ClientID)
+	}
+}
+
+// TestWebhookAuthDurablePathClientIDMissIsOK proves the cross-check is skipped (not
+// errored) when the credential store has no entry for the tenant — the channel ref is
+// always the authoritative gate (B4 best-effort contract).
+func TestWebhookAuthDurablePathClientIDMissIsOK(t *testing.T) {
+	t.Parallel()
+	store := persistence.NewWebhookRefStore()
+	ref, _ := webhookref.Generate()
+	sum := webhookref.Sum(ref)
+	if err := store.PutWebhookRef(context.Background(), sum[:], "emp-nocred"); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	// Cred store has NO entry for emp-nocred → GetBankCredential returns ErrNotFound.
+	auth := httpadapter.NewStaticTokenAuthWithRoles(nil, nil, nil).
+		WithWebhookRefStore(store).
+		WithCredentialStore(secret.NewStore(nil))
+
+	id, ok := auth.AuthenticateWebhookCtx(context.Background(), ref)
+	if !ok || id.TenantID != "emp-nocred" {
+		t.Fatalf("must still authenticate; got (%+v, %v)", id, ok)
+	}
+	if id.ClientID != "" {
+		t.Fatalf("ClientID should be empty on a miss, got %q", id.ClientID)
 	}
 }

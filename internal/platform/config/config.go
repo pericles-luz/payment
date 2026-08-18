@@ -123,6 +123,16 @@ type Config struct {
 	// token there is no way to provision a credential, so the route can never become
 	// an anonymous land-grab. Set PAYMENT_CONSOLE_BOOTSTRAP_TOKEN.
 	ConsoleBootstrapToken string
+	// WebhookReconcile enables the periodic sweep worker that re-attempts C6 PIX
+	// webhook registration for every tenant with a C6 credential (SIN-69585 / B2).
+	// When off the sweep is an inert no-op — the worker goroutine still runs but
+	// calls Sweep() which returns immediately. Rollback = flip to false. Set
+	// PAYMENT_WEBHOOK_RECONCILE truthy to enable.
+	WebhookReconcile bool
+	// WebhookReconcileInterval is the cadence of the sweep worker. Defaults to 5
+	// minutes (reasonable for a PSP outage recovery window without hammering C6).
+	// Set PAYMENT_WEBHOOK_RECONCILE_INTERVAL as a Go duration string (e.g. "5m").
+	WebhookReconcileInterval time.Duration
 	// STGSeed opts into the staging-stub demo seed (SIN-69226): when set AND the
 	// bank adapter is the stub (C6.BaseURL empty) AND the store is empty, boot
 	// populates a small synthetic two-level-tenancy dataset (Conta "Verz" + two
@@ -212,7 +222,9 @@ func FromEnv() Config {
 			RateLimitBurst:    getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
 			MaxRetries:        getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
 		},
-		STGSeed: getenvBool("PAYMENT_STG_SEED", false),
+		WebhookReconcile:         getenvBool("PAYMENT_WEBHOOK_RECONCILE", false),
+		WebhookReconcileInterval: getenvDuration("PAYMENT_WEBHOOK_RECONCILE_INTERVAL", 5*time.Minute),
+		STGSeed:                  getenvBool("PAYMENT_STG_SEED", false),
 	}
 }
 

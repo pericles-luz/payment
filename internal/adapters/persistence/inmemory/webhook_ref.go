@@ -30,9 +30,13 @@ func NewWebhookRefStore() *WebhookRefStore {
 // Compile-time check that the adapter satisfies the port.
 var _ ports.WebhookRefStore = (*WebhookRefStore)(nil)
 
-// PutWebhookRef binds a minted ref (by its SHA-256) to tenantID. Re-putting the same
-// hash overwrites with the same tenant (idempotent); an empty hash or tenant is a
-// validation error, mirroring the durable adapter.
+// PutWebhookRef binds a minted ref (by its SHA-256) to tenantID with SUPERSEDE
+// semantics identical to the durable adapter (SIN-69588 / B1): it first drops every
+// OTHER ref currently held for the tenant, then records this one, so a tenant keeps AT
+// MOST ONE active ref. Re-putting the same hash is idempotent. An empty hash or tenant
+// is a validation error. (A revoked ref in the durable store is soft-deleted for audit;
+// here — a stub/test store with no audit surface — dropping it is behaviourally
+// identical for the port contract: it stops resolving.)
 func (s *WebhookRefStore) PutWebhookRef(_ context.Context, refSHA []byte, tenantID string) error {
 	if len(refSHA) == 0 {
 		return shared.NewValidationError("ref_sha256", "ref hash is required")
@@ -40,10 +44,37 @@ func (s *WebhookRefStore) PutWebhookRef(_ context.Context, refSHA []byte, tenant
 	if tenantID == "" {
 		return shared.NewValidationError("tenant_id", "tenant id is required")
 	}
+	newHash := hex.EncodeToString(refSHA)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byHash[hex.EncodeToString(refSHA)] = tenantID
+	// Supersede: drop the tenant's other active refs before recording the new one.
+	for h, t := range s.byHash {
+		if t == tenantID && h != newHash {
+			delete(s.byHash, h)
+		}
+	}
+	s.byHash[newHash] = tenantID
 	return nil
+}
+
+// RevokeWebhookRefs drops every ref currently held for tenantID so none of them resolve
+// afterwards (SIN-69588 / B1 — the revocation path). Idempotent: a tenant with no ref
+// revokes zero and returns (0, nil). Mirrors the durable adapter's soft-delete for the
+// port contract.
+func (s *WebhookRefStore) RevokeWebhookRefs(_ context.Context, tenantID string) (int, error) {
+	if tenantID == "" {
+		return 0, shared.NewValidationError("tenant_id", "tenant id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for h, t := range s.byHash {
+		if t == tenantID {
+			delete(s.byHash, h)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // LookupWebhookRef resolves a ref's SHA-256 to its owning tenant id. An unknown ref

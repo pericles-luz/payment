@@ -164,6 +164,13 @@ func (c *countingRefStore) LookupWebhookRef(ctx context.Context, refSHA []byte) 
 	return c.inner.LookupWebhookRef(ctx, refSHA)
 }
 
+// RevokeWebhookRefs satisfies the widened ports.WebhookRefStore (SIN-69588 / B1),
+// delegating to the wrapped in-memory store. The resolver under test never revokes, so
+// this exists only to keep the fake assignable to the port.
+func (c *countingRefStore) RevokeWebhookRefs(ctx context.Context, tenantID string) (int, error) {
+	return c.inner.RevokeWebhookRefs(ctx, tenantID)
+}
+
 // guard: a resolver with a valid ref that IS registered but env matches exactly emits no
 // mismatch (covers the equal-tenant branch alongside the mismatch test).
 func TestResolveEqualEnvNoMismatch(t *testing.T) {
