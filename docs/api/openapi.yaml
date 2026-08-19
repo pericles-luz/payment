@@ -1251,10 +1251,18 @@ components:
 
     Devedor:
       type: object
-      description: Dados do devedor/pagador (opcional).
+      description: >-
+        Dados do devedor/pagador. Opcional na cobrança imediata. Na cobrança **com
+        vencimento** (cobv) é obrigatório e exige o endereço completo — o banco recusa o
+        registro sem `street`, `city`, `state` e `zip_code`, porque a cobv é um documento
+        formal de cobrança entregue ao pagador.
       properties:
         tax_id: { type: string, description: CPF/CNPJ. }
         name: { type: string }
+        street: { type: string, description: "Logradouro. Obrigatório na cobv." }
+        city: { type: string, description: "Cidade. Obrigatório na cobv." }
+        state: { type: string, description: "UF, 2 letras. Obrigatório na cobv." }
+        zip_code: { type: string, description: "CEP, apenas dígitos. Obrigatório na cobv." }
 
     CreateChargeRequest:
       type: object
@@ -1305,7 +1313,7 @@ components:
 
     CobVRequest:
       type: object
-      required: [amount_cents, currency, due_date, validity_days, fine_bps, monthly_interest_bps, creditor_key]
+      required: [amount_cents, currency, due_date, validity_days, fine_bps, monthly_interest_bps, creditor_key, devedor]
       properties:
         amount_cents: { type: integer, format: int64, description: Valor em centavos. }
         currency: { type: string, example: BRL }
@@ -1316,7 +1324,12 @@ components:
         discount_bps: { type: integer, format: int64, description: Desconto por antecipação em pontos-base. }
         discount_fixed_cents: { type: integer, format: int64, description: Desconto fixo em centavos. }
         devedor: { $ref: "#/components/schemas/Devedor" }
-        creditor_key: { type: string, description: Chave PIX do recebedor. }
+        creditor_key:
+          type: string
+          description: >-
+            Chave PIX do recebedor. Obrigatória: o banco recusa a cobrança com vencimento
+            sem ela. Quando omitida, é resolvida da credencial da empresa-cliente; se
+            também não houver ali, a chamada é recusada antes de ir ao banco.
     CobV:
       type: object
       properties:

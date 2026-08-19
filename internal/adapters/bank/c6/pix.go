@@ -81,6 +81,12 @@ type pixDevedor struct {
 	CPF  string `json:"cpf,omitempty"`
 	CNPJ string `json:"cnpj,omitempty"`
 	Nome string `json:"nome,omitempty"`
+	// Address, required only on a due-date charge (cobv). omitempty keeps the immediate
+	// charge's devedor byte-identical to what it has always sent.
+	Logradouro string `json:"logradouro,omitempty"`
+	Cidade     string `json:"cidade,omitempty"`
+	UF         string `json:"uf,omitempty"`
+	CEP        string `json:"cep,omitempty"`
 }
 
 // pixChargeRequestBody is the JSON sent to C6 to create an immediate PIX charge.

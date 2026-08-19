@@ -97,8 +97,12 @@ func cobvBody() map[string]any {
 		"fine_bps":             200,
 		"monthly_interest_bps": 100,
 		"discount_bps":         500,
-		"devedor":              map[string]any{"tax_id": "12345678901", "name": "Maria"},
-		"creditor_key":         "acme@pix.example",
+		"devedor": map[string]any{
+			"tax_id": "12345678901", "name": "Maria",
+			// The PSP requires the full address on a cobv (not on an immediate cob).
+			"street": "Rua das Flores, 123", "city": "Brasília", "state": "DF", "zip_code": "70000000",
+		},
+		"creditor_key": "acme@pix.example",
 	}
 }
 

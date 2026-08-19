@@ -26,6 +26,10 @@ func validParams() Params {
 		MonthlyInterestBps: 100,
 		DebtorTaxID:        "12345678901",
 		DebtorName:         "Maria",
+		DebtorStreet:       "Rua das Flores, 123",
+		DebtorCity:         "Brasília",
+		DebtorState:        "DF",
+		DebtorZipCode:      "70000000",
 		CreditorKey:        "acme@pix.example",
 	}
 }
