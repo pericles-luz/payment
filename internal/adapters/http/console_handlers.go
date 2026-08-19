@@ -353,14 +353,21 @@ func (s *Server) consoleAddBank(w http.ResponseWriter, r *http.Request) {
 		s.ui.Page(w, r, "banks", http.StatusUnprocessableEntity, view)
 		return
 	}
-	// Navigate to the bank detail to configure the credential, with a toast.
+	// Navigate to the bank detail to configure the credential, with a toast. The
+	// creditor card must be gated the SAME way the detail page gates it: leaving the
+	// field at its zero value rendered the read-only card here, telling the operator
+	// that editing "is only available on the default bank" on a page showing exactly
+	// that bank — right after the flow that tells them to configure it. The message was
+	// not just cosmetic: it dead-ends onboarding on a fresh deployment, where adding the
+	// bank is the only way to reach this page.
 	s.ui.BodyWithOOB(w, http.StatusOK, "bank_detail",
 		adminweb.BankDetailView{
-			Base:   s.consoleBase(r, info.Slug, "tenants"),
-			Tenant: tv,
-			Bank:   adminweb.ToBankRows(tv.ID, []app.BankInfo{info}, tv.Active)[0],
-			Form:   map[string]string{},
-			Errors: map[string]string{},
+			Base:             s.consoleBase(r, info.Slug, "tenants"),
+			Tenant:           tv,
+			Bank:             adminweb.ToBankRows(tv.ID, []app.BankInfo{info}, tv.Active)[0],
+			Form:             map[string]string{},
+			Errors:           map[string]string{},
+			CreditorEditable: info.Slug == ports.BankIDC6,
 		},
 		adminweb.OOBPart{Name: "toast_oob", Data: adminweb.ToastData{Kind: "success", Message: "Banco adicionado. Configure a credencial para ativá-lo."}})
 }

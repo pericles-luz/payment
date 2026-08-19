@@ -106,6 +106,18 @@ func TestConsoleAddBankNavigatesToDetail(t *testing.T) {
 		t.Fatalf("add bank = %d: %s", ok.Code, body)
 	}
 
+	// The creditor-key form must be usable right here. Rendering the read-only card
+	// instead told the operator that editing "is only available on the default bank" —
+	// on the default bank's own page, immediately after being told to configure it. On a
+	// fresh deployment this is the ONLY route to the page, so the wrong branch dead-ends
+	// onboarding: the PIX key can never be set, and a charge without it has no QR.
+	if !strings.Contains(body, `name="creditor_key"`) {
+		t.Fatalf("creditor-key form must render on the default bank's detail: %s", body)
+	}
+	if strings.Contains(body, "apenas no banco padrão") {
+		t.Fatalf("read-only creditor card must not render for the default bank: %s", body)
+	}
+
 	// Unknown bank slug (allow-list backstop) → 422 with inline error, no detail.
 	bad := consolePost(t, f.handler, "/console/tenants/t1/banks", adminToken,
 		url.Values{"bank_type": {"nubank"}}, csrf)
