@@ -106,8 +106,12 @@ func run() error {
 	// in-flow registration (SIN-69560 / F2). Nil for the stub (no webhook wire), which
 	// makes the registration service inert — exactly the safe default in dev/tests.
 	var webhookRegistrar ports.PixWebhookRegistrar
+	var recWebhookRegistrar ports.RecurrenceWebhookRegistrar
+	var svcWebhookRegistrar ports.ServiceWebhookRegistrar
 	if set, ok := registry.Get(ports.BankIDC6); ok {
 		webhookRegistrar = set.PixWebhook
+		recWebhookRegistrar = set.RecurrenceWebhook
+		svcWebhookRegistrar = set.ServiceWebhook
 	}
 	// The per-port routers dispatch each request to the bank resolved at the HTTP
 	// boundary (carried on the context). The application services depend on these,
@@ -335,10 +339,19 @@ func run() error {
 	// holds carries an active ref of this tenant) from a stale one (revoked, superseded or
 	// foreign ref). Without it a prefix match alone would mark a dead registration as done,
 	// and neither a self-serve write nor the reconcile sweep could ever heal it (SIN-69580).
+	// Multi-channel by construction (SIN-69580): one ref serves the PIX settlement
+	// callback, both recurrence callbacks and the proprietary per-service ones, because
+	// the PSP routes by the service discriminator in the notification body. Registering
+	// only PIX — the pre-multi-channel behaviour — left the others pointing at whatever
+	// ref was current when they were last written, and the next mint killed them
+	// silently. CHECKOUT is listed explicitly; BANK_SLIP is deliberately absent until the
+	// boleto flow exists, so the PSP is never told to deliver what we cannot process.
 	webhookRegSvc := app.NewWebhookRegistrationService(
 		creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
 		webhookCallbackBaseURL(), slog.Default()).
-		WithRefLookup(webhookRefStore)
+		WithRefLookup(webhookRefStore).
+		WithRecurrenceRegistrar(recWebhookRegistrar).
+		WithServiceRegistrar(svcWebhookRegistrar, c6.ServiceCheckout)
 
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:     app.NewChargeService(deps),
@@ -700,6 +713,16 @@ func buildProviderSet(generic ports.BankProvider, raw ports.PixProvider) bank.Pr
 	// PSP webhook over the same transport. Nil for the stub ⇒ registration is a no-op.
 	if v, ok := raw.(ports.PixWebhookRegistrar); ok {
 		set.PixWebhook = v
+	}
+	// The recurrence and PSP-proprietary callbacks share the SAME per-tenant URL as the
+	// PIX one — one ref serves every channel. Exposing them here lets the in-flow
+	// registration keep all of them pointing at the current ref: a mint supersedes the
+	// ref for all at once, so a channel left behind is a silently dead one (SIN-69580).
+	if v, ok := raw.(ports.RecurrenceWebhookRegistrar); ok {
+		set.RecurrenceWebhook = v
+	}
+	if v, ok := raw.(ports.ServiceWebhookRegistrar); ok {
+		set.ServiceWebhook = v
 	}
 	return set
 }

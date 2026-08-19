@@ -48,12 +48,15 @@ const webhookCallbackPathPrefix = "/webhooks/c6/"
 // never logged, never returned, never put in an error. The PIX key is masked in logs.
 // The tenant id (a non-secret grouping id) is logged so an operator can correlate.
 type WebhookRegistrationService struct {
-	creds     ports.CredentialStore
-	registrar ports.PixWebhookRegistrar
-	minter    webhookRefMinter
-	refs      webhookRefLookup
-	baseURL   string
-	logger    *slog.Logger
+	creds        ports.CredentialStore
+	registrar    ports.PixWebhookRegistrar
+	recRegistrar ports.RecurrenceWebhookRegistrar
+	svcRegistrar ports.ServiceWebhookRegistrar
+	services     []string
+	minter       webhookRefMinter
+	refs         webhookRefLookup
+	baseURL      string
+	logger       *slog.Logger
 }
 
 // webhookRefLookup is the narrow slice of ports.WebhookRefStore the idempotency gate
@@ -133,6 +136,29 @@ func (s *WebhookRegistrationService) WithRefLookup(refs webhookRefLookup) *Webho
 	return s
 }
 
+// WithRecurrenceRegistrar adds the two BACEN recurrence channels (mandate + recurring
+// charge) to the set registered in-flow. Optional: unwired, those channels are simply not
+// part of the tenant's channel set, and behaviour is exactly as before.
+func (s *WebhookRegistrationService) WithRecurrenceRegistrar(r ports.RecurrenceWebhookRegistrar) *WebhookRegistrationService {
+	if s != nil {
+		s.recRegistrar = r
+	}
+	return s
+}
+
+// WithServiceRegistrar adds PSP-proprietary, per-service channels (checkout, boleto) to
+// the set registered in-flow. The service list is EXPLICIT rather than "everything the
+// PSP supports": registering a channel whose inbound flow does not exist yet would make
+// the PSP deliver notifications the receiver cannot process. Optional; an empty list
+// leaves the proprietary channels alone.
+func (s *WebhookRegistrationService) WithServiceRegistrar(r ports.ServiceWebhookRegistrar, services ...string) *WebhookRegistrationService {
+	if s != nil && len(services) > 0 {
+		s.svcRegistrar = r
+		s.services = services
+	}
+	return s
+}
+
 // ready reports whether every dependency needed to attempt a registration is wired.
 // When false TryRegister returns immediately (no-op), so callers can invoke it
 // unconditionally without a nil check.
@@ -146,15 +172,18 @@ func (s *WebhookRegistrationService) ready() bool {
 //
 //  1. Resolve the tenant's C6 credential from the vault. ErrNotFound (no credential yet)
 //     or an empty creditor key means the cred+key pair is not complete — skip silently.
-//  2. GET the currently-registered webhook for the key. Skip WITHOUT minting only when
-//     the registered URL carries an ACTIVE ref of THIS tenant (idempotent, bounds ref
-//     proliferation). A NotFound, a foreign origin, or a ref that is revoked/superseded/
-//     owned by someone else means callbacks through it are dead, so we replace it. Any
-//     other GET error — or a ref-store fault — is ambiguous, so we skip rather than mint
-//     a ref on every pass.
-//  3. Mint a fresh ref (hash persisted by F1), build the callback URL, PUT it, then GET
-//     to confirm the readback matches. Every failure is logged (masked key, NEVER the
-//     ref/URL) and swallowed.
+//  2. Read EVERY wired channel (PIX settlement, the two recurrence callbacks, and any
+//     proprietary per-service ones). Skip WITHOUT minting only when all of them carry an
+//     ACTIVE ref of THIS tenant. A NotFound, a foreign origin, or a ref that is
+//     revoked/superseded/owned by someone else means callbacks through it are dead, so we
+//     re-register. Any PSP read error — or a ref-store fault — is ambiguous, so we skip
+//     rather than mint a ref on every pass.
+//  3. Mint ONE fresh ref (hash persisted by F1), build the callback URL, and write it to
+//     every channel, confirming each by readback. All channels share the ref because the
+//     PSP routes by the service discriminator in the notification, not by the URL — which
+//     is also why a mint must be followed by re-registering ALL of them: the superseded
+//     ref is dead everywhere at once. Per-channel failures are logged (masked key and
+//     channel, NEVER the ref/URL) and swallowed, so one bad channel cannot abort the rest.
 func (s *WebhookRegistrationService) TryRegister(ctx context.Context, tenantID string) {
 	if !s.ready() {
 		return
@@ -181,34 +210,30 @@ func (s *WebhookRegistrationService) TryRegister(ctx context.Context, tenantID s
 		return
 	}
 
-	// Idempotency gate: skip only when C6 holds a callback that this tenant can actually
-	// be reached through — i.e. one whose ref is an ACTIVE ref of this tenant. A URL that
-	// merely sits under our origin is not enough (SIN-69580): a revoked, superseded or
-	// foreign ref would satisfy a prefix check while every callback through it 404s at the
-	// receiver, and the registration could then never self-heal — defeating the reconcile
-	// sweep it is supposed to make idempotent.
-	if existing, gerr := s.registrar.GetWebhook(ctx, tenantID, chave); gerr == nil {
-		switch s.registrationState(ctx, tenantID, existing.WebhookURL) {
-		case registrationLive:
-			return
-		case registrationUnknown:
-			// Ref-store fault: re-registering would mint a fresh ref on every sweep
-			// (churn). Skip; the next sweep re-evaluates.
-			s.logger.WarnContext(ctx, "webhook in-flow registration: ref lookup failed, skipping",
-				slog.String("tenant_id", tenantID), slog.String("pix_key", maskPixKey(chave)))
-			return
-		case registrationStale:
-			// Registered URL is not reachable for this tenant — fall through and replace it.
-		}
-	} else if !errors.Is(gerr, shared.ErrNotFound) {
-		// Ambiguous PSP state (transport/5xx): do not mint a ref against an unknown
-		// registration state — skip and let a later write retry.
-		s.logger.WarnContext(ctx, "webhook in-flow registration: readback failed, skipping",
-			slog.String("tenant_id", tenantID), slog.String("pix_key", maskPixKey(chave)),
-			slog.String("error", gerr.Error()))
+	channels := s.channelsFor(tenantID, chave)
+
+	// Idempotency gate, evaluated across EVERY channel. Skipping requires all of them to
+	// be reachable — one ref serves them all, so a mint replaces the ref for all of them
+	// at once and any channel still holding the superseded ref is dead. Checking only the
+	// PIX channel (the pre-SIN-69580 behaviour) let the others rot silently.
+	//
+	// A channel is reachable only when the ref in the URL C6 holds is an ACTIVE ref of this
+	// tenant. A URL merely sitting under our origin is not enough: a revoked, superseded or
+	// foreign ref satisfies a prefix check while every callback through it 404s at the
+	// receiver, and the registration could then never self-heal.
+	switch s.gate(ctx, tenantID, chave, channels) {
+	case gateSatisfied:
 		return
+	case gateAmbiguous:
+		// Either the PSP or the ref store could not answer. Registering now would mint a
+		// fresh ref on every sweep (churn) against an unknown state — skip and re-evaluate
+		// on the next pass.
+		return
+	case gateNeedsRegistration:
 	}
 
+	// ONE mint for every channel. This supersedes the tenant's previous active ref, so
+	// every channel below MUST be re-registered — including ones that were already live.
 	ref, err := s.minter.MintWebhookRef(ctx, tenantID)
 	if err != nil {
 		s.logger.WarnContext(ctx, "webhook in-flow registration: mint ref failed",
@@ -217,32 +242,162 @@ func (s *WebhookRegistrationService) TryRegister(ctx context.Context, tenantID s
 	}
 	callbackURL := s.baseURL + webhookCallbackPathPrefix + ref
 
-	if err := s.registrar.RegisterWebhook(ctx, tenantID, chave, callbackURL); err != nil {
-		s.logger.WarnContext(ctx, "webhook in-flow registration: register failed",
-			slog.String("tenant_id", tenantID), slog.String("pix_key", maskPixKey(chave)),
-			slog.String("error", err.Error()))
-		return
+	var registered, failed int
+	for _, ch := range channels {
+		if s.registerChannel(ctx, tenantID, chave, ch, callbackURL) {
+			registered++
+			continue
+		}
+		failed++
 	}
 
-	// Confirm by GET (same readback the one-shot cmd does) — a registration that cannot
-	// be confirmed is reported (masked) but still not fatal.
-	got, err := s.registrar.GetWebhook(ctx, tenantID, chave)
+	// One summary line per attempt. Per-channel failures are already logged individually;
+	// this makes "3 of 4 channels are live" visible without correlating lines.
+	attrs := []any{
+		slog.String("tenant_id", tenantID),
+		slog.String("pix_key", maskPixKey(chave)),
+		slog.Int("channels_registered", registered),
+		slog.Int("channels_failed", failed),
+	}
+	if failed > 0 {
+		s.logger.WarnContext(ctx, "webhook in-flow registration: partially registered", attrs...)
+		return
+	}
+	s.logger.InfoContext(ctx, "webhook in-flow registration: registered and confirmed", attrs...)
+}
+
+// webhookChannel is one PSP notification channel. All of a tenant's channels point at the
+// SAME callback URL — the PSP routes by the service discriminator it echoes in the
+// notification body, which the inbound receiver switches on.
+type webhookChannel struct {
+	name     string
+	get      func(context.Context) (ports.WebhookRegistration, error)
+	register func(context.Context, string) error
+}
+
+// channelsFor builds the channel set this deployment can actually drive. The recurrence
+// and proprietary registrars are optional dependencies, so a deployment that has not wired
+// them keeps exactly the previous single-channel behaviour.
+func (s *WebhookRegistrationService) channelsFor(tenantID, chave string) []webhookChannel {
+	channels := []webhookChannel{{
+		name: "pix",
+		get: func(ctx context.Context) (ports.WebhookRegistration, error) {
+			return s.registrar.GetWebhook(ctx, tenantID, chave)
+		},
+		register: func(ctx context.Context, url string) error {
+			return s.registrar.RegisterWebhook(ctx, tenantID, chave, url)
+		},
+	}}
+	if s.recRegistrar != nil {
+		channels = append(channels,
+			webhookChannel{
+				name: "rec",
+				get: func(ctx context.Context) (ports.WebhookRegistration, error) {
+					return s.recRegistrar.GetRecWebhook(ctx, tenantID)
+				},
+				register: func(ctx context.Context, url string) error {
+					return s.recRegistrar.RegisterRecWebhook(ctx, tenantID, url)
+				},
+			},
+			webhookChannel{
+				name: "cobr",
+				get: func(ctx context.Context) (ports.WebhookRegistration, error) {
+					return s.recRegistrar.GetCobRWebhook(ctx, tenantID)
+				},
+				register: func(ctx context.Context, url string) error {
+					return s.recRegistrar.RegisterCobRWebhook(ctx, tenantID, url)
+				},
+			})
+	}
+	if s.svcRegistrar != nil {
+		for _, svc := range s.services {
+			svc := svc
+			channels = append(channels, webhookChannel{
+				name: strings.ToLower(svc),
+				get: func(ctx context.Context) (ports.WebhookRegistration, error) {
+					return s.svcRegistrar.GetServiceWebhook(ctx, tenantID, svc)
+				},
+				register: func(ctx context.Context, url string) error {
+					return s.svcRegistrar.RegisterServiceWebhook(ctx, tenantID, svc, url)
+				},
+			})
+		}
+	}
+	return channels
+}
+
+// gateDecision is the aggregate verdict over every channel.
+type gateDecision int
+
+const (
+	// gateSatisfied: every channel is reachable through an active ref — nothing to do.
+	gateSatisfied gateDecision = iota
+	// gateNeedsRegistration: at least one channel is unregistered or stale.
+	gateNeedsRegistration
+	// gateAmbiguous: some channel could not be classified; acting would risk ref churn.
+	gateAmbiguous
+)
+
+func (s *WebhookRegistrationService) gate(ctx context.Context, tenantID, chave string, channels []webhookChannel) gateDecision {
+	needs := false
+	for _, ch := range channels {
+		existing, err := ch.get(ctx)
+		switch {
+		case errors.Is(err, shared.ErrNotFound):
+			needs = true
+			continue
+		case err != nil:
+			s.logger.WarnContext(ctx, "webhook in-flow registration: readback failed, skipping",
+				slog.String("tenant_id", tenantID), slog.String("channel", ch.name),
+				slog.String("pix_key", maskPixKey(chave)), slog.String("error", err.Error()))
+			return gateAmbiguous
+		}
+		switch s.registrationState(ctx, tenantID, existing.WebhookURL) {
+		case registrationLive:
+		case registrationStale:
+			needs = true
+		case registrationUnknown:
+			s.logger.WarnContext(ctx, "webhook in-flow registration: ref lookup failed, skipping",
+				slog.String("tenant_id", tenantID), slog.String("channel", ch.name),
+				slog.String("pix_key", maskPixKey(chave)))
+			return gateAmbiguous
+		}
+	}
+	if needs {
+		return gateNeedsRegistration
+	}
+	return gateSatisfied
+}
+
+// registerChannel registers one channel and confirms it by readback. It reports success;
+// every failure is logged (masked key and channel name, NEVER the ref or the URL) and
+// swallowed, so one bad channel cannot abort the others.
+func (s *WebhookRegistrationService) registerChannel(ctx context.Context, tenantID, chave string, ch webhookChannel, callbackURL string) bool {
+	logAttrs := func(extra ...any) []any {
+		return append([]any{
+			slog.String("tenant_id", tenantID),
+			slog.String("channel", ch.name),
+			slog.String("pix_key", maskPixKey(chave)),
+		}, extra...)
+	}
+	if err := ch.register(ctx, callbackURL); err != nil {
+		s.logger.WarnContext(ctx, "webhook in-flow registration: register failed",
+			logAttrs(slog.String("error", err.Error()))...)
+		return false
+	}
+	got, err := ch.get(ctx)
 	if err != nil {
 		s.logger.WarnContext(ctx, "webhook in-flow registration: registered but confirm failed",
-			slog.String("tenant_id", tenantID), slog.String("pix_key", maskPixKey(chave)),
-			slog.String("error", err.Error()))
-		return
+			logAttrs(slog.String("error", err.Error()))...)
+		return false
 	}
 	if got.WebhookURL != callbackURL {
-		// The PSP holds a DIFFERENT URL than we just PUT — surface it WITHOUT printing
+		// The PSP holds a DIFFERENT URL than we just wrote — surface it WITHOUT printing
 		// either URL (both embed the secret ref).
-		s.logger.WarnContext(ctx, "webhook in-flow registration: confirmation mismatch",
-			slog.String("tenant_id", tenantID), slog.String("pix_key", maskPixKey(chave)))
-		return
+		s.logger.WarnContext(ctx, "webhook in-flow registration: confirmation mismatch", logAttrs()...)
+		return false
 	}
-
-	s.logger.InfoContext(ctx, "webhook in-flow registration: registered and confirmed",
-		slog.String("tenant_id", tenantID), slog.String("pix_key", maskPixKey(chave)))
+	return true
 }
 
 // maskPixKey renders a PIX key for logs without exposing the full routing-sensitive
