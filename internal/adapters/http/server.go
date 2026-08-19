@@ -463,6 +463,9 @@ func (s *Server) Router() http.Handler {
 					)
 					r.Use(newRateLimiter(selfServeBurst, selfServeRefillPS, nil).middlewareSelfServeCred(selfServeRetryAfter))
 					r.Put("/bank-credential", s.handleTenantSetBankCredential)
+					// A chave PIX completa o par com a credencial: sem ela o
+					// adaptador não sabe para qual conta rotear os fundos.
+					r.Put("/pix-key", s.handleTenantSetCreditorKey)
 				})
 				// Self-serve mTLS certificate intake (SIN-69346), the certificate sibling of
 				// the credential intake above. Same flag (one Verz onboarding surface), same

@@ -258,9 +258,17 @@ chamada. É o padrão "Stripe-Connect" (`Stripe-Account`).
   `tenant_id` — é esse valor que você usa no seletor.
 - O vínculo com a Conta é **server-side**: você **não** informa `account_id` no
   corpo; ele vem da chave. Uma Conta nunca cria empresa-cliente sob outra Conta.
-- A credencial bancária da nova empresa-cliente vai por `PUT /v1/bank-credential`
-  e o certificado mTLS por `PUT /v1/bank-certificate`, ambos self-serve e
+- A credencial bancária da nova empresa-cliente vai por `PUT /v1/bank-credential`,
+  o certificado mTLS por `PUT /v1/bank-certificate` e a chave PIX de recebimento
+  por `PUT /v1/pix-key` (`{"creditor_key": "..."}`) — os três self-serve e
   endereçados pelo mesmo seletor (§11.3). Requerem `Idempotency-Key`.
+
+  **Ordem importa:** a chave PIX é guardada junto da credencial, então grave a
+  credencial primeiro. Uma chave enviada antes é recusada com `404`.
+
+  A chave é **write-only**: ela não é segredo — é o identificador público da conta
+  —, mas é dado de roteamento de fundos, então a resposta nunca a devolve. Guardar
+  o que você enviou é com você.
 - **Assim que a credencial e a chave PIX daquela empresa-cliente ficam
   completas, registramos os webhooks dela no banco automaticamente** — você não
   registra nada no PSP. O que você implementa é o endpoint de saída (§12).
