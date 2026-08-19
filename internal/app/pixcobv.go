@@ -72,6 +72,10 @@ type DueChargeInput struct {
 	DiscountFixedCents int64
 	DebtorTaxID        string
 	DebtorName         string
+	DebtorStreet       string
+	DebtorCity         string
+	DebtorState        string
+	DebtorZipCode      string
 	CreditorKey        string
 	IdempotencyKey     string
 }
@@ -215,6 +219,10 @@ func (s *PixDueChargeService) validateDueCharge(in DueChargeInput, principal sha
 		DiscountFixedCents: in.DiscountFixedCents,
 		DebtorTaxID:        in.DebtorTaxID,
 		DebtorName:         in.DebtorName,
+		DebtorStreet:       in.DebtorStreet,
+		DebtorCity:         in.DebtorCity,
+		DebtorState:        in.DebtorState,
+		DebtorZipCode:      in.DebtorZipCode,
 		CreditorKey:        in.CreditorKey,
 	})
 	return err
@@ -237,6 +245,10 @@ func (s *PixDueChargeService) toRequest(in DueChargeInput, txID string) ports.Pi
 		DiscountFixedCents: in.DiscountFixedCents,
 		DebtorTaxID:        in.DebtorTaxID,
 		DebtorName:         in.DebtorName,
+		DebtorStreet:       in.DebtorStreet,
+		DebtorCity:         in.DebtorCity,
+		DebtorState:        in.DebtorState,
+		DebtorZipCode:      in.DebtorZipCode,
 		CreditorKey:        in.CreditorKey,
 		IdempotencyKey:     in.IdempotencyKey,
 	}

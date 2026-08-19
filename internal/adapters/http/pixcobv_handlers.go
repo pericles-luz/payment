@@ -93,6 +93,10 @@ func toDueChargeInput(tenantID, accountID, idemKey string, req cobvRequest, due 
 	if req.Devedor != nil {
 		in.DebtorTaxID = req.Devedor.TaxID
 		in.DebtorName = req.Devedor.Name
+		in.DebtorStreet = req.Devedor.Street
+		in.DebtorCity = req.Devedor.City
+		in.DebtorState = req.Devedor.State
+		in.DebtorZipCode = req.Devedor.ZipCode
 	}
 	return in
 }

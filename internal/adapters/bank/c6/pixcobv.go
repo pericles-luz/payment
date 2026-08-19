@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
@@ -157,13 +158,30 @@ func bpsFromPercent(s string) int64 {
 // omits one (ADR-0004 / SIN-65862). The fine and interest are transmitted as
 // percentual modalidades; the discount is percentual (DiscountBps) or a fixed value
 // (DiscountFixedCents) "por antecipação". The txid lives in the path, not the body.
+// buildCobvDevedor builds the devedor a due-date charge requires. Unlike an immediate
+// charge — whose devedor is optional and carries no address — the PSP demands nome, cpf,
+// logradouro, cidade, uf and cep here, because the cobv is a formal charge document. The
+// address fields are therefore mapped onto the SAME object the cob builder produces,
+// rather than reusing that builder as-is (which would emit a devedor the bank rejects).
+func buildCobvDevedor(req ports.PixDueChargeRequest) *pixDevedor {
+	d := buildDevedorFields(req.DebtorTaxID, req.DebtorName)
+	if d == nil {
+		return nil
+	}
+	d.Logradouro = strings.TrimSpace(req.DebtorStreet)
+	d.Cidade = strings.TrimSpace(req.DebtorCity)
+	d.UF = strings.TrimSpace(req.DebtorState)
+	d.CEP = strings.TrimSpace(req.DebtorZipCode)
+	return d
+}
+
 func toCobvRequestBody(chave string, req ports.PixDueChargeRequest) cobvRequestBody {
 	body := cobvRequestBody{
 		Calendario: cobvCalendario{
 			DataDeVencimento:       req.DueDate.UTC().Format(cobvDateLayout),
 			ValidadeAposVencimento: req.ValidityDays,
 		},
-		Devedor: buildDevedorFields(req.DebtorTaxID, req.DebtorName),
+		Devedor: buildCobvDevedor(req),
 		Valor:   cobvValor{Original: formatAmount(req.AmountCents)},
 		Chave:   chave,
 	}
@@ -281,6 +299,12 @@ func (p *Provider) CreateDueCharge(ctx context.Context, tenantID string, req por
 	if err != nil {
 		return ports.PixDueChargeResult{}, err
 	}
+	if strings.TrimSpace(chave) == "" {
+		// `chave` is REQUIRED on a cobv. Sending the body without it (the field is
+		// omitempty) produced an opaque PSP 400; refusing here names the cause and
+		// costs no round-trip. A tenant with no registered PIX key cannot receive.
+		return ports.PixDueChargeResult{}, &Error{Op: "create_cobv", sentinel: shared.ErrValidation, detail: "creditor PIX key is required"}
+	}
 
 	payload, err := json.Marshal(toCobvRequestBody(chave, req))
 	if err != nil {
@@ -333,6 +357,12 @@ func (p *Provider) UpdateDueCharge(ctx context.Context, tenantID, txID string, r
 	chave, err := p.resolveCreditorKey(ctx, tenantID, req.CreditorKey)
 	if err != nil {
 		return ports.PixDueChargeResult{}, err
+	}
+	if strings.TrimSpace(chave) == "" {
+		// `chave` is REQUIRED on a cobv. Sending the body without it (the field is
+		// omitempty) produced an opaque PSP 400; refusing here names the cause and
+		// costs no round-trip. A tenant with no registered PIX key cannot receive.
+		return ports.PixDueChargeResult{}, &Error{Op: "update_cobv", sentinel: shared.ErrValidation, detail: "creditor PIX key is required"}
 	}
 
 	payload, err := json.Marshal(toCobvRequestBody(chave, req))

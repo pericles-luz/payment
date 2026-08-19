@@ -39,6 +39,9 @@ func cobvInput(tenantID string) app.DueChargeInput {
 		DueDate: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), ValidityDays: 5,
 		FineBps: 200, MonthlyInterestBps: 100, DiscountBps: 500,
 		DebtorTaxID: "12345678901", DebtorName: "Maria",
+		// The PSP requires the debtor's full address on a due-date charge.
+		DebtorStreet: "Rua das Flores, 123", DebtorCity: "Brasília",
+		DebtorState: "DF", DebtorZipCode: "70000000",
 		CreditorKey: "acme@pix.example", IdempotencyKey: "k1",
 	}
 }

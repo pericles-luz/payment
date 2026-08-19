@@ -30,6 +30,12 @@ type createPixRequest struct {
 type pixDevedorReq struct {
 	TaxID string `json:"tax_id"`
 	Name  string `json:"name"`
+	// Address fields. Optional on an immediate charge (the PSP does not ask for them)
+	// and MANDATORY on a due-date charge, where the document is a formal cobrança.
+	Street  string `json:"street,omitempty"`
+	City    string `json:"city,omitempty"`
+	State   string `json:"state,omitempty"`
+	ZipCode string `json:"zip_code,omitempty"`
 }
 
 // pixChargeView is the JSON representation of an immediate PIX charge returned to

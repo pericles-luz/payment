@@ -140,6 +140,9 @@ func TestCobvOmitsOptionalBlocks(t *testing.T) {
 	req := ports.PixDueChargeRequest{
 		TenantID: "t1", AmountCents: 1000, Currency: "BRL",
 		DueDate: time.Date(2030, 3, 17, 0, 0, 0, 0, time.UTC), ValidityDays: 0,
+		// `chave` is required by the contract, so it is always present — what this test
+		// pins is that the OPTIONAL blocks stay omitted.
+		CreditorKey:    "123e4567-e89b-12d3-a456-426614174000",
 		IdempotencyKey: "no-extras",
 	}
 	if _, err := p.CreateDueCharge(context.Background(), "t1", req); err != nil {
@@ -152,8 +155,10 @@ func TestCobvOmitsOptionalBlocks(t *testing.T) {
 	if _, ok := sent["devedor"]; ok {
 		t.Fatalf("devedor must be omitted when no payer, body=%s", ps.body())
 	}
-	if _, ok := sent["chave"]; ok {
-		t.Fatalf("chave must be omitted when no creditor key, body=%s", ps.body())
+	// `chave` is REQUIRED by the contract, so it must always ride — the field was
+	// previously omitempty, which produced an opaque PSP 400.
+	if _, ok := sent["chave"]; !ok {
+		t.Fatalf("chave is required and must always be sent, body=%s", ps.body())
 	}
 	var valor struct {
 		Multa    json.RawMessage `json:"multa"`
@@ -163,5 +168,93 @@ func TestCobvOmitsOptionalBlocks(t *testing.T) {
 	_ = json.Unmarshal(sent["valor"], &valor)
 	if valor.Multa != nil || valor.Juros != nil || valor.Desconto != nil {
 		t.Fatalf("zero rates must omit their blocks, body=%s", ps.body())
+	}
+}
+
+// A tenant with no registered PIX key cannot receive, so the charge is refused at our
+// boundary with a named cause instead of an opaque 400 from the bank.
+func TestCobvRequiresCreditorKey(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	p := ps.provider(t, oneTenant("t1", "c", "s"))
+
+	_, err := p.CreateDueCharge(context.Background(), "t1", ports.PixDueChargeRequest{
+		TenantID: "t1", AmountCents: 1000, Currency: "BRL",
+		DueDate:        time.Date(2030, 3, 17, 0, 0, 0, 0, time.UTC),
+		IdempotencyKey: "no-key",
+	})
+	if !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("want ErrValidation, got %v", err)
+	}
+	if len(ps.body()) > 0 {
+		t.Fatalf("nothing may reach the bank: %s", ps.body())
+	}
+}
+
+// A due-date charge carries the debtor's FULL address — nome, cpf, logradouro, cidade,
+// uf and cep are all required by the contract. The previous body sent only cpf/nome, so
+// every cobv would have been refused by the bank. An immediate charge is deliberately
+// unaffected: its devedor is optional and address-less.
+func TestCobvDevedorCarriesFullAddress(t *testing.T) {
+	t.Parallel()
+	ps := newProductServer(t)
+	p := ps.provider(t, oneTenant("t1", "c", "s"))
+
+	if _, err := p.CreateDueCharge(context.Background(), "t1", ports.PixDueChargeRequest{
+		TenantID: "t1", AmountCents: 1000, Currency: "BRL",
+		DueDate:        time.Date(2030, 3, 17, 0, 0, 0, 0, time.UTC),
+		DebtorTaxID:    "12345678901",
+		DebtorName:     "Maria",
+		DebtorStreet:   "Rua das Flores, 123",
+		DebtorCity:     "Brasília",
+		DebtorState:    "DF",
+		DebtorZipCode:  "70000000",
+		CreditorKey:    "123e4567-e89b-12d3-a456-426614174000",
+		IdempotencyKey: "addr-1",
+	}); err != nil {
+		t.Fatalf("CreateDueCharge: %v", err)
+	}
+
+	var sent struct {
+		Devedor struct {
+			Nome       string `json:"nome"`
+			CPF        string `json:"cpf"`
+			Logradouro string `json:"logradouro"`
+			Cidade     string `json:"cidade"`
+			UF         string `json:"uf"`
+			CEP        string `json:"cep"`
+		} `json:"devedor"`
+	}
+	if err := json.Unmarshal(ps.body(), &sent); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	d := sent.Devedor
+	if d.Nome != "Maria" || d.CPF != "12345678901" {
+		t.Fatalf("devedor identity not mapped: %+v", d)
+	}
+	if d.Logradouro != "Rua das Flores, 123" || d.Cidade != "Brasília" || d.UF != "DF" || d.CEP != "70000000" {
+		t.Fatalf("devedor address not mapped: %+v (body=%s)", d, ps.body())
+	}
+}
+
+// The immediate charge keeps its address-less devedor: the contract does not ask for one
+// there, and sending fields a schema does not define is how the boleto path broke. Asserted
+// on the builders directly — the cobv builder is the only one that adds the address.
+func TestCobDevedorStaysAddressLess(t *testing.T) {
+	t.Parallel()
+	cob := buildDevedorFields("12345678901", "Maria")
+	if cob == nil {
+		t.Fatal("devedor should be built")
+	}
+	if cob.Logradouro != "" || cob.Cidade != "" || cob.UF != "" || cob.CEP != "" {
+		t.Fatalf("immediate charge must not carry an address: %+v", cob)
+	}
+	cobv := buildCobvDevedor(ports.PixDueChargeRequest{
+		DebtorTaxID: "12345678901", DebtorName: "Maria",
+		DebtorStreet: "Rua das Flores, 123", DebtorCity: "Brasília",
+		DebtorState: "DF", DebtorZipCode: "70000000",
+	})
+	if cobv.Logradouro == "" || cobv.Cidade == "" || cobv.UF == "" || cobv.CEP == "" {
+		t.Fatalf("due-date charge must carry the address: %+v", cobv)
 	}
 }

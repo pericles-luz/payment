@@ -364,6 +364,21 @@ cobrança é criada normalmente, só que sem QR.
 endpoint de alteração. `PUT /v1/boletos/{id}` responde `400` em vez de fingir que alterou
 uma cobrança já registrada. Para mudar algo: cancele e emita outra.
 
+### 4.6 Cobrança com vencimento (cobv): devedor completo e chave obrigatória
+
+A cobv é um **documento formal de cobrança** entregue ao pagador, e o banco exige mais
+que a cobrança imediata:
+
+- **`devedor` completo** — além de `tax_id` e `name`, são obrigatórios `street`, `city`,
+  `state` (UF) e `zip_code`. Na cobrança **imediata** o devedor continua opcional e sem
+  endereço; a exigência é específica da cobv.
+- **`creditor_key`** — obrigatória. Se omitida, resolvemos da credencial da
+  empresa-cliente; não havendo nem lá, a chamada é recusada **antes** de ir ao banco,
+  com o campo nomeado.
+
+Ambas as validações acontecem no nosso boundary, então um campo faltando volta como erro
+nomeado em vez de um `400` opaco do PSP.
+
 ## 5. Consulta e pagamento DDA
 
 **Quando:** pagar boletos que caíram no DDA da empresa-cliente. Fluxo: listar →

@@ -52,12 +52,23 @@ const (
 // (unlike an immediate charge, where it is optional): the document is a CPF or CNPJ
 // and the name is required. The document is never logged.
 type Debtor struct {
-	taxID string
-	name  string
+	taxID   string
+	name    string
+	street  string
+	city    string
+	state   string
+	zipCode string
 }
 
 // TaxID returns the payer document (all digits, CPF or CNPJ).
 func (d Debtor) TaxID() string { return d.taxID }
+
+// Street, City, State and ZipCode return the payer address the PSP requires on a
+// due-date charge.
+func (d Debtor) Street() string  { return d.street }
+func (d Debtor) City() string    { return d.city }
+func (d Debtor) State() string   { return d.state }
+func (d Debtor) ZipCode() string { return d.zipCode }
 
 // Name returns the payer name.
 func (d Debtor) Name() string { return d.name }
@@ -100,6 +111,10 @@ type Params struct {
 	DiscountFixedCents int64
 	DebtorTaxID        string
 	DebtorName         string
+	DebtorStreet       string
+	DebtorCity         string
+	DebtorState        string
+	DebtorZipCode      string
 	CreditorKey        string
 }
 
@@ -133,7 +148,7 @@ func New(p Params) (Charge, error) {
 	if err := validateDiscount(p.DiscountBps, p.DiscountFixedCents, p.Principal.Cents()); err != nil {
 		return Charge{}, err
 	}
-	debtor, err := newDebtor(p.DebtorTaxID, p.DebtorName)
+	debtor, err := newDebtor(p.DebtorTaxID, p.DebtorName, p.DebtorStreet, p.DebtorCity, p.DebtorState, p.DebtorZipCode)
 	if err != nil {
 		return Charge{}, err
 	}
@@ -181,16 +196,33 @@ func validateDiscount(bps, fixedCents, principalCents int64) error {
 // newDebtor validates and builds the devedor: a required CPF (11) or CNPJ (14)
 // all-digit document and a required name. The check is syntactic (length + digits),
 // mirroring the immediate-charge devedor guard.
-func newDebtor(taxID, name string) (Debtor, error) {
+func newDebtor(taxID, name, street, city, state, zipCode string) (Debtor, error) {
 	taxID = strings.TrimSpace(taxID)
 	name = strings.TrimSpace(name)
+	street = strings.TrimSpace(street)
+	city = strings.TrimSpace(city)
+	state = strings.TrimSpace(state)
+	zipCode = strings.TrimSpace(zipCode)
 	if !validTaxID(taxID) {
 		return Debtor{}, shared.NewValidationError("devedor.tax_id", "debtor tax id must be 11 (CPF) or 14 (CNPJ) digits")
 	}
 	if name == "" {
 		return Debtor{}, shared.NewValidationError("devedor.name", "debtor name is required")
 	}
-	return Debtor{taxID: taxID, name: name}, nil
+	// The address is required by the PSP on every cobv. Validating it here — where the
+	// charge is already validated — turns a bank-side 400 into a named field error at our
+	// boundary, before any money-moving call is attempted.
+	for _, f := range []struct{ field, value string }{
+		{"devedor.logradouro", street},
+		{"devedor.cidade", city},
+		{"devedor.uf", state},
+		{"devedor.cep", zipCode},
+	} {
+		if f.value == "" {
+			return Debtor{}, shared.NewValidationError(f.field, "debtor address is required on a due-date charge")
+		}
+	}
+	return Debtor{taxID: taxID, name: name, street: street, city: city, state: state, zipCode: zipCode}, nil
 }
 
 // validTaxID reports whether s is an all-digit CPF (11) or CNPJ (14). It is a

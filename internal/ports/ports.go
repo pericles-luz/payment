@@ -807,6 +807,14 @@ type PixDueChargeRequest struct {
 	DiscountFixedCents int64
 	DebtorTaxID        string
 	DebtorName         string
+	// The debtor's ADDRESS is mandatory on a due-date charge: BACEN/C6 require
+	// logradouro, cidade, uf and cep on every cobv, because the document is a formal
+	// charge the payer receives. (An immediate cob has no such requirement — its debtor
+	// is optional and address-less, which is why only this shape carries them.)
+	DebtorStreet  string
+	DebtorCity    string
+	DebtorState   string // UF, 2 letters
+	DebtorZipCode string // CEP, digits only
 	// CreditorKey is the recebedor's PIX key (chave) the charge is registered under.
 	CreditorKey string
 	// IdempotencyKey, when present, is forwarded so the PSP collapses retried/
