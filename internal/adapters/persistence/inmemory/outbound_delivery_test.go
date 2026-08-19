@@ -13,7 +13,7 @@ var memNow = time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC)
 
 func mkDelivery(t *testing.T, id, acct, tenantID, eventKey string) *outboundqueue.Delivery {
 	t.Helper()
-	d, err := outboundqueue.NewDelivery(id, acct, tenantID, eventKey, "tx", "payment.paid", memNow)
+	d, err := outboundqueue.NewDelivery(id, acct, tenantID, eventKey, "tx", "payment.paid", outboundqueue.Detail{}, memNow)
 	if err != nil {
 		t.Fatalf("new delivery: %v", err)
 	}

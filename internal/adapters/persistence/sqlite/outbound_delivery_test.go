@@ -13,7 +13,7 @@ var delNow = time.Unix(1700000000, 0).UTC()
 
 func newDelivery(t *testing.T, id, acct, tenantID, eventKey, txID string) *outboundqueue.Delivery {
 	t.Helper()
-	d, err := outboundqueue.NewDelivery(id, acct, tenantID, eventKey, txID, "payment.paid", delNow)
+	d, err := outboundqueue.NewDelivery(id, acct, tenantID, eventKey, txID, "payment.paid", outboundqueue.Detail{}, delNow)
 	if err != nil {
 		t.Fatalf("new delivery: %v", err)
 	}

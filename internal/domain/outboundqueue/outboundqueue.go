@@ -107,6 +107,23 @@ type Delivery struct {
 	eventType string
 	status    DeliveryStatus
 	createdAt time.Time
+	detail    Detail
+}
+
+// Detail is the NON-PII business detail carried with a delivery so a Conta's receiver
+// learns what settled without calling our API back for it: the amount in CENTS (never
+// reais — minor units are the only representation that crosses this boundary, so no
+// decimal rounding can ever change a value in transit), how many parcelas a card
+// authorisation was split into, and the PSP's capture message.
+//
+// It is deliberately narrow. The outbox stays free of the devedor PII a Pix payload can
+// hold (sin-68744), which is what lets these tables remain unencrypted; an installment
+// count, a status message and an amount identify no natural person. A PIX or boleto
+// settlement leaves the card fields zero/empty.
+type Detail struct {
+	AmountCents  int64
+	Installments int
+	Message      string
 }
 
 // NewDelivery constructs a pending Delivery, enforcing the invariants that make
@@ -115,7 +132,7 @@ type Delivery struct {
 // DeadLetter), a non-empty tenantID and event_key (dedup), and a non-empty event type.
 // txID may be empty for an event that carries no charge id. The status is always
 // pending.
-func NewDelivery(id, accountID, tenantID, eventKey, txID, eventType string, now time.Time) (*Delivery, error) {
+func NewDelivery(id, accountID, tenantID, eventKey, txID, eventType string, detail Detail, now time.Time) (*Delivery, error) {
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
 	tenantID = strings.TrimSpace(tenantID)
@@ -145,12 +162,13 @@ func NewDelivery(id, accountID, tenantID, eventKey, txID, eventType string, now 
 		eventType: eventType,
 		status:    StatusPending,
 		createdAt: now,
+		detail:    detail,
 	}, nil
 }
 
 // RehydrateDelivery rebuilds a Delivery from persisted state without re-running
 // creation validation (persistence adapters only).
-func RehydrateDelivery(id, accountID, tenantID, eventKey, txID, eventType string, status DeliveryStatus, createdAt time.Time) *Delivery {
+func RehydrateDelivery(id, accountID, tenantID, eventKey, txID, eventType string, status DeliveryStatus, createdAt time.Time, detail Detail) *Delivery {
 	return &Delivery{
 		id:        id,
 		accountID: accountID,
@@ -160,6 +178,7 @@ func RehydrateDelivery(id, accountID, tenantID, eventKey, txID, eventType string
 		eventType: eventType,
 		status:    status,
 		createdAt: createdAt,
+		detail:    detail,
 	}
 }
 
@@ -183,6 +202,9 @@ func (d *Delivery) EventType() string { return d.eventType }
 
 // Status returns the lifecycle status (pending in F1).
 func (d *Delivery) Status() DeliveryStatus { return d.status }
+
+// Detail returns the non-PII business detail forwarded with this delivery.
+func (d *Delivery) Detail() Detail { return d.detail }
 
 // CreatedAt returns the attribution instant.
 func (d *Delivery) CreatedAt() time.Time { return d.createdAt }

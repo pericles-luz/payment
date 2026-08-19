@@ -28,7 +28,7 @@ func TestNewDeliveryValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d, err := outboundqueue.NewDelivery(tt.id, tt.accountID, tt.tenantID, tt.eventKey, tt.txID, tt.eventType, testNow)
+			d, err := outboundqueue.NewDelivery(tt.id, tt.accountID, tt.tenantID, tt.eventKey, tt.txID, tt.eventType, outboundqueue.Detail{}, testNow)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -52,7 +52,7 @@ func TestNewDeliveryValidation(t *testing.T) {
 }
 
 func TestDeliveryTrimsAndAccessors(t *testing.T) {
-	d, err := outboundqueue.NewDelivery("  d1 ", " acct-1 ", " ten-1 ", " ek-1 ", " tx-1 ", " payment.paid ", testNow)
+	d, err := outboundqueue.NewDelivery("  d1 ", " acct-1 ", " ten-1 ", " ek-1 ", " tx-1 ", " payment.paid ", outboundqueue.Detail{}, testNow)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestDeliveryTrimsAndAccessors(t *testing.T) {
 }
 
 func TestRehydrateDelivery(t *testing.T) {
-	d := outboundqueue.RehydrateDelivery("d1", "acct-1", "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.StatusPending, testNow)
+	d := outboundqueue.RehydrateDelivery("d1", "acct-1", "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.StatusPending, testNow, outboundqueue.Detail{})
 	if d.ID() != "d1" || d.AccountID() != "acct-1" || d.Status() != outboundqueue.StatusPending {
 		t.Fatalf("rehydrate mismatch: %+v", d)
 	}

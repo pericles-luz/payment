@@ -143,7 +143,10 @@ func (a *OutboundAttributor) active() bool {
 // It NEVER returns an error: every failure is logged and swallowed so the inbound webhook
 // ACK to C6 is fully decoupled from attribution (best-effort, threat D3). It is a no-op
 // when the attributor is inactive (flag off / not wired), keeping the feature dark.
-func (a *OutboundAttributor) Attribute(ctx context.Context, tenantID, eventKey, txID, eventType string) {
+// detail carries the NON-PII settlement detail forwarded with the delivery (amount in
+// cents, card installments, PSP capture message). A caller with nothing to add passes
+// the zero value, which forwards exactly as before this field existed.
+func (a *OutboundAttributor) Attribute(ctx context.Context, tenantID, eventKey, txID, eventType string, detail outboundqueue.Detail) {
 	if !a.active() {
 		return
 	}
@@ -166,7 +169,7 @@ func (a *OutboundAttributor) Attribute(ctx context.Context, tenantID, eventKey, 
 		return
 	}
 
-	d, err := outboundqueue.NewDelivery(a.ids.NewID(), accountID, tenantID, eventKey, txID, eventType, a.clock.Now())
+	d, err := outboundqueue.NewDelivery(a.ids.NewID(), accountID, tenantID, eventKey, txID, eventType, detail, a.clock.Now())
 	if err != nil {
 		slog.ErrorContext(ctx, "outbound attribution: could not build delivery",
 			"event", "outbound.attribution.error",

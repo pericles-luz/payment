@@ -40,9 +40,10 @@ func newCheckoutRWServer(t *testing.T) *checkoutRWServer {
 			cs.get(w, r)
 			return
 		}
-		// Real reconcile (GET 200): the full `checkout` schema — id, status, decimal
-		// amount (reais) and url. No captured/received amount (captured_amount is
-		// "EM BREVE"), so the read cannot reconcile by captured value.
+		// Real reconcile (GET 200): the `checkout` schema — id, status, decimal amount
+		// (reais) and url — with NO payment.card block. That is the shape of a session
+		// whose capture is not affirmed, so it must NOT settle even though status is
+		// PAID (see TestGetCheckoutSessionSettlesOnCapturedPayment for the paid shape).
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"chk_1","status":"PAID","amount":15.00,"url":"https://checkout.c6bank.info/chk_1"}`))
 	})
@@ -70,11 +71,12 @@ func (cs *checkoutRWServer) provider(t *testing.T, creds ports.CredentialStore) 
 }
 
 // TestGetCheckoutSessionSuccess asserts the reconcile read maps id/status/amount from
-// the real `checkout` schema and attaches the per-tenant bearer. C6 does not yet
-// return a captured amount (captured_amount is "EM BREVE"), so ReceivedAmountCents is
-// zero and AmountReconciled() is false — fail-safe for threat W3 (a checkout is never
-// settled for an unverified captured amount). Settlement-by-captured-amount is a
-// follow-up once C6 GA's captured_amount (settlement path, SIN-65726).
+// the real `checkout` schema and attaches the per-tenant bearer.
+//
+// This response carries status PAID but NO payment.card block, so the capture is not
+// affirmed and the session must not settle: ReceivedAmountCents stays zero and
+// AmountReconciled() is false. It pins the narrow half of the settlement gate — status
+// alone is never enough (threat W3).
 func TestGetCheckoutSessionSuccess(t *testing.T) {
 	t.Parallel()
 	cs := newCheckoutRWServer(t)
@@ -88,7 +90,7 @@ func TestGetCheckoutSessionSuccess(t *testing.T) {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 	if res.AmountReconciled() {
-		t.Fatalf("no captured amount is available yet — reconcile must stay false (fail-safe): %+v", res)
+		t.Fatalf("status PAID without an affirmed card capture must NOT reconcile: %+v", res)
 	}
 	if cs.lastAuth != "Bearer tok-client-1" {
 		t.Fatalf("bearer not attached: %q", cs.lastAuth)

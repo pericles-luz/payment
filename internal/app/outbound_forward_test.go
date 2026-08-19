@@ -156,7 +156,7 @@ func newProcHarness(t *testing.T, enabled bool, reader app.OutboundConfigReader,
 
 func (h *procHarness) enqueue(t *testing.T, id, acct, ek string) {
 	t.Helper()
-	d, err := outboundqueue.NewDelivery(id, acct, "ten-1", ek, "tx-1", "payment.paid", fwdNow)
+	d, err := outboundqueue.NewDelivery(id, acct, "ten-1", ek, "tx-1", "payment.paid", outboundqueue.Detail{}, fwdNow)
 	if err != nil {
 		t.Fatalf("new delivery: %v", err)
 	}

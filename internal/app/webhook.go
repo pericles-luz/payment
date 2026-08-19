@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/audit"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/outboundqueue"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/payment"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
@@ -118,6 +119,10 @@ func (s *WebhookService) reconcileCheckout(ctx context.Context, tenantID, sessio
 		Status:              res.Status,
 		ExpectedAmountCents: res.AmountCents,
 		ReceivedAmountCents: res.ReceivedAmountCents,
+		// Card detail forwarded to the Conta's outbound webhook (SIN-69580): how many
+		// parcelas the authorisation was split into and the PSP's capture message.
+		Installments: res.Installments,
+		Message:      res.Message,
 	}, nil
 }
 
@@ -145,6 +150,9 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 	}
 
 	var settled *payment.Payment
+	// settledRes keeps the reconciled bank state visible after the transaction closes so
+	// the outbound notification can carry its detail (amount, installments, message).
+	var settledRes ports.ChargeResult
 	err := s.uow.WithinTx(ctx, func(r ports.Repository) error {
 		// Anti-replay: first-time wins, duplicates are acked as no-ops. Marking
 		// inside the tx means the key only persists if the rest of the unit of
@@ -212,6 +220,7 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 			return fmt.Errorf("save settled payment: %w", err)
 		}
 		settled = p
+		settledRes = res
 		return nil
 	})
 	if err != nil {
@@ -220,7 +229,7 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 	if settled == nil {
 		return nil
 	}
-	return s.publishSettled(ctx, settled, ev)
+	return s.publishSettled(ctx, settled, ev, settledRes)
 }
 
 // recordSettlementMismatch appends the durable audit record for a refused
@@ -263,7 +272,7 @@ func (s *WebhookService) recordSettlementMismatch(ctx context.Context, r ports.R
 }
 
 // publishSettled emits the payment-paid event after a successful settlement.
-func (s *WebhookService) publishSettled(ctx context.Context, settled *payment.Payment, ev PaymentEvent) error {
+func (s *WebhookService) publishSettled(ctx context.Context, settled *payment.Payment, ev PaymentEvent, res ports.ChargeResult) error {
 	payload := []byte(fmt.Sprintf(`{"payment_id":%q,"tenant_id":%q,"tx_id":%q}`, settled.ID(), settled.TenantID(), settled.TxID()))
 	_ = s.bus.Publish(ctx, TopicPaymentPaid, ports.Message{
 		TenantID:       settled.TenantID(),
@@ -278,6 +287,16 @@ func (s *WebhookService) publishSettled(ctx context.Context, settled *payment.Pa
 	// turn a settled payment into a webhook error to C6 (threat D3). The tenant is the
 	// settled payment's own tenant (server-side authoritative), the dedup key is the
 	// inbound event_key, and the business event type is payment.paid.
-	s.attributor.Attribute(ctx, settled.TenantID(), ev.EventKey, settled.TxID(), TopicPaymentPaid)
+	// The settlement detail rides along so the Conta's receiver learns WHAT settled —
+	// the amount in CENTS (never reais: minor units are the only representation that
+	// crosses this boundary, so no decimal rounding can alter a value in transit), and,
+	// for a card checkout, in how many parcelas it was authorised plus the PSP's capture
+	// message. A PIX or boleto settlement leaves the card fields zero/empty.
+	s.attributor.Attribute(ctx, settled.TenantID(), ev.EventKey, settled.TxID(), TopicPaymentPaid,
+		outboundqueue.Detail{
+			AmountCents:  res.ExpectedAmountCents,
+			Installments: res.Installments,
+			Message:      res.Message,
+		})
 	return nil
 }

@@ -13,7 +13,7 @@ var memF2Now = time.Date(2026, 8, 17, 16, 0, 0, 0, time.UTC)
 
 func memDelivery(t *testing.T, id, acct, ek string) *outboundqueue.Delivery {
 	t.Helper()
-	d, err := outboundqueue.NewDelivery(id, acct, "ten-1", ek, "tx", "payment.paid", memF2Now)
+	d, err := outboundqueue.NewDelivery(id, acct, "ten-1", ek, "tx", "payment.paid", outboundqueue.Detail{}, memF2Now)
 	if err != nil {
 		t.Fatalf("new delivery: %v", err)
 	}
