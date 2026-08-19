@@ -309,15 +309,36 @@ Corpo:
   "event_type": "payment.paid",
   "tx_id": "E1234...",
   "account_id": "<sua Conta>",
-  "timestamp": 1755561600
+  "timestamp": 1755561600,
+  "amount_cents": 501,
+  "installments": 3,
+  "message": "Transacao capturada com sucesso"
 }
 ```
 
-> **O corpo não traz dado de pagador, valor nem PII — de propósito.** Ele
-> carrega o mínimo para você saber *o que* mudou. Precisando do detalhe da
-> cobrança, chame nossa API de volta com sua chave-de-Conta e o
-> `X-Client-Tenant` da empresa-cliente. Isso mantém PII fora de um canal que
-> atravessa a internet até um endpoint que não controlamos.
+| campo | significado |
+|---|---|
+| `amount_cents` | valor liquidado, **sempre em centavos** (inteiro) |
+| `installments` | em quantas parcelas o cartão foi autorizado; `0` em PIX e boleto |
+| `message` | o que o PSP disse sobre a captura; vazio em PIX e boleto |
+
+> **`amount_cents` é sempre inteiro, em centavos.** Nenhum valor cruza esta
+> fronteira em reais. O PSP informa o valor do checkout como decimal em reais
+> no fio (`"amount": 5.01`) e nós convertemos para centavos por string, nunca
+> por ponto flutuante — você recebe `501`. Não existe campo `amount` em reais
+> neste corpo, e nunca vai existir: diferença de arredondamento em valor é bug
+> de dinheiro.
+
+> `installments` e `message` são sempre enviados, mesmo quando não se aplicam
+> (zero e vazio), para o schema ser estável e você não precisar tratar campo
+> ausente.
+
+> **O corpo não traz dado de pagador nem PII — de propósito.** Valor, parcelas
+> e mensagem do PSP não identificam pessoa; nome, CPF/CNPJ e demais dados do
+> devedor não trafegam aqui. Precisando do detalhe da cobrança, chame nossa API
+> de volta com sua chave-de-Conta e o `X-Client-Tenant` da empresa-cliente.
+> Isso mantém PII fora de um canal que atravessa a internet até um endpoint que
+> não controlamos.
 
 ### 12.2 Como validar (obrigatório)
 

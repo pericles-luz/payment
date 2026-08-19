@@ -73,7 +73,7 @@ func TestAttributeEnqueuesForRealConta(t *testing.T) {
 	res := &fakeAccountResolver{accountID: "acct-verz"}
 	a := newAttributor(t, true, res, store)
 
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 
 	if res.gotTenant != "ten-1" {
 		t.Fatalf("resolver saw tenant %q, want ten-1", res.gotTenant)
@@ -101,7 +101,7 @@ func TestAttributeEnqueuesForRealConta(t *testing.T) {
 func TestAttributeIsolatesByAccount(t *testing.T) {
 	store := inmemory.NewOutboundDeliveryStore()
 	a := newAttributor(t, true, &fakeAccountResolver{accountID: "acct-A"}, store)
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 
 	other, err := store.PendingDeliveries(context.Background(), "acct-B")
 	if err != nil {
@@ -119,7 +119,7 @@ func TestAttributeDeadLettersOnResolverError(t *testing.T) {
 	res := &fakeAccountResolver{err: errors.New("store down")}
 	a := newAttributor(t, true, res, store)
 
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 
 	dls, err := store.DeadLetters(context.Background())
 	if err != nil {
@@ -148,7 +148,7 @@ func TestAttributeSkipsSelfAccount(t *testing.T) {
 	store := inmemory.NewOutboundDeliveryStore()
 	a := newAttributor(t, true, &fakeAccountResolver{accountID: ""}, store)
 
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 
 	if got, _ := store.PendingDeliveries(context.Background(), ""); len(got) != 0 {
 		t.Fatalf("expected no delivery, got %d", len(got))
@@ -164,7 +164,7 @@ func TestAttributeDisabledIsNoop(t *testing.T) {
 	res := &fakeAccountResolver{accountID: "acct-verz"}
 	a := newAttributor(t, false, res, store)
 
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 
 	if res.gotTenant != "" {
 		t.Fatalf("disabled attributor should not resolve, saw %q", res.gotTenant)
@@ -178,11 +178,11 @@ func TestAttributeDisabledIsNoop(t *testing.T) {
 // never originates a mis-attributed delivery).
 func TestAttributeNilAndUnwiredAreSafe(t *testing.T) {
 	var nilA *app.OutboundAttributor
-	nilA.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid") // must not panic
+	nilA.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{}) // must not panic
 
 	// Enabled but missing ports ⇒ inactive.
 	half := app.NewOutboundAttributor(app.OutboundAttributorDeps{Enabled: true})
-	half.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid") // must not panic
+	half.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{}) // must not panic
 }
 
 // Idempotency: the same inbound event attributed twice enqueues ONE delivery (dedup by
@@ -191,8 +191,8 @@ func TestAttributeIdempotentOnEventKey(t *testing.T) {
 	store := inmemory.NewOutboundDeliveryStore()
 	a := newAttributor(t, true, &fakeAccountResolver{accountID: "acct-verz"}, store)
 
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 
 	got, _ := store.PendingDeliveries(context.Background(), "acct-verz")
 	if len(got) != 1 {
@@ -212,7 +212,7 @@ func TestAttributeSwallowsQueueError(t *testing.T) {
 		IDs:         &seqIDs{},
 	})
 	// Must not panic or propagate.
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 }
 
 // Best-effort: a dead-letter sink failure is swallowed too.
@@ -225,7 +225,7 @@ func TestAttributeSwallowsDeadLetterError(t *testing.T) {
 		Clock:       fixedClock{t: obNow},
 		IDs:         &seqIDs{},
 	})
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 }
 
 // --- default store resolver ------------------------------------------------
@@ -280,7 +280,7 @@ func TestAttributeWithStoreResolverError(t *testing.T) {
 	store := inmemory.NewOutboundDeliveryStore()
 	resolver := app.NewStoreAccountResolver(fakeTenantFinder{err: errors.New("boom")})
 	a := newAttributor(t, true, resolver, store)
-	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid")
+	a.Attribute(context.Background(), "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{})
 
 	dls, _ := store.DeadLetters(context.Background())
 	if len(dls) != 1 || dls[0].Reason() != outboundqueue.ReasonUnresolvable {

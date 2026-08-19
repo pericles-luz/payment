@@ -684,6 +684,14 @@ type ChargeResult struct {
 	Status              string
 	ExpectedAmountCents int64
 	ReceivedAmountCents int64
+	// Installments and Message carry card-settlement detail through to the Conta's
+	// outbound webhook so a reseller learns in how many parcelas the payment was
+	// authorised and what the PSP said about the capture. They are meaningful only for
+	// a card checkout; a PIX or boleto reconcile leaves them zero/empty. Neither is
+	// PII (an installment count and a PSP status message), which is what keeps them
+	// carryable on the non-PII outbound envelope.
+	Installments int
+	Message      string
 }
 
 // AmountReconciled reports whether the amount received on this charge exactly
@@ -1148,6 +1156,12 @@ type CheckoutResult struct {
 	// them; the adapter sets them from the request).
 	CardType              string
 	RequireAuthentication bool
+	// Installments is how many parcelas the card authorisation was split into (1 for a
+	// single payment). Message is the PSP's human-readable capture status, e.g.
+	// "Transacao capturada com sucesso". Both come from payment.card on the reconcile
+	// read and are forwarded to the Conta's outbound webhook.
+	Installments int
+	Message      string
 }
 
 // AmountReconciled reports whether the amount captured on the session exactly matches

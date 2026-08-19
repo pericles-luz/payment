@@ -420,15 +420,30 @@ type forwardBody struct {
 	TxID      string `json:"tx_id"`
 	AccountID string `json:"account_id"`
 	Timestamp int64  `json:"timestamp"`
+	// AmountCents is the settled amount in integer MINOR UNITS. Amounts never cross this
+	// boundary as reais: the PSP reports checkout amounts as decimal reais on the wire
+	// ("amount": 5.01) and the adapter parses them to cents by string, never a float, so
+	// the receiver gets 501 and no rounding can alter a value in transit.
+	AmountCents int64 `json:"amount_cents"`
+	// Installments is how many parcelas a card authorisation was split into, so the
+	// empresa knows what it will actually receive and when. Zero for a PIX or boleto,
+	// which have no installments.
+	Installments int `json:"installments"`
+	// Message is the PSP's capture status in its own words, e.g. "Transacao capturada
+	// com sucesso". Empty when the PSP said nothing (PIX, boleto).
+	Message string `json:"message"`
 }
 
 // buildForwardBody serialises the canonical envelope for a delivery at instant now.
 func buildForwardBody(d *outboundqueue.Delivery, now time.Time) ([]byte, error) {
 	return json.Marshal(forwardBody{
-		EventKey:  d.EventKey(),
-		EventType: d.EventType(),
-		TxID:      d.TxID(),
-		AccountID: d.AccountID(),
-		Timestamp: now.Unix(),
+		EventKey:     d.EventKey(),
+		EventType:    d.EventType(),
+		TxID:         d.TxID(),
+		AccountID:    d.AccountID(),
+		Timestamp:    now.Unix(),
+		AmountCents:  d.Detail().AmountCents,
+		Installments: d.Detail().Installments,
+		Message:      d.Detail().Message,
 	})
 }

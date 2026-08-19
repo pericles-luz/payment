@@ -36,6 +36,7 @@ type storedDelivery struct {
 	eventType string
 	status    outboundqueue.DeliveryStatus
 	createdAt time.Time
+	detail    outboundqueue.Detail
 }
 
 type storedDeadLetter struct {
@@ -75,6 +76,7 @@ func (s *OutboundDeliveryStore) EnqueueDelivery(_ context.Context, d *outboundqu
 		eventType: d.EventType(),
 		status:    d.Status(),
 		createdAt: d.CreatedAt(),
+		detail:    d.Detail(),
 	})
 	return nil
 }
@@ -111,7 +113,7 @@ func (s *OutboundDeliveryStore) PendingDeliveries(_ context.Context, accountID s
 			continue
 		}
 		out = append(out, outboundqueue.RehydrateDelivery(
-			r.id, r.accountID, r.tenantID, r.eventKey, r.txID, r.eventType, r.status, r.createdAt))
+			r.id, r.accountID, r.tenantID, r.eventKey, r.txID, r.eventType, r.status, r.createdAt, r.detail))
 	}
 	return out, nil
 }
@@ -133,7 +135,7 @@ func (s *OutboundDeliveryStore) ClaimPendingDeliveries(_ context.Context, limit 
 			continue
 		}
 		out = append(out, outboundqueue.RehydrateDelivery(
-			r.id, r.accountID, r.tenantID, r.eventKey, r.txID, r.eventType, r.status, r.createdAt))
+			r.id, r.accountID, r.tenantID, r.eventKey, r.txID, r.eventType, r.status, r.createdAt, r.detail))
 		if len(out) >= limit {
 			break
 		}

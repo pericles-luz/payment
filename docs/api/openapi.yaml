@@ -1125,10 +1125,13 @@ components:
       description: >-
         Envelope canônico entregue no endpoint da Conta. Carrega apenas campos de
         roteamento/notificação — **nunca** valor, pagador ou qualquer PII que o
-        payload PIX possa conter. Um receptor que precise do detalhe da cobrança
-        chama a API de volta com sua chave-de-Conta. A ordem dos campos é estável,
-        então os bytes assinados são exatamente os bytes transmitidos.
-      required: [event_key, event_type, tx_id, account_id, timestamp]
+        payload PIX possa conter — nome, CPF/CNPJ e demais dados do devedor não
+        trafegam aqui. Valor, parcelas e mensagem do PSP são enviados porque não
+        identificam pessoa. Um receptor que precise do detalhe da cobrança chama a
+        API de volta com sua chave-de-Conta. A ordem dos campos é estável, então os
+        bytes assinados são exatamente os bytes transmitidos.
+      required:
+        [event_key, event_type, tx_id, account_id, timestamp, amount_cents, installments, message]
       properties:
         event_key:
           type: string
@@ -1157,6 +1160,30 @@ components:
             Instante do envio em unix-seconds. Repete o header
             `X-Webhook-Timestamp`, que é o valor efetivamente usado na assinatura.
           example: 1755561600
+        amount_cents:
+          type: integer
+          format: int64
+          description: >-
+            Valor liquidado em CENTAVOS (unidades menores inteiras). Nenhum valor
+            cruza esta fronteira em reais: o PSP informa o valor do checkout como
+            decimal em reais no fio ("amount": 5.01) e o adaptador converte para
+            centavos por string, nunca por ponto flutuante. Não existe campo
+            `amount` em reais neste corpo — diferença de arredondamento em valor é
+            bug de dinheiro.
+          example: 501
+        installments:
+          type: integer
+          description: >-
+            Em quantas parcelas a autorização do cartão foi dividida, para a empresa
+            saber o que vai receber e quando. Zero em PIX e boleto, que não têm
+            parcelamento. Sempre presente, para o schema ser estável.
+          example: 3
+        message:
+          type: string
+          description: >-
+            Status da captura nas palavras do PSP. Vazio quando o PSP não disse nada
+            (PIX, boleto). Sempre presente, para o schema ser estável.
+          example: Transacao capturada com sucesso
 
     AccountKeyIssued:
       type: object

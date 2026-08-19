@@ -13,7 +13,7 @@ var f2Now = time.Date(2026, 8, 17, 16, 0, 0, 0, time.UTC)
 
 func mustDelivery(t *testing.T) *outboundqueue.Delivery {
 	t.Helper()
-	d, err := outboundqueue.NewDelivery("d-1", "acct-verz", "ten-1", "ek-1", "tx-1", "payment.paid", f2Now)
+	d, err := outboundqueue.NewDelivery("d-1", "acct-verz", "ten-1", "ek-1", "tx-1", "payment.paid", outboundqueue.Detail{}, f2Now)
 	if err != nil {
 		t.Fatalf("new delivery: %v", err)
 	}

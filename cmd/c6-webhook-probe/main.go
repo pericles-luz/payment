@@ -36,7 +36,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -45,6 +47,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -93,6 +96,11 @@ func run() error {
 	fmt.Printf("client_id        : %s\n", cred.ClientID)
 	fmt.Printf("creditor key     : %s (len=%d)\n", maskTail(cred.CreditorKey), len(cred.CreditorKey))
 	fmt.Printf("base url         : %s\n", cfg.C6.BaseURL)
+	// A 401 whose credential looks like a PIX key is almost always a field swap in the
+	// console. Comparing without printing either value keeps the check safe.
+	if strings.EqualFold(strings.TrimSpace(cred.ClientID), strings.TrimSpace(cred.CreditorKey)) {
+		fmt.Printf("ATENCAO          : client_id e chave PIX sao O MESMO VALOR — campos trocados\n")
+	}
 	if cred.CreditorKey == "" {
 		return fmt.Errorf("tenant has no PIX creditor key — nothing to register")
 	}
@@ -110,6 +118,18 @@ func run() error {
 	if tenantCert != nil {
 		httpc.Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{*tenantCert}
 		fmt.Printf("cert mTLS        : do COFRE (por-tenant)\n")
+		// Which identity the handshake actually presents. A 401 on the token endpoint
+		// cannot distinguish "wrong secret" from "certificate of another environment",
+		// so the subject is printed to separate the two.
+		if len(tenantCert.Certificate) > 0 {
+			if leaf, perr := x509.ParseCertificate(tenantCert.Certificate[0]); perr == nil {
+				fmt.Printf("cert subject     : %s\n", leaf.Subject.CommonName)
+				fmt.Printf("cert emissor     : %s\n", leaf.Issuer.CommonName)
+				fmt.Printf("cert validade    : %s ate %s\n",
+					leaf.NotBefore.Format("2006-01-02"), leaf.NotAfter.Format("2006-01-02"))
+				fmt.Printf("cert sha256      : %x\n", sha256.Sum256(tenantCert.Certificate[0]))
+			}
+		}
 	} else {
 		fmt.Printf("cert mTLS        : do ARQUIVO §8 (%s) — tenant sem cert no cofre\n", cfg.C6.ClientCertPath)
 	}
@@ -121,6 +141,12 @@ func run() error {
 		return err
 	}
 	fmt.Printf("   token obtido (len=%d)\n", len(token))
+
+	// Read-only mode: stop right after authentication. The default flow WRITES (it PUTs
+	// webhook registrations), so inspecting a production credential must never use it.
+	if len(os.Args) > 2 && os.Args[2] == "--token-only" {
+		return nil
+	}
 
 	base := strings.TrimRight(cfg.C6.BaseURL, "/")
 
@@ -150,6 +176,90 @@ func run() error {
 		} {
 			section(probe.label + " /v1/webhooks")
 			if err := call(ctx, httpc, probe.method, base+"/v1/webhooks", token, []byte(probe.body), "application/json"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// --get-checkout <sessionID>: read ONE real checkout session and print the PSP's
+	// body verbatim. It exists to settle a question our own API cannot answer: the
+	// adapter's checkoutResponseBody declares only id/status/url/amount and pins
+	// ReceivedAmountCents to 0 on the stated grounds that C6 does not yet return a
+	// captured amount ("EM BREVE"). That claim came from a code comment, never from an
+	// observed response, and it is the single thing standing between a paid checkout and
+	// settlement (SIN-65726). Printing the raw body checks it against the wire.
+	if len(os.Args) > 3 && os.Args[2] == "--get-checkout" {
+		id := strings.TrimSpace(os.Args[3])
+		section("GET /v1/checkouts/" + id + " (corpo bruto)")
+		if err := call(ctx, httpc, http.MethodGet, base+"/v1/checkouts/"+id, token, nil, "application/json"); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if len(os.Args) > 2 && os.Args[2] == "--checkout" {
+		// The minimal body (amount + payment.card) answered 401, which reads as a
+		// permission problem — but /auth reports checkout.write among the granted scopes.
+		// So the variants below isolate what the gateway actually objects to: an
+		// incomplete payload, the payment method, or the URL shape.
+		exp := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+		full := map[string]any{
+			"amount":                7.77,
+			"description":           "Smoke sandbox",
+			"external_reference_id": "smokechk01",
+			"expiration_date_time":  exp,
+			"redirect_url":          "https://payment-sbx.lmhost.com.br/",
+			"payer": map[string]any{
+				"name":   "Fulano de Tal",
+				"tax_id": "12345678901",
+				"email":  "fulano@example.com",
+				"address": map[string]any{
+					"street": "Rua das Flores", "number": 123,
+					"city": "Brasilia", "state": "DF", "zip_code": "70000000",
+				},
+			},
+			"payment": map[string]any{
+				"card": map[string]any{"type": "CREDIT", "installments": 1},
+			},
+		}
+		// Same complete body, only the payment method differs — isolates whether the 401
+		// is about PIX-in-checkout specifically or about the payload.
+		pixFull := map[string]any{}
+		for k, v := range full {
+			pixFull[k] = v
+		}
+		pixFull["external_reference_id"] = "smokechk02"
+		pixFull["payment"] = map[string]any{"pix": map[string]any{"key": "AUTO"}}
+		// And the body our adapter actually sends today: amount + payment.card only.
+		adapterShape := map[string]any{
+			"amount":  7.77,
+			"payment": map[string]any{"card": map[string]any{"type": "CREDIT", "installments": 1}},
+		}
+		variants := []struct {
+			name string
+			body map[string]any
+		}{
+			{"corpo COMPLETO com cartao", full},
+			{"corpo COMPLETO com pix AUTO", pixFull},
+			{"corpo que NOSSO adapter envia hoje", adapterShape},
+		}
+		// Reads first: they create nothing and separate "not authorized for checkout at
+		// all" from "not authorized to WRITE". A 404 on a bogus id means the credential
+		// got past authorization; a 401 means it did not.
+		section("GET /v1/checkouts/{id inexistente} (checkout.read)")
+		if err := call(ctx, httpc, http.MethodGet, base+"/v1/checkouts/naoexiste", token, nil, "application/json"); err != nil {
+			return err
+		}
+		section("GET /v1/checkouts/generate/public-key (checkout.keys.read)")
+		if err := call(ctx, httpc, http.MethodGet, base+"/v1/checkouts/generate/public-key", token, nil, "application/json"); err != nil {
+			return err
+		}
+		for _, v := range variants {
+			b, _ := json.Marshal(v.body)
+			section(v.name)
+			fmt.Printf("   enviado: %s\n", string(b))
+			if err := call(ctx, httpc, http.MethodPost, base+"/v1/checkouts/", token, b, "application/json"); err != nil {
 				return err
 			}
 		}
@@ -260,36 +370,117 @@ func loadTenantMaterial(ctx context.Context, cfg config.Config, tenantID string)
 // secret only in the Basic auth header) so the probe exercises the same auth path the
 // service uses. On failure the raw body IS printed — that is the diagnostic value.
 func fetchToken(ctx context.Context, httpc *http.Client, cfg config.Config, cred ports.BankCredential) (string, error) {
-	form := url.Values{"grant_type": {"client_credentials"}}
-	if cfg.C6.Scope != "" {
-		form.Set("scope", cfg.C6.Scope)
+	// RFC 6749 allows the client credentials either in the Authorization header
+	// (client_secret_basic) or in the form body (client_secret_post). The adapter sends
+	// Basic; the published C6 contract documents all three fields IN THE BODY. Production
+	// accepts Basic, so the difference never surfaced. Both are tried here, in that order,
+	// and the winner is reported — a 401 alone cannot tell "wrong secret" from "wrong
+	// client-authentication method".
+	attempts := []struct {
+		name  string
+		build func(url.Values, *http.Request)
+	}{
+		{"client_secret_basic (o que o adapter manda hoje)", func(_ url.Values, r *http.Request) {
+			r.SetBasicAuth(cred.ClientID, cred.Secret)
+		}},
+		{"client_secret_post (o que o contrato documenta)", nil},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.C6.TokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
+	var lastErr error
+	for _, a := range attempts {
+		form := url.Values{"grant_type": {"client_credentials"}}
+		if cfg.C6.Scope != "" {
+			form.Set("scope", cfg.C6.Scope)
+		}
+		if a.build == nil {
+			form.Set("client_id", cred.ClientID)
+			form.Set("client_secret", cred.Secret)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.C6.TokenURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+		if a.build != nil {
+			a.build(form, req)
+		}
+		resp, err := httpc.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("token transport: %w", err)
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxPrintBytes))
+		_ = resp.Body.Close()
+		fmt.Printf("   %-48s HTTP %d\n", a.name, resp.StatusCode)
+		if resp.StatusCode/100 != 2 {
+			fmt.Printf("      corpo: %s\n", strings.TrimSpace(string(raw)))
+			lastErr = fmt.Errorf("token failed with HTTP %d", resp.StatusCode)
+			continue
+		}
+		var tr struct {
+			AccessToken string `json:"access_token"`
+			// The certification script documents that /auth echoes the credential's
+			// granted scopes. A 403 on a business endpoint is usually a missing scope,
+			// so they are printed here to make that diagnosable in one run.
+			Scopes any `json:"scopes"`
+		}
+		if err := json.Unmarshal(raw, &tr); err != nil || tr.AccessToken == "" {
+			return "", fmt.Errorf("token response not understood")
+		}
+		// The token turned out to be OPAQUE (no dots), so no claims exist to inspect. The
+		// certification script says /auth returns the granted scopes, so the envelope is
+		// printed in full — with the bearer redacted — to find where they actually live.
+		{
+			var env map[string]any
+			if json.Unmarshal(raw, &env) == nil {
+				if _, ok := env["access_token"]; ok {
+					env["access_token"] = "<REDIGIDO>"
+				}
+				if b, mErr := json.MarshalIndent(env, "      ", "  "); mErr == nil {
+					fmt.Printf("      resposta do /auth: %s\n", string(b))
+				}
+			}
+		}
+		if tr.Scopes != nil {
+			if b, mErr := json.Marshal(tr.Scopes); mErr == nil {
+				fmt.Printf("      escopos (corpo): %s\n", string(b))
+			}
+		}
+		// The granted scopes may travel inside the JWT instead of the envelope. Only the
+		// scope-bearing claims are printed — never the token, which is a bearer secret.
+		parts := strings.Split(tr.AccessToken, ".")
+		fmt.Printf("      formato do token: %d segmento(s) separados por ponto\n", len(parts))
+		if len(parts) == 3 {
+			payload, dErr := base64.RawURLEncoding.DecodeString(parts[1])
+			if dErr != nil {
+				fmt.Printf("      payload nao decodifica como base64url: %v\n", dErr)
+			}
+			if dErr == nil {
+				var claims map[string]any
+				if uErr := json.Unmarshal(payload, &claims); uErr != nil {
+					fmt.Printf("      payload nao e JSON: %v\n", uErr)
+				} else {
+					// Claim NAMES are always listed: the certification script says the
+					// granted scopes come back from /auth, so knowing which claims exist
+					// is the first step when a business endpoint answers 401/403.
+					names := make([]string, 0, len(claims))
+					for k := range claims {
+						names = append(names, k)
+					}
+					sort.Strings(names)
+					fmt.Printf("      claims presentes: %s\n", strings.Join(names, ", "))
+					for _, k := range []string{"scope", "scopes", "authorities", "permissions", "roles"} {
+						if v, ok := claims[k]; ok {
+							if b, mErr := json.Marshal(v); mErr == nil {
+								fmt.Printf("      claim %s: %s\n", k, string(b))
+							}
+						}
+					}
+				}
+			}
+		}
+		return tr.AccessToken, nil
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	req.SetBasicAuth(cred.ClientID, cred.Secret)
-
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("token transport: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxPrintBytes))
-	fmt.Printf("   HTTP %d\n", resp.StatusCode)
-	if resp.StatusCode/100 != 2 {
-		fmt.Printf("   corpo: %s\n", string(raw))
-		return "", fmt.Errorf("token failed with HTTP %d", resp.StatusCode)
-	}
-	var tr struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal(raw, &tr); err != nil || tr.AccessToken == "" {
-		return "", fmt.Errorf("token response not understood")
-	}
-	return tr.AccessToken, nil
+	return "", lastErr
 }
 
 // call performs one authenticated request and prints status, content-type and the
