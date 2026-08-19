@@ -11,7 +11,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
-// --- Boleto: register OMITS the portal-gated discount, read reconciles legacy tiers ---
+// --- Boleto: fees, read reconciliation and the absent amendment endpoint ---
 
 // The real /v1/bank_slips discount object has a portal-gated inner schema (undiscovered by
 // blind probing — SIN-65888), so CreateBoleto intentionally OMITS it until captured (CTO
@@ -19,35 +19,68 @@ import (
 // discount tiers, the bank_slips body must not emit a `discount`/`discounts` key (the
 // strict C6 schema would 400). Fine/interest/amount still transport. (This replaces the
 // prior "carries discounts on create" assertion, obsoleted by the DTO split — CTO §4.)
-func TestCreateBoletoOmitsPortalGatedDiscount(t *testing.T) {
+// The published contract exposes exactly ONE discount tier (first_discount_*), so a single
+// tier maps and a second one is refused instead of being dropped: silently discarding a
+// tier would change what the payer owes.
+func TestCreateBoletoDiscountTier(t *testing.T) {
 	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
-	if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
-		TenantID: "t1", BoletoID: "bol_1", AmountCents: 100000, Currency: "BRL",
-		FineBps: 200, MonthlyInterestBps: 100,
-		Payer: fullBoletoPayer(),
-		Discounts: []ports.BoletoDiscountTier{
-			{DaysBeforeDue: 10, Bps: 1000},
-			{DaysBeforeDue: 0, FixedCents: 500},
-		},
-	}); err != nil {
-		t.Fatalf("CreateBoleto: %v", err)
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(ps.body(), &raw); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	for _, gone := range []string{"discount", "discounts"} {
-		if _, ok := raw[gone]; ok {
-			t.Fatalf("portal-gated %q must be omitted from the bank_slips body: %s", gone, ps.body())
+	t.Run("single_tier_maps_into_fees", func(t *testing.T) {
+		t.Parallel()
+		ps := newProductServer(t)
+		p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
+
+		if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
+			TenantID: "t1", BoletoID: "bol_1", AmountCents: 100000, Currency: "BRL",
+			FineBps: 200, MonthlyInterestBps: 100,
+			Payer:       fullBoletoPayer(),
+			Description: "Compra de produto X",
+			Discounts:   []ports.BoletoDiscountTier{{DaysBeforeDue: 10, Bps: 1000}},
+		}); err != nil {
+			t.Fatalf("CreateBoleto: %v", err)
 		}
-	}
-	// Sanity: the rest of the rate set still transports (the omission is discount-specific).
-	if _, ok := raw["fine"]; !ok {
-		t.Fatalf("fine must still transport alongside the discount omission: %s", ps.body())
-	}
+		var sent struct {
+			Fees struct {
+				DiscountType          string      `json:"discount_type"`
+				FirstDiscountValue    json.Number `json:"first_discount_value"`
+				FirstDiscountDeadline int         `json:"first_discount_deadline"`
+			} `json:"fees"`
+		}
+		if err := json.Unmarshal(ps.body(), &sent); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if sent.Fees.FirstDiscountValue.String() != "10.00" || sent.Fees.FirstDiscountDeadline != 10 {
+			t.Fatalf("discount tier not mapped: %+v (body=%s)", sent.Fees, ps.body())
+		}
+		if sent.Fees.DiscountType == "" {
+			t.Fatalf("discount_type must accompany the value: %s", ps.body())
+		}
+		// The invented top-level array must be gone.
+		var raw map[string]json.RawMessage
+		_ = json.Unmarshal(ps.body(), &raw)
+		if _, ok := raw["discounts"]; ok {
+			t.Fatalf("discounts is not a contract field: %s", ps.body())
+		}
+	})
+
+	t.Run("second_tier_is_refused", func(t *testing.T) {
+		t.Parallel()
+		ps := newProductServer(t)
+		p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
+
+		_, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
+			TenantID: "t1", BoletoID: "bol_1", AmountCents: 100000, Currency: "BRL",
+			Payer:       fullBoletoPayer(),
+			Description: "Compra de produto X",
+			Discounts: []ports.BoletoDiscountTier{
+				{DaysBeforeDue: 10, Bps: 1000},
+				{DaysBeforeDue: 0, FixedCents: 500},
+			},
+		})
+		if !errors.Is(err, shared.ErrValidation) {
+			t.Fatalf("a second tier must be refused, got %v", err)
+		}
+	})
 }
 
 func TestGetBoletoSuccess(t *testing.T) {
@@ -130,47 +163,21 @@ func TestCancelBoletoNotFoundMapping(t *testing.T) {
 }
 
 // roteiro grupo 5: alteração via PUT carries the new params; bearer + idempotency.
-func TestUpdateBoletoSuccess(t *testing.T) {
+// The contract has no amendment endpoint, so UpdateBoleto fails closed. The alternative —
+// PUTting a speculative path — would look like it amended a registered charge while the
+// bank knew nothing about it, leaving our state and the bank's divergent on money.
+func TestUpdateBoletoIsUnsupported(t *testing.T) {
 	t.Parallel()
 	ps := newProductServer(t)
 	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
-	res, err := p.UpdateBoleto(context.Background(), "t1", "bol_1", ports.BoletoRequest{
+	_, err := p.UpdateBoleto(context.Background(), "t1", "bol_1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "bol_1", AmountCents: 2000, Currency: "BRL",
-		FineBps: 150, MonthlyInterestBps: 80, IdempotencyKey: "upd-key",
 	})
-	if err != nil {
-		t.Fatalf("UpdateBoleto: %v", err)
+	if !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("want ErrValidation, got %v", err)
 	}
-	if res.AmountCents != 2000 || res.FineBps != 150 {
-		t.Fatalf("amended params not reconciled: %+v", res)
-	}
-	var sent struct {
-		Amount  int64 `json:"amount"`
-		FineBps int64 `json:"fine_bps"`
-	}
-	if err := json.Unmarshal(ps.body(), &sent); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if sent.Amount != 2000 || sent.FineBps != 150 {
-		t.Fatalf("update body not transported: %s", ps.body())
-	}
-	if ps.idemKey() != "upd-key" {
-		t.Fatalf("idempotency key not forwarded: %q", ps.idemKey())
-	}
-}
-
-func TestUpdateBoletoNotFoundMapping(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	ps.boletoUpdate = func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"code":"NOT_FOUND"}`))
-	}
-	p := ps.provider(t, oneTenant("t1", "c", "s"))
-	if _, err := p.UpdateBoleto(context.Background(), "t1", "nope", ports.BoletoRequest{
-		TenantID: "t1", BoletoID: "nope", AmountCents: 1, Currency: "BRL", IdempotencyKey: "k",
-	}); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("404 should map to ErrNotFound, got %v", err)
+	if ps.body() != nil && len(ps.body()) > 0 {
+		t.Fatalf("no request may reach the bank: %s", ps.body())
 	}
 }

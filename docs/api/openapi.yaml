@@ -383,7 +383,14 @@ paths:
     put:
       operationId: updateBoleto
       tags: [Boleto]
-      summary: Alterar boleto (vencimento/validade/valor/multa/juros/desconto)
+      summary: Alterar boleto — NÃO suportado pelo banco
+      deprecated: true
+      description: >-
+        **Indisponível.** O contrato publicado do banco expõe emissão, consulta, PDF,
+        listagem e baixa — não há endpoint de alteração. Esta rota responde `400`
+        (`validation error`) em vez de simular uma alteração que o banco desconhece, o
+        que deixaria o nosso estado e o dele divergentes sobre dinheiro. Para mudar uma
+        cobrança já registrada: cancele (`deleteBoleto`) e emita outra.
       parameters:
         - $ref: "#/components/parameters/PathId"
         - $ref: "#/components/parameters/IdempotencyKey"
@@ -1356,12 +1363,17 @@ components:
 
     Address:
       type: object
+      description: >-
+        Endereço do pagador. Todos os campos são exigidos pelo banco na emissão do
+        boleto — `neighborhood` inclusive, cuja ausência faz o registro ser recusado.
+      required: [street, neighborhood, city, state, zip_code]
       properties:
-        street: { type: string }
-        number: { type: integer }
+        street: { type: string, description: "Logradouro. É enviado ao banco composto com o número." }
+        number: { type: integer, description: Número do logradouro. }
+        neighborhood: { type: string, description: Bairro. Obrigatório para emitir boleto. }
         city: { type: string }
-        state: { type: string }
-        zip_code: { type: string }
+        state: { type: string, description: "UF, 2 letras." }
+        zip_code: { type: string, description: "CEP, apenas dígitos." }
     Payer:
       type: object
       required: [address]
@@ -1378,7 +1390,7 @@ components:
         fixed_cents: { type: integer, format: int64 }
     CreateBoletoRequest:
       type: object
-      required: [amount_cents, currency, due_date, fine_bps, monthly_interest_bps, payer]
+      required: [amount_cents, currency, due_date, fine_bps, monthly_interest_bps, payer, description]
       properties:
         amount_cents: { type: integer, format: int64, description: Valor em centavos. }
         currency: { type: string, example: BRL }
@@ -1390,6 +1402,13 @@ components:
           type: array
           items: { $ref: "#/components/schemas/DiscountTier" }
         payer: { $ref: "#/components/schemas/Payer" }
+        description:
+          type: string
+          maxLength: 100
+          description: >-
+            Descrição da cobrança, impressa no boleto e vista pelo pagador. Obrigatória:
+            o banco recusa o registro sem ela. Máximo de 100 caracteres.
+          example: Mensalidade agosto/2026
     UpdateBoletoRequest:
       type: object
       required: [due_date]

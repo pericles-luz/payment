@@ -346,6 +346,24 @@ baixa/cancelamento (`deleteBoleto`, `DELETE`) endereçam por `boleto_id`.
 
 ---
 
+### 4.5 BolePix: campos obrigatórios e o que o banco não faz
+
+Duas exigências do banco que recusam o registro quando ausentes:
+
+- **`description`** — descrição impressa no boleto, vista pelo pagador. Máximo 100
+  caracteres.
+- **`payer.address.neighborhood`** — o bairro. O endereço do pagador é validado
+  integralmente na emissão.
+
+O QR Code do PIX vem **na própria resposta do registro**, não numa consulta posterior:
+uma cobrança BolePix é pagável por boleto ou por PIX desde o momento em que é criada.
+Ele é gerado a partir da chave aleatória registrada da empresa-cliente — sem chave, a
+cobrança é criada normalmente, só que sem QR.
+
+**Alteração não existe.** O banco expõe emissão, consulta, PDF, listagem e baixa; não há
+endpoint de alteração. `PUT /v1/boletos/{id}` responde `400` em vez de fingir que alterou
+uma cobrança já registrada. Para mudar algo: cancele e emita outra.
+
 ## 5. Consulta e pagamento DDA
 
 **Quando:** pagar boletos que caíram no DDA da empresa-cliente. Fluxo: listar →
