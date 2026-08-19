@@ -289,35 +289,137 @@ func (s *Server) handleSetBankCertificate(w http.ResponseWriter, r *http.Request
 // notification is a few hundred bytes — 64 KiB is generous. Oversize → 413.
 const maxWebhookBytes = 64 << 10
 
-// webhookServiceCheckout is the c6WebhookNotification.service value that marks a
-// checkout-session status notification (roteiro 12). Matched case-insensitively; any
-// other service is reconciled as a PIX/charge.
-const webhookServiceCheckout = "checkout"
-
-// webhookServiceRec / webhookServiceCobR are the c6WebhookNotification.service
-// values that mark a PIX Automático (recorrência) notification (SIN-66036): a
-// mandate-status change (rec) or a recurring-charge event (cobr). C6 fronts every
-// callback — PIX, checkout and the two recurrence streams — on the same opaque
-// channel with the same envelope, distinguishing them by service; routing here
-// reuses the channel auth, body cap and client_id cross-check already applied above.
-// The recurrence handlers reconcile the authoritative mandate/charge (GetRec /
-// GetCobR) before trusting the body (threat W3). Both matched case-insensitively.
-// The exact service tokens are confirmed against the C6 sandbox in F4 (homologação).
+// Service discriminators that change how a notification is routed. BANK_SLIP and
+// BANK_SLIP_PIX need no constant: they reconcile as ordinary charges, which is the
+// default branch. PIX is the odd one — same channel, different envelope entirely (see
+// c6WebhookNotification).
 const (
-	webhookServiceRec  = "rec"
-	webhookServiceCobR = "cobr"
+	webhookServicePix      = "pix"
+	webhookServiceCheckout = "checkout"
+
+	// Labels for the two recurrence streams, used in the event key.
+	webhookLabelRec  = "rec"
+	webhookLabelCobR = "cobr"
 )
 
-// c6WebhookNotification is the inbound C6 callback body (notificações.yaml,
-// WebhookNotification). It is UNTRUSTED: the tenant comes from the authenticated
-// channel (never client_id), and settlement reconciles the authoritative state
-// via GetCharge rather than trusting status. Only the fields the adapter needs are
-// decoded; unknown fields are rejected (anti mass-assignment).
+// c6WebhookNotification is the union of the FOUR documented inbound shapes. C6 fronts
+// every callback on the same opaque channel, but the payloads are genuinely different
+// contracts, not one envelope with optional fields:
+//
+//	proprietary (BANK_SLIP, BANK_SLIP_PIX, CHECKOUT)
+//	    external_id, date_time, client_id, partner_id, service, status
+//	PIX (WebhookNotificationPix)
+//	    date_time, status, service=PIX, key, tax_id, information
+//	    — NO external_id; the settled ids live inside `information`, which is a STRING
+//	      carrying JSON.
+//	recorrência (RecNotification / CobRNotification, BACEN shape)
+//	    idRec [, txid], status, atualizacao — NO service discriminator at all.
+//
+// It is UNTRUSTED: the tenant comes from the authenticated channel (never client_id),
+// and settlement reconciles the authoritative state rather than trusting `status`.
+//
+// Unknown fields are ACCEPTED (they were previously rejected). Rejecting them made the
+// receiver refuse every real notification — the documented envelope already carries
+// date_time and partner_id, which the old struct did not declare — and would break again
+// on any additive PSP change. The mass-assignment concern it guarded against does not
+// apply: this is a fixed struct, so an unknown field binds to nothing. The controls that
+// actually matter stay: the 64 KiB cap, the channel-derived tenant, and authoritative
+// reconciliation.
 type c6WebhookNotification struct {
-	ExternalID string `json:"external_id"` // C6 charge id → reconcile key (txID)
+	ExternalID string `json:"external_id"` // proprietary: object id → reconcile key
 	ClientID   string `json:"client_id"`   // C6 merchant id → cross-checked, not trusted
-	Service    string `json:"service"`     // e.g. pix — part of the idempotency key
+	Service    string `json:"service"`     // PIX | BANK_SLIP | BANK_SLIP_PIX | CHECKOUT
 	Status     string `json:"status"`      // advisory only; never the settle decision
+
+	// Information is the PIX envelope's payload: a JSON document carried AS A STRING.
+	Information string `json:"information"`
+	// Pix is the same payload UNWRAPPED. Both registrations point at this one URL — the
+	// BACEN one (PUT /v2/pix/webhook/{chave}) and the proprietary one — so the received
+	// PIX may arrive either nested in `information` or as a top-level array.
+	Pix []pixReceived `json:"pix"`
+
+	// IDRec/TxID discriminate the two recurrence streams, which carry no `service`.
+	IDRec string `json:"idRec"`
+	TxID  string `json:"txid"`
+}
+
+// pixReceived is one received PIX. Only the end-to-end id is read: it is the reconcile
+// key, and everything else in the payload is advisory.
+type pixReceived struct {
+	EndToEndID string `json:"endToEndId"`
+}
+
+// pixInformation is the JSON nested inside WebhookNotificationPix.information.
+type pixInformation struct {
+	Pix []pixReceived `json:"pix"`
+}
+
+// firstEndToEndID returns the first non-empty end-to-end id in a received-PIX list.
+func firstEndToEndID(list []pixReceived) string {
+	for _, p := range list {
+		if e2e := strings.TrimSpace(p.EndToEndID); e2e != "" {
+			return e2e
+		}
+	}
+	return ""
+}
+
+// webhookKind is the resolved routing decision for one notification.
+type webhookKind int
+
+const (
+	webhookKindPayment webhookKind = iota
+	webhookKindCheckout
+	webhookKindRec
+	webhookKindCobR
+)
+
+// resolveWebhook classifies an inbound notification and extracts its reconcile id.
+// Routing is by the DOCUMENTED discriminators: `service` for the proprietary envelope and
+// PIX, and the presence of idRec/txid for the two BACEN recurrence streams. It reports
+// ok=false when nothing identifies the event, which the caller turns into a 400 — better
+// than reconciling against an empty id.
+func resolveWebhook(note c6WebhookNotification) (kind webhookKind, id, label string, ok bool) {
+	switch {
+	case strings.EqualFold(note.Service, webhookServicePix):
+		// The documented PIX envelope has NO external_id: the end-to-end id is the
+		// reconcile key. It can reach us three ways, so all three are accepted rather
+		// than betting on one — a settled PIX that cannot be identified is money we
+		// never reconcile.
+		if e2e := firstEndToEndID(note.Pix); e2e != "" {
+			return webhookKindPayment, e2e, webhookServicePix, true
+		}
+		if note.Information != "" {
+			var info pixInformation
+			if err := json.Unmarshal([]byte(note.Information), &info); err == nil {
+				if e2e := firstEndToEndID(info.Pix); e2e != "" {
+					return webhookKindPayment, e2e, webhookServicePix, true
+				}
+			}
+		}
+		if note.ExternalID != "" {
+			return webhookKindPayment, note.ExternalID, webhookServicePix, true
+		}
+		return 0, "", "", false
+	case note.IDRec != "" && note.TxID != "":
+		return webhookKindCobR, note.TxID, webhookLabelCobR, true
+	case note.IDRec != "":
+		return webhookKindRec, note.IDRec, webhookLabelRec, true
+	// The recurrence streams carry idRec/txid in the published contract and no `service`.
+	// These two service tokens were assumed before that contract was available and were
+	// never confirmed against the bank; they are kept as a fallback so a deployment that
+	// does receive them keeps working, but the cases above are the documented path.
+	case strings.EqualFold(note.Service, webhookLabelRec) && note.ExternalID != "":
+		return webhookKindRec, note.ExternalID, webhookLabelRec, true
+	case strings.EqualFold(note.Service, webhookLabelCobR) && note.ExternalID != "":
+		return webhookKindCobR, note.ExternalID, webhookLabelCobR, true
+	case strings.EqualFold(note.Service, webhookServiceCheckout):
+		return webhookKindCheckout, note.ExternalID, webhookServiceCheckout, note.ExternalID != ""
+	case note.ExternalID != "":
+		// BANK_SLIP / BANK_SLIP_PIX and anything else identified by external_id.
+		return webhookKindPayment, note.ExternalID, strings.ToLower(note.Service), true
+	}
+	return 0, "", "", false
 }
 
 // handleC6Webhook receives a C6 payment notification on a tenant's opaque callback
@@ -355,7 +457,6 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBytes)
 	var note c6WebhookNotification
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&note); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -383,49 +484,43 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(note.ExternalID) == "" {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
 	// 4. Dispatch with the CHANNEL tenant. EventKey distinguishes state transitions
-	//    of the same charge (e.g. pending→paid) while collapsing exact redeliveries,
+	//    of the same object (e.g. pending→paid) while collapsing exact redeliveries,
 	//    so anti-replay dedup (processed_events) suppresses duplicates without
 	//    dropping a genuine settle. Retention of processed_events is INDEFINITE: the
 	//    C6 contract signs nothing (no timestamp), so dedup is the only replay
 	//    barrier and pruning a key would reopen a replay window. A bounded
 	//    signed-timestamp window is deferred to SIN-64762 (if C6 ever signs).
 	//
-	//    The service field selects which authoritative state to reconcile before
-	//    settling: a checkout notification reconciles the checkout session (roteiro
-	//    12), every other service the PIX/charge. Both paths share the same dedup +
-	//    reconcile-before-settle unit of work and the EventKey carries the service, so
-	//    a checkout and a charge event for the same external id never collide.
-	ev := app.PaymentEvent{
-		TenantID: id.TenantID,
-		TxID:     note.ExternalID,
-		EventKey: note.ExternalID + "|" + note.Service + "|" + note.Status,
+	//    The resolved kind selects which authoritative state to reconcile before
+	//    settling. Every path shares the same dedup + reconcile-before-settle unit of
+	//    work, and the EventKey carries the kind label, so a checkout and a charge event
+	//    for the same id never collide.
+	kind, objectID, label, ok := resolveWebhook(note)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
 	}
+	eventKey := objectID + "|" + label + "|" + note.Status
+
 	var err error
-	switch strings.ToLower(strings.TrimSpace(note.Service)) {
-	case webhookServiceCheckout:
-		err = s.webhooks.HandleCheckoutEvent(r.Context(), ev)
-	case webhookServiceRec:
-		// Mandate-status notification: the external id is the idRec to reconcile.
-		err = s.webhooks.HandleRecEvent(r.Context(), app.RecEvent{
-			TenantID: id.TenantID,
-			IDRec:    note.ExternalID,
-			EventKey: ev.EventKey,
+	switch kind {
+	case webhookKindCheckout:
+		err = s.webhooks.HandleCheckoutEvent(r.Context(), app.PaymentEvent{
+			TenantID: id.TenantID, TxID: objectID, EventKey: eventKey,
 		})
-	case webhookServiceCobR:
-		// Recurring-charge notification: the external id is the cobr txid.
+	case webhookKindRec:
+		err = s.webhooks.HandleRecEvent(r.Context(), app.RecEvent{
+			TenantID: id.TenantID, IDRec: objectID, EventKey: eventKey,
+		})
+	case webhookKindCobR:
 		err = s.webhooks.HandleCobREvent(r.Context(), app.CobREvent{
-			TenantID: id.TenantID,
-			TxID:     note.ExternalID,
-			EventKey: ev.EventKey,
+			TenantID: id.TenantID, TxID: objectID, EventKey: eventKey,
 		})
 	default:
-		err = s.webhooks.HandlePaymentEvent(r.Context(), ev)
+		err = s.webhooks.HandlePaymentEvent(r.Context(), app.PaymentEvent{
+			TenantID: id.TenantID, TxID: objectID, EventKey: eventKey,
+		})
 	}
 	if err != nil {
 		writeDomainError(w, err)
