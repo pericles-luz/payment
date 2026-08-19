@@ -908,6 +908,24 @@ type PixWebhookRegistrar interface {
 	GetWebhook(ctx context.Context, tenantID, pixKey string) (WebhookRegistration, error)
 }
 
+// ServiceWebhookRegistrar is the output port for the PSP-PROPRIETARY notification
+// surface, which is registered per SERVICE (checkout, boleto) rather than per PIX key.
+// It is a separate port from PixWebhookRegistrar (ISP) because the two surfaces are
+// genuinely different contracts at the PSP — different path, different HTTP verb,
+// different body field name, and even opposite Accept requirements — so a consumer of
+// one must not be forced to depend on the other. Every service can point at the SAME
+// per-tenant callback URL: the PSP routes by the service discriminator it echoes in the
+// notification, which the inbound receiver switches on.
+type ServiceWebhookRegistrar interface {
+	// RegisterServiceWebhook idempotently registers the HTTPS webhookURL the PSP will
+	// notify for `service`. An unknown service, an empty tenantID, or a non-HTTPS URL is
+	// shared.ErrValidation.
+	RegisterServiceWebhook(ctx context.Context, tenantID, service, webhookURL string) error
+	// GetServiceWebhook reads back the callback currently registered for `service` so a
+	// caller can confirm idempotently. An unregistered service is shared.ErrNotFound.
+	GetServiceWebhook(ctx context.Context, tenantID, service string) (WebhookRegistration, error)
+}
+
 // PixListFilter is the date-window + pagination filter for listing immediate PIX
 // charges. Start and End are the BACEN inicio/fim bounds (required); Page and
 // PageSize map to paginacao.paginaAtual / paginacao.itensPorPagina (optional — a
