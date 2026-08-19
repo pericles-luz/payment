@@ -621,6 +621,7 @@ func newBankRegistry(cfg config.Config, creds ports.CredentialStore, certs c6.Ce
 		RateLimitPerSecond: cfg.C6.RateLimitRPS,
 		RateLimitBurst:     cfg.C6.RateLimitBurst,
 		MaxRetries:         cfg.C6.MaxRetries,
+		BillingScheme:      cfg.C6.BillingScheme,
 	}
 	// C6 requires an mTLS client certificate on the connection. The transport now
 	// sources that certificate from the DURABLE vault, selected PER REQUEST by tenant

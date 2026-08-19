@@ -21,11 +21,12 @@ func fullBoletoPayer() ports.BoletoPayer {
 		Name:  "Fulano de Tal",
 		TaxID: "12345678901",
 		Address: ports.BoletoAddress{
-			Street:  "Rua das Flores",
-			Number:  123,
-			City:    "Brasília",
-			State:   "DF",
-			ZipCode: "70000000",
+			Street:       "Rua das Flores",
+			Number:       123,
+			Neighborhood: "Asa Sul",
+			City:         "Brasília",
+			State:        "DF",
+			ZipCode:      "70000000",
 		},
 	}
 }
@@ -41,82 +42,117 @@ var externalRefPattern = regexp.MustCompile(`^[a-zA-Z0-9]{1,10}$`)
 func TestCreateBoletoBankSlipsBody(t *testing.T) {
 	t.Parallel()
 	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
+	// A tenant WITH a registered random PIX key: that key is what turns a plain boleto
+	// into a BolePix, so the QR sub-object only appears when the credential carries one.
+	creds := oneTenant("t1", "client-1", "secret-1")
+	c := creds.creds["t1"]
+	c.CreditorKey = "123e4567-e89b-12d3-a456-426614174000"
+	creds.creds["t1"] = c
+	p := ps.provider(t, creds)
 
 	due := time.Date(2026, 7, 1, 15, 4, 5, 0, time.UTC)
 	if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "11111111-2222-3333-4444-555555555555",
 		AmountCents: 1234, Currency: "BRL", DueDate: due,
 		FineBps: 200, MonthlyInterestBps: 100,
-		Payer: fullBoletoPayer(),
+		Payer:       fullBoletoPayer(),
+		Description: "Compra de produto X",
 	}); err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
 	}
 
-	// amount is a decimal NUMBER on the wire (reais, SIN-65888) — json.Number preserves the
-	// raw token so we assert the exact serialization without a float comparison.
-	type fee struct {
-		Value json.Number `json:"value"`
-		Type  string      `json:"type"`
-	}
+	// amount is a decimal NUMBER on the wire (reais) — json.Number preserves the raw token
+	// so the exact serialization is asserted without a float comparison.
 	var sent struct {
 		Amount              json.Number `json:"amount"`
 		DueDate             string      `json:"due_date"`
+		Description         string      `json:"description"`
 		ExternalReferenceID string      `json:"external_reference_id"`
-		Fine                *fee        `json:"fine"`
-		Interest            *fee        `json:"interest"`
-		Payer               struct {
+		Fees                *struct {
+			FineValue     json.Number `json:"fine_value"`
+			FineType      string      `json:"fine_type"`
+			InterestValue json.Number `json:"interest_value"`
+			InterestType  string      `json:"interest_type"`
+		} `json:"fees"`
+		Payer struct {
 			Name    string `json:"name"`
 			TaxID   string `json:"tax_id"`
 			Address struct {
-				Street  string `json:"street"`
-				Number  int    `json:"number"`
-				City    string `json:"city"`
-				State   string `json:"state"`
-				ZipCode string `json:"zip_code"`
+				Address      string `json:"address"`
+				Neighborhood string `json:"neighborhood"`
+				City         string `json:"city"`
+				State        string `json:"state"`
+				ZipCode      string `json:"zip_code"`
 			} `json:"address"`
 		} `json:"payer"`
+		PaymentMethod struct {
+			BankSlip struct {
+				BillingScheme string `json:"billing_scheme"`
+			} `json:"bank_slip"`
+			Pix *struct {
+				Key  string `json:"key"`
+				Type string `json:"type"`
+			} `json:"pix"`
+		} `json:"payment_method"`
 	}
 	if err := json.Unmarshal(ps.body(), &sent); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	// 1234 centavos ⇒ the decimal "12.34" (not 1234, not 12.340000001).
+	// 1234 centavos => the decimal "12.34" (not 1234, not 12.340000001).
 	if sent.Amount.String() != "12.34" {
 		t.Fatalf("amount: want decimal 12.34, got %q (body=%s)", sent.Amount.String(), ps.body())
 	}
 	if sent.DueDate != "2026-07-01" {
 		t.Fatalf("due_date must be yyyy-MM-dd, got %q", sent.DueDate)
 	}
+	// description is REQUIRED by the bank; a body without it is refused at registration.
+	if sent.Description != "Compra de produto X" {
+		t.Fatalf("description not transported: %q", sent.Description)
+	}
 	if !externalRefPattern.MatchString(sent.ExternalReferenceID) {
 		t.Fatalf("external_reference_id %q must match %s", sent.ExternalReferenceID, externalRefPattern)
 	}
-	// fine/interest are {value,type} objects (200 bps ⇒ "2.00" PERCENTAGE, 100 bps ⇒ "1.00").
-	if sent.Fine == nil || sent.Fine.Value.String() != "2.00" || sent.Fine.Type != "PERCENTAGE" {
-		t.Fatalf("fine not mapped to {value,type}: %+v (body=%s)", sent.Fine, ps.body())
+	// Fees ride in ONE flat object — not the two separate fine/interest objects the
+	// pre-contract implementation sent. 200 bps => "2.00" PERCENTAGE.
+	if sent.Fees == nil {
+		t.Fatalf("fees object missing: %s", ps.body())
 	}
-	if sent.Interest == nil || sent.Interest.Value.String() != "1.00" || sent.Interest.Type != "PERCENTAGE" {
-		t.Fatalf("interest not mapped to {value,type}: %+v (body=%s)", sent.Interest, ps.body())
+	if sent.Fees.FineValue.String() != "2.00" || sent.Fees.FineType != "PERCENTAGE" {
+		t.Fatalf("fine not mapped: %+v (body=%s)", sent.Fees, ps.body())
+	}
+	if sent.Fees.InterestValue.String() != "1.00" || sent.Fees.InterestType != "MONTHLY_PERCENTAGE" {
+		t.Fatalf("interest not mapped: %+v (body=%s)", sent.Fees, ps.body())
 	}
 	if sent.Payer.Name != "Fulano de Tal" || sent.Payer.TaxID != "12345678901" {
 		t.Fatalf("payer not mapped: %+v", sent.Payer)
 	}
+	// The contract has ONE address line (street composed with the number) plus a
+	// mandatory neighborhood — not the street/number pair of the previous body.
 	a := sent.Payer.Address
-	if a.Street != "Rua das Flores" || a.Number != 123 || a.City != "Brasília" || a.State != "DF" || a.ZipCode != "70000000" {
+	if a.Address != "Rua das Flores, 123" || a.Neighborhood != "Asa Sul" || a.City != "Brasília" || a.State != "DF" || a.ZipCode != "70000000" {
 		t.Fatalf("payer address not mapped: %+v", a)
 	}
+	// payment_method is what makes this a BolePix: the carteira registers the slip and the
+	// tenant's random PIX key adds the QR Code to the same charge.
+	if got := sent.PaymentMethod.BankSlip.BillingScheme; got != defaultBillingScheme {
+		t.Fatalf("billing_scheme = %q, want %q", got, defaultBillingScheme)
+	}
+	if sent.PaymentMethod.Pix == nil || sent.PaymentMethod.Pix.Type != pixKeyTypeEVP {
+		t.Fatalf("pix sub-object missing or wrong type: %+v (body=%s)", sent.PaymentMethod.Pix, ps.body())
+	}
 
-	// The invented flat/legacy-rate fields must be gone (strict C6 schema rejects them;
-	// mass-assignment / contract-drift guard).
+	// Fields the contract does not define must be gone: the strict schema rejects them,
+	// and `valid_until` in particular was invented by the previous implementation.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(ps.body(), &raw); err != nil {
 		t.Fatalf("decode raw: %v", err)
 	}
 	for _, gone := range []string{
-		"payer_tax_id", "amount_cents", "boleto_id", "currency",
-		"fine_bps", "fine_fixed_cents", "monthly_interest_bps", "discounts",
+		"payer_tax_id", "amount_cents", "boleto_id", "currency", "valid_until",
+		"fine", "interest", "fine_bps", "fine_fixed_cents", "monthly_interest_bps", "discounts",
 	} {
 		if _, ok := raw[gone]; ok {
-			t.Fatalf("legacy field %q must not be in the bank_slips body: %s", gone, ps.body())
+			t.Fatalf("field %q is not in the C6 contract: %s", gone, ps.body())
 		}
 	}
 }
@@ -131,13 +167,14 @@ func TestCreateBoleto201Mapped(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		// Verbatim shape from the captured 201 (SIN-65888 contrato-real-bank-slips).
-		_, _ = w.Write([]byte(`{"amount":12.34,"due_date":"2026-07-25","originator_id":"000006572943","our_number":"10233820","billing_scheme":"21","billing_type":"3","id":"01KW0CY8QNAQK50SJ2ESDG5YFP","bar_code":"33699151800000012340000065729430010233820213","digitable_line":"33690.00009 65729.430010 02338.202134 9 15180000001234"}`))
+		// Official C6 201: artifacts nested under payment_method.bank_slip, QR under .pix.
+		_, _ = w.Write([]byte(`{"amount":12.34,"due_date":"2026-07-25","id":"01KW0CY8QNAQK50SJ2ESDG5YFP","external_reference_id":"ref1","payment_method":{"bank_slip":{"originator_id":"000006572943","our_number":"10233820","billing_scheme":"21","billing_type":"3","bar_code":"33699151800000012340000065729430010233820213","digitable_line":"33690.00009 65729.430010 02338.202134 9 15180000001234"},"pix":{"qr_code":"00020126_EMV_PAYLOAD","reference":"ref-pix"}}}`))
 	}
 	p := ps.provider(t, oneTenant("t1", "c", "s"))
 
 	res, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "bol_9", AmountCents: 1234, Currency: "BRL",
-		DueDate: time.Unix(1_800_000_000, 0), Payer: fullBoletoPayer(),
+		DueDate: time.Unix(1_800_000_000, 0), Payer: fullBoletoPayer(), Description: "Compra de produto X",
 	})
 	if err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
@@ -166,9 +203,15 @@ func TestCreateBoleto201Mapped(t *testing.T) {
 	if res.AmountCents != 1234 {
 		t.Fatalf("AmountCents: want 1234 (from 12.34), got %d", res.AmountCents)
 	}
-	// C6 does not echo these on create; the hexagonal "unknown" representation is zero.
-	if res.Status != "" || res.QRCode != "" {
-		t.Fatalf("create must not synthesize status/qr_code: %+v", res)
+	// The BolePix QR Code IS returned at registration (payment_method.pix.qr_code) — the
+	// pre-contract implementation assumed it was only available on a later read, so a
+	// caller could never hand the payer a QR without an extra round-trip. Status stays
+	// empty: C6 does not echo it on create.
+	if res.QRCode != "00020126_EMV_PAYLOAD" {
+		t.Fatalf("QR Code must be mapped from payment_method.pix: %+v", res)
+	}
+	if res.Status != "" {
+		t.Fatalf("status is not echoed on create: %+v", res)
 	}
 }
 
@@ -181,7 +224,7 @@ func TestCreateBoletoRequiresFullPayer(t *testing.T) {
 	base := func() ports.BoletoRequest {
 		return ports.BoletoRequest{
 			TenantID: "t1", BoletoID: "bol_1", AmountCents: 100, Currency: "BRL",
-			DueDate: time.Unix(1_800_000_000, 0), Payer: fullBoletoPayer(),
+			DueDate: time.Unix(1_800_000_000, 0), Payer: fullBoletoPayer(), Description: "Compra de produto X",
 		}
 	}
 	cases := []struct {
@@ -322,18 +365,29 @@ func TestBankSlipFeesShapeAndOmitEmpty(t *testing.T) {
 		if err := json.Unmarshal(body, &raw); err != nil {
 			t.Fatalf("decode raw: %v", err)
 		}
-		msg, ok := raw[key]
+		msg, ok := raw["fees"]
 		if !ok {
 			return false, "", ""
 		}
 		var f struct {
-			Value json.Number `json:"value"`
-			Type  string      `json:"type"`
+			FineValue     json.Number `json:"fine_value"`
+			FineType      string      `json:"fine_type"`
+			InterestValue json.Number `json:"interest_value"`
+			InterestType  string      `json:"interest_type"`
 		}
 		if err := json.Unmarshal(msg, &f); err != nil {
-			t.Fatalf("decode fee %q: %v", key, err)
+			t.Fatalf("decode fees: %v", err)
 		}
-		return true, f.Value.String(), f.Type
+		if key == "interest" {
+			if f.InterestType == "" {
+				return false, "", ""
+			}
+			return true, f.InterestValue.String(), f.InterestType
+		}
+		if f.FineType == "" {
+			return false, "", ""
+		}
+		return true, f.FineValue.String(), f.FineType
 	}
 
 	t.Run("zero_fees_omit_keys", func(t *testing.T) {
@@ -342,7 +396,7 @@ func TestBankSlipFeesShapeAndOmitEmpty(t *testing.T) {
 		p := ps.provider(t, oneTenant("t1", "c", "s"))
 		if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 			TenantID: "t1", BoletoID: "b", AmountCents: 100, Currency: "BRL",
-			DueDate: time.Unix(1_800_000_000, 0), Payer: fullBoletoPayer(),
+			DueDate: time.Unix(1_800_000_000, 0), Payer: fullBoletoPayer(), Description: "Compra de produto X",
 		}); err != nil {
 			t.Fatalf("CreateBoleto: %v", err)
 		}
@@ -360,13 +414,13 @@ func TestBankSlipFeesShapeAndOmitEmpty(t *testing.T) {
 		p := ps.provider(t, oneTenant("t1", "c", "s"))
 		if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 			TenantID: "t1", BoletoID: "b", AmountCents: 100, Currency: "BRL",
-			DueDate: time.Unix(1_800_000_000, 0), FineFixedCents: 550, Payer: fullBoletoPayer(),
+			DueDate: time.Unix(1_800_000_000, 0), FineFixedCents: 550, Payer: fullBoletoPayer(), Description: "Compra de produto X",
 		}); err != nil {
 			t.Fatalf("CreateBoleto: %v", err)
 		}
 		present, value, typ := decodeFee(t, ps.body(), "fine")
-		if !present || value != "5.50" || typ != "FIXED" {
-			t.Fatalf("fixed fine: want {5.50,FIXED}, got present=%v value=%q type=%q (body=%s)", present, value, typ, ps.body())
+		if !present || value != "5.50" || typ != feeTypeFixedValue {
+			t.Fatalf("fixed fine: want {5.50,FIXED_VALUE}, got present=%v value=%q type=%q (body=%s)", present, value, typ, ps.body())
 		}
 	})
 
@@ -376,7 +430,7 @@ func TestBankSlipFeesShapeAndOmitEmpty(t *testing.T) {
 		p := ps.provider(t, oneTenant("t1", "c", "s"))
 		if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 			TenantID: "t1", BoletoID: "b", AmountCents: 100, Currency: "BRL",
-			DueDate: time.Unix(1_800_000_000, 0), FineBps: 150, FineFixedCents: 999, Payer: fullBoletoPayer(),
+			DueDate: time.Unix(1_800_000_000, 0), FineBps: 150, FineFixedCents: 999, Payer: fullBoletoPayer(), Description: "Compra de produto X",
 		}); err != nil {
 			t.Fatalf("CreateBoleto: %v", err)
 		}

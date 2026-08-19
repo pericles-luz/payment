@@ -972,11 +972,15 @@ type BoletoDiscountTier struct {
 // ADR-0005 "Riscos conhecidos" for the "S/N"/alphanumeric homologation question.
 // These are plain Go types — transport tags and wire formatting live in the adapter.
 type BoletoAddress struct {
-	Street  string
-	Number  int
-	City    string
-	State   string // UF, 2 letters
-	ZipCode string // CEP, digits only
+	Street string
+	Number int
+	// Neighborhood is the bairro. C6 requires it on every bank-slip registration
+	// (`payer.address.neighborhood`), so an empty value is a validation error at the
+	// adapter boundary rather than a 400 from the bank.
+	Neighborhood string
+	City         string
+	State        string // UF, 2 letters
+	ZipCode      string // CEP, digits only
 }
 
 // BoletoPayer identifies the sacado/pagador of a boleto. It is the domain mirror of
@@ -1014,7 +1018,10 @@ type BoletoRequest struct {
 	// Payer is the boleto's sacado/pagador. The real C6 contract requires the full
 	// payer (name + tax id + address) on POST /v1/bank_slips; mandatory-field
 	// validation lives in the C6 adapter so the stub stays lenient (ADR-0005).
-	Payer          BoletoPayer
+	Payer BoletoPayer
+	// Description is the customer-visible charge description printed on the slip. C6
+	// requires it (max 100 chars) — a registration without it is refused by the bank.
+	Description    string
 	IdempotencyKey string
 }
 

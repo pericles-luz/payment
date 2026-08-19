@@ -67,11 +67,12 @@ type DiscountTierInput struct {
 // integer to mirror the C6 contract; "S/N"/alphanumeric numbers are an open
 // homologation question handled at the adapter/contract level.
 type BoletoAddressInput struct {
-	Street  string
-	Number  int
-	City    string
-	State   string
-	ZipCode string
+	Street       string
+	Number       int
+	Neighborhood string
+	City         string
+	State        string
+	ZipCode      string
 }
 
 // BoletoPayerInput is the boleto sacado/pagador at the boundary. It is optional at the
@@ -104,7 +105,12 @@ type RegisterBoletoInput struct {
 	MonthlyInterestBps int64
 	Discounts          []DiscountTierInput
 	Payer              BoletoPayerInput
-	IdempotencyKey     string
+	// Description is the charge description printed on the slip and required by the
+	// bank. It is request metadata, not aggregate state: it never affects the money,
+	// the schedule or the ledger, so it rides alongside the payer instead of entering
+	// the Boleto aggregate.
+	Description    string
+	IdempotencyKey string
 }
 
 // RegisterBoleto registers a boleto at the bank and records the billable event,
@@ -159,7 +165,7 @@ func (s *BoletoService) RegisterBoleto(ctx context.Context, in RegisterBoletoInp
 		return nil, ports.BoletoResult{}, err
 	}
 
-	res, err := s.boleto.CreateBoleto(ctx, in.TenantID, toBoletoRequest(b, in.Payer, in.IdempotencyKey))
+	res, err := s.boleto.CreateBoleto(ctx, in.TenantID, toBoletoRequest(b, in.Payer, in.Description, in.IdempotencyKey))
 	if err != nil {
 		return nil, ports.BoletoResult{}, fmt.Errorf("bank create boleto: %w", err)
 	}
@@ -268,7 +274,7 @@ func (s *BoletoService) UpdateBoleto(ctx context.Context, tenantID, boletoID str
 	if err != nil {
 		return ports.BoletoResult{}, err
 	}
-	return s.boleto.UpdateBoleto(ctx, tenantID, boletoID, toBoletoRequest(b, BoletoPayerInput{}, in.IdempotencyKey))
+	return s.boleto.UpdateBoleto(ctx, tenantID, boletoID, toBoletoRequest(b, BoletoPayerInput{}, "", in.IdempotencyKey))
 }
 
 // reservePayment returns the payment to bill for this boleto: an existing one for the
@@ -374,7 +380,7 @@ func buildDiscountTiers(in []DiscountTierInput) ([]boleto.DiscountTier, error) {
 // toBoletoRequest maps a validated domain boleto to the PSP port request. The boleto
 // id is taken from the domain object (b.ID()); payer/idemKey are supplied by the
 // caller (register carries a payer; amend passes the zero payer).
-func toBoletoRequest(b boleto.Boleto, payer BoletoPayerInput, idemKey string) ports.BoletoRequest {
+func toBoletoRequest(b boleto.Boleto, payer BoletoPayerInput, description, idemKey string) ports.BoletoRequest {
 	domainTiers := b.Discounts()
 	tiers := make([]ports.BoletoDiscountTier, len(domainTiers))
 	for i, d := range domainTiers {
@@ -392,6 +398,7 @@ func toBoletoRequest(b boleto.Boleto, payer BoletoPayerInput, idemKey string) po
 		MonthlyInterestBps: b.MonthlyInterestBps(),
 		Discounts:          tiers,
 		Payer:              toPortBoletoPayer(payer),
+		Description:        strings.TrimSpace(description),
 		IdempotencyKey:     idemKey,
 	}
 }
@@ -403,11 +410,12 @@ func toPortBoletoPayer(in BoletoPayerInput) ports.BoletoPayer {
 		Name:  strings.TrimSpace(in.Name),
 		TaxID: strings.TrimSpace(in.TaxID),
 		Address: ports.BoletoAddress{
-			Street:  strings.TrimSpace(in.Address.Street),
-			Number:  in.Address.Number,
-			City:    strings.TrimSpace(in.Address.City),
-			State:   strings.TrimSpace(in.Address.State),
-			ZipCode: strings.TrimSpace(in.Address.ZipCode),
+			Street:       strings.TrimSpace(in.Address.Street),
+			Number:       in.Address.Number,
+			Neighborhood: strings.TrimSpace(in.Address.Neighborhood),
+			City:         strings.TrimSpace(in.Address.City),
+			State:        strings.TrimSpace(in.Address.State),
+			ZipCode:      strings.TrimSpace(in.Address.ZipCode),
 		},
 	}
 }

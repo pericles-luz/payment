@@ -34,7 +34,6 @@ type productServer struct {
 	boletoCreate http.HandlerFunc
 	boletoGet    http.HandlerFunc
 	boletoCancel http.HandlerFunc
-	boletoUpdate http.HandlerFunc
 	checkout     http.HandlerFunc
 	// cobvPut backs both create and amend (both PUT /v2/pix/cobv/{txid}); cobvGet
 	// backs the reconcile read (roteiro 7.5–7.7).
@@ -63,42 +62,34 @@ func newProductServer(t *testing.T) *productServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
-	mux.HandleFunc("POST /v1/bank_slips", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v2/bank_slips", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		if ps.boletoCreate != nil {
 			ps.boletoCreate(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		// Real C6 201 shape (SIN-65888): id/our_number/bar_code/digitable_line/amount(decimal).
-		_, _ = w.Write([]byte(`{"id":"01HBANKSLIP0000000000000001","our_number":"55501","originator_id":"000000000001","bar_code":"bc-1","digitable_line":"dl-1","amount":10.00,"billing_scheme":"21","billing_type":"3","due_date":"2027-01-15"}`))
+		// Official C6 BolePix 201: the scannable artifacts are NESTED under
+		// payment_method.bank_slip, and the QR Code arrives under payment_method.pix.
+		_, _ = w.Write([]byte(`{"id":"01HBANKSLIP0000000000000001","external_reference_id":"ref1","amount":10.00,"due_date":"2027-01-15","payment_method":{"bank_slip":{"originator_id":"000000000001","billing_scheme":"21","billing_type":"3","digitable_line":"dl-1","bar_code":"bc-1","our_number":"55501","number":"1"},"pix":{"qr_code":"pix-emv","mime_type":"image/png","reference":"ref-pix"}}}`))
 	})
-	mux.HandleFunc("GET /boletos/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v2/bank_slips/{id}", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		if ps.boletoGet != nil {
 			ps.boletoGet(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"REGISTERED","qr_code":"pix-emv","barcode":"123","amount_cents":1000,"fine_bps":200,"monthly_interest_bps":100,"discounts":[{"days_before_due":0,"bps":500}]}`))
+		_, _ = w.Write([]byte(`{"id":"bol_1","external_reference_id":"ref1","status":"REGISTERED","amount":10.00,"due_date":"2027-01-15","fees":{"fine_value":2.00,"fine_type":"PERCENTAGE","interest_value":1.00,"interest_type":"MONTHLY_PERCENTAGE","discount_type":"MONTHLY_PERCENTAGE","first_discount_value":5.00,"first_discount_deadline":0},"payment_method":{"bank_slip":{"digitable_line":"dl-1","bar_code":"123","our_number":"55501"},"pix":{"qr_code":"pix-emv"}}}`))
 	})
-	mux.HandleFunc("DELETE /boletos/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PUT /v2/bank_slips/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		if ps.boletoCancel != nil {
 			ps.boletoCancel(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"CANCELLED","qr_code":"pix-emv","barcode":"123","amount_cents":1000}`))
-	})
-	mux.HandleFunc("PUT /boletos/{id}", func(w http.ResponseWriter, r *http.Request) {
-		record(r)
-		if ps.boletoUpdate != nil {
-			ps.boletoUpdate(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"boleto_id":"bol_1","txid":"tx_1","status":"REGISTERED","qr_code":"pix-emv","barcode":"123","amount_cents":2000,"fine_bps":150,"monthly_interest_bps":80}`))
+		_, _ = w.Write([]byte(`{"id":"bol_1","status":"CANCELLED","amount":10.00,"payment_method":{"bank_slip":{"bar_code":"123"},"pix":{"qr_code":"pix-emv"}}}`))
 	})
 	mux.HandleFunc("POST /v1/checkouts/", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
@@ -180,7 +171,8 @@ func TestCreateBoletoSuccess(t *testing.T) {
 	res, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "bol_1", AmountCents: 1000, Currency: "BRL",
 		DueDate: time.Unix(1_800_000_000, 0), FineBps: 200, MonthlyInterestBps: 100,
-		Payer: fullBoletoPayer(),
+		Payer:       fullBoletoPayer(),
+		Description: "Compra de produto X",
 	})
 	if err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
@@ -202,13 +194,14 @@ func TestCreateBoletoSuccess(t *testing.T) {
 	if ps.idemKey() != "bol_1" {
 		t.Fatalf("idempotency key should fall back to boleto id, got %q", ps.idemKey())
 	}
-	// The adapter transports the fine/interest RATES as the real {value,type} objects and
-	// the decimal amount (the domain still computes amounts owed).
+	// The adapter transports fine/interest RATES inside the single `fees` object and the
+	// decimal amount (the domain still computes amounts owed). `description` and
+	// `payment_method` are required by the bank, so their absence is a registration error.
 	var sent map[string]json.RawMessage
 	if err := json.Unmarshal(ps.body(), &sent); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	for _, f := range []string{"fine", "interest", "due_date", "amount"} {
+	for _, f := range []string{"fees", "due_date", "amount", "description", "payment_method"} {
 		if _, ok := sent[f]; !ok {
 			t.Fatalf("boleto request must carry %q, body=%s", f, ps.body())
 		}
@@ -225,7 +218,8 @@ func TestCreateBoletoErrorMapping(t *testing.T) {
 	p := ps.provider(t, oneTenant("t1", "c", "s"))
 	if _, err := p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "b", AmountCents: 1, Currency: "BRL", DueDate: time.Unix(1, 0),
-		Payer: fullBoletoPayer(),
+		Payer:       fullBoletoPayer(),
+		Description: "Compra de produto X",
 	}); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("400 should map to ErrValidation, got %v", err)
 	}
@@ -237,7 +231,8 @@ func TestBoletoMissingCredential(t *testing.T) {
 	p := ps.provider(t, &fakeCreds{creds: map[string]ports.BankCredential{}})
 	if _, err := p.CreateBoleto(context.Background(), "unknown", ports.BoletoRequest{
 		TenantID: "unknown", BoletoID: "b", AmountCents: 1, Currency: "BRL", DueDate: time.Unix(1, 0),
-		Payer: fullBoletoPayer(),
+		Payer:       fullBoletoPayer(),
+		Description: "Compra de produto X",
 	}); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("missing credential should propagate ErrNotFound, got %v", err)
 	}
@@ -399,7 +394,8 @@ func TestProductSecretNeverLeaks(t *testing.T) {
 	}
 	_, err = p.CreateBoleto(context.Background(), "t1", ports.BoletoRequest{
 		TenantID: "t1", BoletoID: "b", AmountCents: 1, Currency: "BRL", DueDate: time.Unix(1, 0),
-		Payer: fullBoletoPayer(),
+		Payer:       fullBoletoPayer(),
+		Description: "Compra de produto X",
 	})
 	if err == nil {
 		t.Fatal("expected error")

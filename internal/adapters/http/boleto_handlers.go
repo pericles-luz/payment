@@ -24,11 +24,12 @@ type boletoDiscountReq struct {
 // boletoAddressReq is the payer address in the request body (ADR-0005). number is an
 // integer mirroring the C6 contract.
 type boletoAddressReq struct {
-	Street  string `json:"street"`
-	Number  int    `json:"number"`
-	City    string `json:"city"`
-	State   string `json:"state"`
-	ZipCode string `json:"zip_code"`
+	Street       string `json:"street"`
+	Number       int    `json:"number"`
+	Neighborhood string `json:"neighborhood"`
+	City         string `json:"city"`
+	State        string `json:"state"`
+	ZipCode      string `json:"zip_code"`
 }
 
 // boletoPayerReq is the nested payer block in the request body (ADR-0005). It is
@@ -53,6 +54,8 @@ type createBoletoRequest struct {
 	MonthlyInterestBps int64               `json:"monthly_interest_bps"`
 	Discounts          []boletoDiscountReq `json:"discounts"`
 	Payer              boletoPayerReq      `json:"payer"`
+	// Description is printed on the slip and required by the bank (max 100 chars).
+	Description string `json:"description"`
 	// Bank optionally selects which configured bank registers this boleto (multi-bank,
 	// SIN-66022); empty keeps header/default routing, overrides X-Bank-Id (ADR-0007).
 	Bank string `json:"bank"`
@@ -64,11 +67,12 @@ func toPayerInput(p boletoPayerReq) app.BoletoPayerInput {
 		Name:  p.Name,
 		TaxID: p.TaxID,
 		Address: app.BoletoAddressInput{
-			Street:  p.Address.Street,
-			Number:  p.Address.Number,
-			City:    p.Address.City,
-			State:   p.Address.State,
-			ZipCode: p.Address.ZipCode,
+			Street:       p.Address.Street,
+			Number:       p.Address.Number,
+			Neighborhood: p.Address.Neighborhood,
+			City:         p.Address.City,
+			State:        p.Address.State,
+			ZipCode:      p.Address.ZipCode,
 		},
 	}
 }
@@ -187,6 +191,7 @@ func (s *Server) handleCreateBoleto(w http.ResponseWriter, r *http.Request) {
 		FineFixedCents:     req.FineFixedCents,
 		MonthlyInterestBps: req.MonthlyInterestBps,
 		Payer:              toPayerInput(req.Payer),
+		Description:        req.Description,
 		IdempotencyKey:     idemKey,
 		Discounts:          toDiscountInputs(req.Discounts),
 	}

@@ -176,6 +176,12 @@ type C6Config struct {
 	// keeps the prior behaviour: the fetch uses the §8 bootstrap cert when configured,
 	// else presents no client cert. It is not a secret — only the tenant identifier.
 	RecJWKSMTLSTenant string
+	// BillingScheme is the C6 "carteira de cobrança" sent on every BolePix registration.
+	// It is ENVIRONMENT-dependent — C6 documents carteira 15 in production and 21 in
+	// sandbox — so it must be configurable per deployment: a hardcoded value silently
+	// registers against the wrong carteira when the environment changes. Empty selects the
+	// adapter default (production). Set PAYMENT_C6_BILLING_SCHEME.
+	BillingScheme string
 	// RateLimitRPS and RateLimitBurst configure the proactive outbound token bucket
 	// that paces requests to C6 (Termo A5 — no DoS-shaped load). Zero/unparseable ⇒
 	// the adapter's conservative defaults. MaxRetries bounds retries on a retryable
@@ -218,6 +224,7 @@ func FromEnv() Config {
 			ClientKeyPath:     os.Getenv("PAYMENT_C6_CLIENT_KEY"),
 			RecJWKSURL:        os.Getenv("PAYMENT_C6_REC_JWKS_URL"),
 			RecJWKSMTLSTenant: os.Getenv("PAYMENT_C6_REC_JWKS_MTLS_TENANT"),
+			BillingScheme:     strings.TrimSpace(os.Getenv("PAYMENT_C6_BILLING_SCHEME")),
 			RateLimitRPS:      getenvFloat("PAYMENT_C6_RATE_LIMIT_RPS", 0),
 			RateLimitBurst:    getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
 			MaxRetries:        getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
