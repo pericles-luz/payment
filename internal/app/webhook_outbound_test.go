@@ -17,7 +17,7 @@ import (
 
 func TestWebhookSettlementMaterialisesOutboundDelivery(t *testing.T) {
 	t.Parallel()
-	h, _, deps, tenantID := settleDivergenceHarness(t)
+	h, deps, tenantID := settleDivergenceHarness(t)
 
 	store := inmemory.NewOutboundDeliveryStore()
 	deps.OutboundAttributor = app.NewOutboundAttributor(app.OutboundAttributorDeps{
@@ -62,7 +62,7 @@ func TestWebhookSettlementMaterialisesOutboundDelivery(t *testing.T) {
 // settle flow until the feature is turned on.
 func TestWebhookSettlementDarkWithoutAttributor(t *testing.T) {
 	t.Parallel()
-	h, _, deps, tenantID := settleDivergenceHarness(t)
+	h, deps, tenantID := settleDivergenceHarness(t)
 	// deps.OutboundAttributor left nil (dark default).
 
 	charges := app.NewChargeService(deps)
