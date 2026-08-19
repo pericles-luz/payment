@@ -427,6 +427,59 @@ Corpo típico enviado pelo C6:
 { "external_id": "E1234...", "client_id": "c6-merchant-id", "service": "pix", "status": "CONCLUIDA" }
 ```
 
+### 6.3 Webhook **de saída** — a notificação que chega até você
+
+Enquanto §6.2 é o banco chamando a Sindireceita, este é o elo que fecha a
+reconciliação **do seu lado**: quando a cobrança de uma empresa-cliente liquida,
+nós entregamos uma notificação assinada no endpoint HTTPS cadastrado **por
+Conta** (um só, para todas as suas empresas-clientes).
+
+É o único componente do fluxo que você precisa escrever. O contrato completo —
+validação passo a passo, política de retry, requisitos do endpoint — está no
+[`integration-guide.md`](./integration-guide.md) §12. Resumo operacional:
+
+```
+POST <seu endpoint>
+Content-Type: application/json
+X-Webhook-Signature: sha256=<hex HMAC-SHA256 de "<timestamp>.<corpo bruto>">
+X-Webhook-Timestamp: 1755561600
+X-Webhook-Idempotency-Key: E1234...|pix|CONCLUIDA
+
+{"event_key":"E1234...|pix|CONCLUIDA","event_type":"payment.paid",
+ "tx_id":"E1234...","account_id":"<sua Conta>","timestamp":1755561600}
+```
+
+Três regras que decidem se a integração funciona:
+
+1. **Valide antes de processar** — janela de frescor de 300 s sobre
+   `X-Webhook-Timestamp`, depois HMAC em tempo constante sobre o **corpo bruto**
+   (reserializar o JSON quebra o MAC).
+2. **Deduplique** por `X-Webhook-Idempotency-Key`: a mesma notificação pode
+   chegar mais de uma vez (retry nosso ou reentrega do banco).
+3. **Responda 2xx rápido** e processe de forma assíncrona. São 3 tentativas com
+   backoff curto; esgotadas, o evento vai para dead-letter e não volta sozinho.
+
+O corpo **não traz valor, pagador nem PII** — só o suficiente para você saber o
+que mudou. Para o detalhe da cobrança, chame nossa API de volta com a
+chave-de-Conta e o `X-Client-Tenant` da empresa-cliente (§2), o que mantém dado
+pessoal fora de um canal que atravessa a internet.
+
+Para testar a verificação sem esperar uma liquidação, reproduza a assinatura
+localmente com o segredo cadastrado:
+
+```bash
+TS=$(date +%s)
+BODY='{"event_key":"teste|pix|CONCLUIDA","event_type":"payment.paid","tx_id":"teste","account_id":"<sua Conta>","timestamp":'"$TS"'}'
+SIG="sha256=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print $2}')"
+
+curl -sS -X POST "$SEU_ENDPOINT" \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Signature: $SIG" \
+  -H "X-Webhook-Timestamp: $TS" \
+  -H "X-Webhook-Idempotency-Key: teste|pix|CONCLUIDA" \
+  -d "$BODY"
+```
+
 ---
 
 ## 7. Área administrativa e bilhetagem
@@ -585,7 +638,7 @@ comportamento passam por flags (`PAYMENT_ACCOUNT_KEY_SELECTOR`,
 | §3 Intake self-serve | `setSelfServeBankCredential`, `setSelfServeBankCertificate` |
 | §4 Cobrança | `createCheckout`, `getCheckout`, `cancelCheckout`, `createPix`, `getPix`, `listPix`, `createCobV`, `getCobV`, `updateCobV`, `createBoleto`, `getBoleto`, `updateBoleto`, `deleteBoleto` |
 | §5 DDA | `listDDABoletos`, `createDDAGroup`, `getDDAGroupItems`, `removeDDAGroupItem`, `removeDDAGroupItems`, `submitDDAGroup` |
-| §6 Reconciliação | `getStatement`, `c6Webhook` |
+| §6 Reconciliação | `getStatement`, `c6Webhook`, `outboundPaymentPaid` (webhook de saída — você implementa o receptor) |
 | §7 Admin / bilhetagem | `adminCreateTenant`, `adminSetPrice`, `adminSetBankCredential`, `adminSetBankCertificate` |
 | §0 Health | `healthCheck` |
 </content>
