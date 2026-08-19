@@ -1128,7 +1128,11 @@ type CheckoutRequest struct {
 	// RequireAuthentication asks the hosted page to authenticate the payer (step-up
 	// / 3-DS) before capture (roteiro 9.c).
 	RequireAuthentication bool
-	IdempotencyKey        string
+	// MaxInstallments is the ceiling of parcelas the buyer may split a credit
+	// purchase into; 1 is a single payment. The range and the debit rule are
+	// enforced by US, not the PSP — see the c6 adapter's cardBody.
+	MaxInstallments int
+	IdempotencyKey  string
 }
 
 // CheckoutResult is the bank's response to a checkout-session operation (open,
@@ -1156,6 +1160,10 @@ type CheckoutResult struct {
 	// them; the adapter sets them from the request).
 	CardType              string
 	RequireAuthentication bool
+	// MaxInstallments echoes the ceiling that was REQUESTED. It is a different
+	// number from Installments below, and conflating them would be a money bug:
+	// this is what we offered, that is what the buyer took.
+	MaxInstallments int
 	// Installments is how many parcelas the card authorisation was split into (1 for a
 	// single payment). Message is the PSP's human-readable capture status, e.g.
 	// "Transacao capturada com sucesso". Both come from payment.card on the reconcile

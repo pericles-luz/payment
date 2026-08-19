@@ -48,6 +48,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -177,6 +178,101 @@ func run() error {
 			section(probe.label + " /v1/webhooks")
 			if err := call(ctx, httpc, probe.method, base+"/v1/webhooks", token, []byte(probe.body), "application/json"); err != nil {
 				return err
+			}
+		}
+		return nil
+	}
+
+	// --parcelas <n>: open ONE hosted checkout with a ceiling of n parcelas and a
+	// LONG expiry, so a human has time to open the page and answer the one question
+	// the wire cannot: does the page offer a CHOICE of parcelas up to n, or does it
+	// force exactly n? The product decision ("the merchant caps it") presumes a
+	// choice, and shipping the wrong reading would force every buyer into n parcelas.
+	//
+	// Nothing is paid: the session simply expires.
+	if len(os.Args) > 3 && os.Args[2] == "--parcelas" {
+		n, convErr := strconv.Atoi(strings.TrimSpace(os.Args[3]))
+		if convErr != nil || n < 1 || n > 12 {
+			return fmt.Errorf("parcelas deve ser 1..12, recebi %q", os.Args[3])
+		}
+		exp := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+		// R$ 30,00 e não R$ 15,00: cada parcela precisa passar do mínimo de R$ 5,00 do
+		// PSP, e o C6 só aplica essa regra na PÁGINA — a criação responde 201 e o link
+		// depois diz "Link de Pagamento não encontrado". Com 30 reais, até 6x cabe.
+		body := map[string]any{
+			"amount": 30.00, "expiration_date_time": exp,
+			"payment": map[string]any{"card": map[string]any{
+				"type": "CREDIT", "installments": n, "authenticate": "NOT_REQUIRED",
+				"interest_type": "BY_ISSUER"}},
+		}
+		b, mErr := json.Marshal(body)
+		if mErr != nil {
+			return mErr
+		}
+		section(fmt.Sprintf("checkout de R$ 30,00 com teto de %dx, valido por 24h", n))
+		fmt.Printf("   enviado: %s\n", b)
+		return call(ctx, httpc, http.MethodPost, base+"/v1/checkouts/", token, b, "application/json")
+	}
+
+	// --installments: probe what C6 accepts on the checkout CREATE for parcelamento,
+	// without paying anything.
+	//
+	// Two questions block the feature and neither has been observed, only assumed:
+	//
+	//   1. Is payment.card.installments a CEILING the buyer chooses under, or the exact
+	//      number of parcelas they must take? The product decision ("the merchant caps
+	//      it") presumes the first.
+	//   2. Is interest_type: BY_ISSUER accepted? We have only ever seen BY_SELLER, which
+	//      C6 fills in by DEFAULT — meaning not sending the field is choosing that the
+	//      MERCHANT absorbs the installment interest. That is a money decision made by
+	//      omission, which is the worst way to make one.
+	//
+	// Every request here CREATES a session and none is ever paid: they simply expire.
+	// That makes the acceptance half of the experiment free. The ceiling-vs-exact half
+	// still needs a human to look at the hosted page (or a headless render of it), which
+	// is why the created URLs are printed.
+	if len(os.Args) > 2 && os.Args[2] == "--installments" {
+		exp := time.Now().Add(20 * time.Minute).UTC().Format(time.RFC3339)
+		casos := []struct {
+			nome string
+			body map[string]any
+		}{
+			{"3x, juros do EMISSOR (o que queremos mandar)", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 3, "authenticate": "NOT_REQUIRED",
+					"interest_type": "BY_ISSUER"}}}},
+			{"3x, sem interest_type (hoje: C6 assume BY_SELLER)", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 3, "authenticate": "NOT_REQUIRED"}}}},
+			{"13x (fora da faixa 1..12): C6 recusa ou aceita?", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 13, "authenticate": "NOT_REQUIRED"}}}},
+			{"DEBITO parcelado: a regra e do C6 ou nossa?", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "DEBIT", "installments": 3, "authenticate": "NOT_REQUIRED"}}}},
+			{"R$ 6,00 em 3x: existe minimo POR PARCELA?", map[string]any{
+				"amount": 6.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 3, "authenticate": "NOT_REQUIRED"}}}},
+			{"R$ 3,00 (abaixo do minimo): forma do erro", map[string]any{
+				"amount": 3.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 1, "authenticate": "NOT_REQUIRED"}}}},
+		}
+
+		for _, c := range casos {
+			section(c.nome)
+			b, err := json.Marshal(c.body)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("   enviado: %s\n", b)
+			if err := call(ctx, httpc, http.MethodPost, base+"/v1/checkouts/", token, b, "application/json"); err != nil {
+				fmt.Printf("   erro de transporte: %v\n", err)
 			}
 		}
 		return nil

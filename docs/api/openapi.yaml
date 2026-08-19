@@ -1389,8 +1389,31 @@ components:
           items: { $ref: "#/components/schemas/CheckoutItem" }
         expires_at: { type: string, format: date-time }
         expires_in_seconds: { type: integer, format: int64 }
-        card_type: { type: string }
+        card_type: { type: string, enum: [credit, debit] }
         require_authentication: { type: boolean }
+        max_installments:
+          type: integer
+          minimum: 1
+          maximum: 12
+          default: 1
+          description: >-
+            Teto de parcelas oferecido ao comprador num cartão de CRÉDITO. Ausente ou
+            zero significa pagamento à vista. Débito não parcela: `card_type: debit`
+            com teto acima de 1 é recusado com 400.
+
+            O comprador escolhe de 1x até este teto na página do banco.
+
+            Cada parcela precisa ficar em pelo menos R$ 5,00, e o teto é reduzido
+            automaticamente ao que o valor comporta (R$ 15,00 com teto de 6x abre com
+            3x). A resposta traz o teto que de fato valeu.
+
+            A faixa 1..12, a regra do débito e o mínimo por parcela são validados por
+            NÓS: o PSP aceita tudo isso na criação e só recusa na página hospedada,
+            com o comprador já no meio do pagamento.
+
+            Os juros do parcelamento ficam por conta do COMPRADOR (o emissor do
+            cartão), não da loja.
+          example: 6
     CheckoutSession:
       type: object
       properties:
@@ -1400,6 +1423,22 @@ components:
         amount_cents: { type: integer, format: int64 }
         card_type: { type: string }
         require_authentication: { type: boolean }
+        max_installments:
+          type: integer
+          description: >-
+            O teto que foi PEDIDO na criação. Não confundir com `installments`
+            abaixo, que é quantas parcelas o comprador de fato tomou.
+          example: 6
+        installments:
+          type: integer
+          description: >-
+            Em quantas parcelas o comprador dividiu. Zero enquanto a sessão não foi
+            paga.
+          example: 3
+        message:
+          type: string
+          description: Status da captura nas palavras do PSP. Vazio antes do pagamento.
+          example: Transacao capturada com sucesso
 
     Address:
       type: object
