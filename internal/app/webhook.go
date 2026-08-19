@@ -185,7 +185,7 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 		// roll back) so a transient audit-store outage retries on redelivery rather
 		// than committing an unaudited refusal.
 		if !res.AmountReconciled() {
-			if err := s.recordSettlementMismatch(ctx, ev, res); err != nil {
+			if err := s.recordSettlementMismatch(ctx, r, ev, res); err != nil {
 				return fmt.Errorf("record settlement divergence: %w", err)
 			}
 			slog.WarnContext(ctx, "settlement amount divergence: refusing to settle",
@@ -228,7 +228,22 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 // It is called inside the webhook's transaction so the record commits together
 // with MarkProcessed; an append error is returned so the caller can roll back and
 // retry on redelivery rather than commit an unaudited refusal.
-func (s *WebhookService) recordSettlementMismatch(ctx context.Context, ev PaymentEvent, res ports.ChargeResult) error {
+//
+// The append goes through the TRANSACTION's repository (r), not the standalone
+// s.audit port. That is what the Repository embeds AuditLog for. Using s.audit here
+// opened a SECOND connection to the same SQLite file while this transaction already
+// held the write lock — a self-deadlock in a single process: SQLite answered
+// SQLITE_BUSY immediately, the error propagated, WithinTx rolled the whole unit of
+// work back including MarkProcessed, and the handler returned 500. The PSP then
+// redelivered into the identical deadlock until it gave up, so a divergence could
+// never be recorded and the notification could never be acked (SIN-69580).
+//
+// Note that neither a busy_timeout nor WAL would have fixed it: the lock is held by
+// this very goroutine's transaction, which cannot release until this call returns, so
+// waiting only converts an instant failure into a slow one, and WAL separates readers
+// from writers, not writers from writers. Joining the transaction removes the second
+// writer altogether.
+func (s *WebhookService) recordSettlementMismatch(ctx context.Context, r ports.Repository, ev PaymentEvent, res ports.ChargeResult) error {
 	e, err := audit.NewSettlementMismatchEntry(
 		s.ids.NewID(),
 		systemOperatorWebhook,
@@ -241,7 +256,7 @@ func (s *WebhookService) recordSettlementMismatch(ctx context.Context, ev Paymen
 	if err != nil {
 		return fmt.Errorf("build audit entry: %w", err)
 	}
-	if err := s.audit.Append(ctx, e); err != nil {
+	if err := r.Append(ctx, e); err != nil {
 		return fmt.Errorf("append audit entry: %w", err)
 	}
 	return nil

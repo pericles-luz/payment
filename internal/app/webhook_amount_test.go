@@ -18,20 +18,23 @@ import (
 
 // settleDivergenceHarness wires a harness with a real transactional store and an
 // in-memory audit log, returning the pieces the divergence tests assert on.
-func settleDivergenceHarness(t *testing.T) (*harness, *auditmem.Log, app.Deps, string) {
+// Deps.Audit is wired to an in-memory sink only so the standalone port is non-nil; the
+// divergence entry does NOT go there. It commits on the TRANSACTION store (h.store),
+// which is what the assertions read — see SIN-69580 and
+// TestDivergenceAuditGoesThroughTransactionNotStandalonePort.
+func settleDivergenceHarness(t *testing.T) (*harness, app.Deps, string) {
 	t.Helper()
 	h := newHarnessFor()
 	tenantID := seedHarnessTenant(t, h)
-	auditLog := auditmem.NewLog()
 	deps := h.deps
 	deps.UoW = h.store
-	deps.Audit = auditLog
-	return h, auditLog, deps, tenantID
+	deps.Audit = auditmem.NewLog()
+	return h, deps, tenantID
 }
 
 func TestWebhookRefusesSettlementOnPartialPayment(t *testing.T) {
 	t.Parallel()
-	h, auditLog, deps, tenantID := settleDivergenceHarness(t)
+	h, deps, tenantID := settleDivergenceHarness(t)
 
 	charges := app.NewChargeService(deps)
 	p, err := charges.CreateCharge(context.Background(), app.CreateChargeInput{
@@ -57,7 +60,11 @@ func TestWebhookRefusesSettlementOnPartialPayment(t *testing.T) {
 	}
 
 	// A durable audit record of the divergence was written, with the exact cents.
-	entries := auditLog.Entries()
+	// It lands on the TRANSACTION store, not the standalone Deps.Audit sink: the
+	// append shares the settlement's unit of work (SIN-69580). In production both are
+	// the same sqlite Store, so the row is the same either way — but appending on the
+	// pool while the tx holds the write lock self-deadlocks with SQLITE_BUSY.
+	entries := h.store.AuditEntries()
 	if len(entries) != 1 {
 		t.Fatalf("want exactly 1 audit entry, got %d", len(entries))
 	}
@@ -81,14 +88,14 @@ func TestWebhookRefusesSettlementOnPartialPayment(t *testing.T) {
 	if reloaded.Status() != payment.StatusPending {
 		t.Fatal("redelivery must not settle a divergent charge")
 	}
-	if got := auditLog.Len(); got != 1 {
+	if got := len(h.store.AuditEntries()); got != 1 {
 		t.Fatalf("redelivery must not re-audit (MarkProcessed kept): audit len = %d, want 1", got)
 	}
 }
 
 func TestWebhookRefusesSettlementOnOverpayment(t *testing.T) {
 	t.Parallel()
-	h, auditLog, deps, tenantID := settleDivergenceHarness(t)
+	h, deps, tenantID := settleDivergenceHarness(t)
 
 	charges := app.NewChargeService(deps)
 	p, err := charges.CreateCharge(context.Background(), app.CreateChargeInput{
@@ -109,7 +116,7 @@ func TestWebhookRefusesSettlementOnOverpayment(t *testing.T) {
 	if reloaded.Status() != payment.StatusPending {
 		t.Fatalf("overpayment must NOT settle, status = %v", reloaded.Status())
 	}
-	entries := auditLog.Entries()
+	entries := h.store.AuditEntries()
 	if len(entries) != 1 || entries[0].ExpectedCents() != 100 || entries[0].ReceivedCents() != 150 {
 		t.Fatalf("want one audit entry 100/150, got %+v", entries)
 	}
@@ -120,7 +127,7 @@ func TestWebhookRefusesSettlementOnOverpayment(t *testing.T) {
 // entry — the gate does not block legitimate settlements.
 func TestWebhookFullPaymentStillSettlesAndDoesNotAudit(t *testing.T) {
 	t.Parallel()
-	h, auditLog, deps, tenantID := settleDivergenceHarness(t)
+	h, deps, tenantID := settleDivergenceHarness(t)
 
 	charges := app.NewChargeService(deps)
 	p, err := charges.CreateCharge(context.Background(), app.CreateChargeInput{
@@ -140,7 +147,7 @@ func TestWebhookFullPaymentStillSettlesAndDoesNotAudit(t *testing.T) {
 	if reloaded.Status() != payment.StatusPaid {
 		t.Fatalf("full payment must settle, status = %v", reloaded.Status())
 	}
-	if got := auditLog.Len(); got != 0 {
+	if got := len(h.store.AuditEntries()); got != 0 {
 		t.Fatalf("a reconciled settlement must not write a divergence audit entry, got %d", got)
 	}
 }
