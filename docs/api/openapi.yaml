@@ -605,6 +605,59 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /v1/pix-key:
+    put:
+      operationId: setSelfServePixKey
+      tags: [Onboarding]
+      summary: Registrar a chave PIX de recebimento da própria empresa-cliente (flag-gated)
+      description: |
+        **Intake self-serve. Flag-gated (`PAYMENT_SELFSERVE_CRED_INTAKE`),
+        default-off — com a flag desligada a rota não existe (`404`).**
+
+        A empresa-cliente registra sua PRÓPRIA chave PIX de recebimento, autenticada
+        pelo próprio token. Não há seletor de tenant no contrato: o tenant vem do
+        token, então um token só consegue escrever a própria chave.
+
+        **Ordem importa:** a chave é guardada junto da credencial, então
+        `PUT /v1/bank-credential` precisa vir antes. Enviada antes, é recusada com
+        `404`.
+
+        **Write-only.** A chave não é segredo — é o identificador público da conta —,
+        mas é dado de roteamento de fundos: a resposta nunca a devolve, para o
+        endpoint não virar um jeito de descobrir para onde vai o dinheiro de alguém.
+
+        Registrar a chave pode completar o par credencial+chave, e nesse momento os
+        webhooks daquela empresa-cliente são registrados no banco automaticamente.
+      security: [{ bearerAuth: [] }, { accountKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [creditor_key]
+              properties:
+                creditor_key:
+                  type: string
+                  description: Chave PIX de recebimento (chave do recebedor).
+                  example: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+      responses:
+        "200":
+          description: Chave registrada. Idêntica para criação e substituição.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  status: { type: string, example: ok }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: >-
+            Rota desligada pela flag, ou credencial ainda não gravada para esta
+            empresa-cliente.
+
   /v1/bank-credential:
     put:
       operationId: setSelfServeBankCredential

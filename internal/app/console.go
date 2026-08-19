@@ -642,6 +642,28 @@ func (s *ConsoleService) SetBankCredentialFor(ctx context.Context, tenantID, ban
 // secret/client id (read-modify-write), and the error path never echoes the value
 // (threat C1/C4). No OAuth token-cache eviction is performed — the creditor key is
 // not part of the OAuth identity, so a cached bearer stays valid (ADR-0003).
+// SetCreditorKeySelfServe grava a chave PIX do recebedor a partir do plano do
+// TENANT, e não do console do operador.
+//
+// É a mesma escrita de SetCreditorKey — mesmo port, mesma auditoria, mesmo cuidado
+// de nunca registrar o valor da chave — com uma diferença que importa: aqui o
+// tenantID vem do contexto AUTENTICADO, nunca de entrada do cliente. Não existe
+// seletor de tenant no contrato, então um token só consegue escrever a própria
+// chave; a classe inteira de quebra de controle de acesso (A01) é eliminada por
+// construção, não conferida.
+//
+// Existe porque a chave PIX faz par com a credencial: sem ela o adaptador não sabe
+// para qual conta rotear os fundos, e a empresa-cliente que provisiona a própria
+// credencial não tinha como completar o par sem passar por um operador.
+func (s *ConsoleService) SetCreditorKeySelfServe(ctx context.Context, tenantID, creditorKey string) error {
+	return s.SetCreditorKey(WithOperatorID(ctx, selfServeOperatorID), tenantID, creditorKey)
+}
+
+// selfServeOperatorID é o ator sintético gravado na auditoria quando a própria
+// empresa-cliente faz a escrita. Nomeia o sistema em vez de inventar um usuário, e
+// separa no rastro a rotação feita pelo tenant da feita por um operador.
+const selfServeOperatorID = "system:self-serve"
+
 func (s *ConsoleService) SetCreditorKey(ctx context.Context, tenantID, creditorKey string) error {
 	tenantID = strings.TrimSpace(tenantID)
 	if _, err := s.tenants.FindTenantByID(ctx, tenantID); err != nil {
