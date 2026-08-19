@@ -1,8 +1,11 @@
 package http
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -452,21 +455,34 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Cap and decode the untrusted body. Oversize → 413 (distinct from a
-	//    malformed body's 400) so the cap is observable.
+	// 2. Cap and read the untrusted body into memory, THEN decode from the buffer.
+	//    Buffering (rather than streaming the decoder straight off r.Body) is what
+	//    makes the raw bytes still available after a decode failure, so a rejection
+	//    can report WHAT was rejected. The body is already capped at 64 KiB, so the
+	//    buffer is bounded by the same pre-auth DoS control. Oversize → 413 (distinct
+	//    from a malformed body's 400) so the cap stays observable.
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBytes)
-	var note c6WebhookNotification
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(&note); err != nil {
+	raw, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
 		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		if errors.As(readErr, &maxErr) {
+			s.logWebhookReject(r.Context(), id.TenantID, "oversize", raw, readErr)
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 			return
 		}
+		s.logWebhookReject(r.Context(), id.TenantID, "read_failed", raw, readErr)
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	var note c6WebhookNotification
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(&note); err != nil {
+		s.logWebhookReject(r.Context(), id.TenantID, "decode_failed", raw, err)
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if dec.More() {
+		s.logWebhookReject(r.Context(), id.TenantID, "trailing_data", raw, nil)
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -480,6 +496,7 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("c6 webhook tenant mismatch: body client_id diverges from channel",
 			slog.String("channel_tenant", id.TenantID),
 			slog.String("claimed_client_id", note.ClientID))
+		s.logWebhookReject(r.Context(), id.TenantID, "tenant_mismatch", raw, nil)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -498,6 +515,10 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	//    for the same id never collide.
 	kind, objectID, label, ok := resolveWebhook(note)
 	if !ok {
+		// The body parsed as JSON but carries no shape this receiver recognises — the
+		// single most likely failure when the PSP changes or extends a contract, and
+		// the one that is invisible without the raw bytes.
+		s.logWebhookReject(r.Context(), id.TenantID, "unresolved_shape", raw, nil)
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -523,9 +544,63 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if err != nil {
+		// A handler failure (the 500s observed in production) is as opaque as a
+		// rejection without the body that caused it, so it logs the same way.
+		s.logWebhookReject(r.Context(), id.TenantID, "handler_failed", raw, err)
 		writeDomainError(w, err)
 		return
 	}
+	s.logWebhookAccepted(r.Context(), id.TenantID, eventKey, raw)
 	// 202: accepted; reconciliation/settlement already attempted synchronously.
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+// logWebhookReject records a rejected or failed inbound webhook together with the RAW
+// body verbatim, at WARN. It is ALWAYS on, deliberately and independently of the
+// WebhookLogPayload flag.
+//
+// Rationale (SIN-69580): a rejected notification produced no log line at all, so a
+// production incident in which C6 delivered settlement notifications every 30s and this
+// receiver answered 400 then 500 was indistinguishable from C6 never calling — the
+// investigation was misdirected for exactly that reason. A rejection is by definition a
+// case this receiver does not yet understand; without the bytes there is nothing to fix
+// it from. Rejections are also low-volume (a healthy channel produces none), so the
+// verbosity and retention cost is bounded.
+//
+// PRIVACY: the payload is written UNREDACTED, so a PIX notification puts the payer's
+// name and tax id (CPF/CNPJ) in the log. That is a deliberate trade against being unable
+// to diagnose settlement failures, and it is the reason this is scoped to rejections
+// rather than all traffic. Logs carrying it inherit the retention and access controls of
+// the journal. The capability ref is NOT included — it lives in the URL, never the body,
+// so the channel secret does not leak into logs.
+func (s *Server) logWebhookReject(ctx context.Context, tenantID, reason string, raw []byte, cause error) {
+	attrs := []any{
+		slog.String("tenant", tenantID),
+		slog.String("reason", reason),
+		slog.Int("body_bytes", len(raw)),
+		slog.String("body", string(raw)),
+	}
+	if cause != nil {
+		attrs = append(attrs, slog.String("error", cause.Error()))
+	}
+	slog.WarnContext(ctx, "c6 webhook rejected", attrs...)
+}
+
+// logWebhookAccepted records a SUCCESSFULLY processed webhook with its raw body, at INFO.
+// Unlike a rejection this is gated on WebhookLogPayload (PAYMENT_WEBHOOK_LOG_PAYLOAD,
+// default false): the accepted path is the high-volume one and it already leaves a
+// durable trace in processed_events and the reconciled payment, so logging every payload
+// would spend privacy exposure and log volume on data that is not needed to debug
+// anything. It exists for the deliberate, time-boxed case of confirming what a healthy
+// notification actually looks like on the wire. Same unredacted-payload caveat as
+// logWebhookReject.
+func (s *Server) logWebhookAccepted(ctx context.Context, tenantID, eventKey string, raw []byte) {
+	if !s.webhookLogPayload {
+		return
+	}
+	slog.InfoContext(ctx, "c6 webhook accepted",
+		slog.String("tenant", tenantID),
+		slog.String("event_key", eventKey),
+		slog.Int("body_bytes", len(raw)),
+		slog.String("body", string(raw)))
 }
