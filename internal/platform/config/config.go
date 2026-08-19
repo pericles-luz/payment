@@ -84,6 +84,13 @@ type Config struct {
 	// (production credentials are provisioned via the admin intake); it is a
 	// fast-follow convenience. Set PAYMENT_SELFSERVE_CRED_INTAKE truthy to enable.
 	SelfServeCredIntake bool
+	// WebhookLogPayload logs the RAW body of SUCCESSFULLY processed inbound webhooks.
+	// Rejected webhooks always log their body, regardless of this flag (SIN-69580):
+	// silent 400s made a live settlement outage indistinguishable from the PSP never
+	// calling. Defaults to false — the accepted path is high-volume and the payload is
+	// written unredacted (payer name, CPF/CNPJ). Set PAYMENT_WEBHOOK_LOG_PAYLOAD truthy
+	// to enable, deliberately and time-boxed.
+	WebhookLogPayload bool
 	// AccountKeySelector enables the model (b) account-key + per-request client
 	// selector auth path at the tenant choke-point (ADR-0011 §2, SIN-69279). When
 	// on, a caller may present an Account's rotatable bearer key (ak_… prefix) plus
@@ -211,6 +218,7 @@ func FromEnv() Config {
 		SecureCookies:          getenvBool("PAYMENT_SECURE_COOKIES", true),
 		TrustedProxyHops:       getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
 		SelfServeCredIntake:    getenvBool("PAYMENT_SELFSERVE_CRED_INTAKE", false),
+		WebhookLogPayload:      getenvBool("PAYMENT_WEBHOOK_LOG_PAYLOAD", false),
 		AccountKeySelector:     getenvBool("PAYMENT_ACCOUNT_KEY_SELECTOR", false),
 		AccountOutboundWebhook: getenvBool("PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK", false),
 		ConsoleUsername:        getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),

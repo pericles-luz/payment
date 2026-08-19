@@ -56,6 +56,10 @@ type Server struct {
 	// registered and the handler is inert unless this is explicitly enabled, so a
 	// rollback is a config flip. See Config.SelfServeCredIntake.
 	selfServeCredIntake bool
+	// webhookLogPayload additionally logs the raw body of SUCCESSFULLY processed
+	// inbound webhooks. Rejections log their body unconditionally regardless of this
+	// flag. Default false. See Config.WebhookLogPayload.
+	webhookLogPayload bool
 	// accountKeyAuth authenticates an Account bearer key (model (b), ADR-0011 §2 /
 	// SIN-69279). When nil OR accountKeySelector is false, the tenant choke-point
 	// runs the unchanged model (a) path (tenant tokens only). See Config.AccountKeyAuth.
@@ -170,6 +174,16 @@ type Config struct {
 	// It does NOT block the go-live (go-live provisions credentials via the admin
 	// intake); it is a fast-follow tenant convenience.
 	SelfServeCredIntake bool
+	// WebhookLogPayload logs the RAW body of successfully processed inbound webhooks
+	// (PAYMENT_WEBHOOK_LOG_PAYLOAD, default false). It does NOT gate the logging of
+	// REJECTED webhooks, whose body is always recorded: a rejection is a case the
+	// receiver does not understand, and silent 400s previously made a live settlement
+	// outage look like the PSP not calling at all (SIN-69580).
+	//
+	// Enable this only deliberately and time-boxed. The payload is written unredacted,
+	// so on the accepted path — which is the high-volume one — it puts payer names and
+	// tax ids into the log for every settled payment.
+	WebhookLogPayload bool
 	// AccountKeyAuth authenticates an Account's rotatable bearer key at the tenant
 	// choke-point (model (b), ADR-0011 §2 / SIN-69279). Built over the account-key
 	// store (ports.AccountKeyStore). It is consulted ONLY when AccountKeySelector is
@@ -236,6 +250,7 @@ func NewServer(c Config) *Server {
 		bankResolver:           c.BankResolver,
 		trustedProxyHops:       c.TrustedProxyHops,
 		selfServeCredIntake:    c.SelfServeCredIntake,
+		webhookLogPayload:      c.WebhookLogPayload,
 		accountKeyAuth:         c.AccountKeyAuth,
 		accountKeySelector:     c.AccountKeySelector,
 		accountKeyMint:         c.AccountKeyMint,

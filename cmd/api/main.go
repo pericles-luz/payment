@@ -391,6 +391,7 @@ func run() error {
 		TrustedProxyHops: cfg.TrustedProxyHops,
 		// Self-serve credential intake (SIN-69196), default-off dark-ship.
 		SelfServeCredIntake: cfg.SelfServeCredIntake,
+		WebhookLogPayload:   cfg.WebhookLogPayload,
 		// Model (b) account-key + per-request client selector (ADR-0011 §2 /
 		// SIN-69279), default-off dark-ship: consulted only when AccountKeySelector
 		// is on and the bearer has the ak_ shape; otherwise inert (model (a)).
