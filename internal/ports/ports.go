@@ -916,6 +916,25 @@ type PixWebhookRegistrar interface {
 	GetWebhook(ctx context.Context, tenantID, pixKey string) (WebhookRegistration, error)
 }
 
+// WebhookDeregistrar is the output port for REMOVING a tenant's PSP callbacks. It is a
+// port of its own, not extra methods on the registrars, so a bank adapter that can
+// register but not deregister still satisfies those (ISP) — which is the real situation:
+// the PSP-proprietary surface exposes no delete at all, only the BACEN ones do.
+//
+// It exists because removing a tenant's bank configuration otherwise leaves the PSP
+// calling us forever: the credential we would need to authenticate the notification is
+// gone, and the callback ref may be revoked, so every delivery is one we can never
+// reconcile. Deregistration must therefore run BEFORE the credential is deleted — it
+// needs that credential to authenticate.
+type WebhookDeregistrar interface {
+	// DeleteWebhook removes the PIX settlement callback registered for pixKey. An
+	// already-absent registration is shared.ErrNotFound, which a caller may treat as done.
+	DeleteWebhook(ctx context.Context, tenantID, pixKey string) error
+	// DeleteRecWebhook and DeleteCobRWebhook remove the two singleton recurrence callbacks.
+	DeleteRecWebhook(ctx context.Context, tenantID string) error
+	DeleteCobRWebhook(ctx context.Context, tenantID string) error
+}
+
 // ServiceWebhookRegistrar is the output port for the PSP-PROPRIETARY notification
 // surface, which is registered per SERVICE (checkout, boleto) rather than per PIX key.
 // It is a separate port from PixWebhookRegistrar (ISP) because the two surfaces are

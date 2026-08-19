@@ -379,6 +379,24 @@ que a cobrança imediata:
 Ambas as validações acontecem no nosso boundary, então um campo faltando volta como erro
 nomeado em vez de um `400` opaco do PSP.
 
+### 4.7 Remover a configuração de banco também desliga as notificações
+
+Remover a configuração de banco de uma empresa-cliente (console → *remover banco*) passou
+a **desregistrar os callbacks no PSP** antes de apagar credencial e certificado.
+
+A ordem é o ponto: a desregistração se autentica com a credencial que está prestes a ser
+apagada, e o callback PIX é endereçado pela chave do recebedor guardada nela. Feita depois,
+seria impossível — e o banco continuaria chamando uma URL cuja credencial não existe mais,
+entregando notificações que nunca reconciliam.
+
+É best-effort: se o PSP estiver indisponível, a remoção **acontece assim mesmo**. Recusar
+por causa do banco deixaria o operador preso exatamente com o resíduo que isso remove. A
+falha fica registrada em log (nunca a URL, que embute o segredo).
+
+Uma limitação do contrato: só as superfícies BACEN expõem remoção (PIX, mandato e cobrança
+recorrente). A superfície própria do C6 — a do **checkout** — tem apenas cadastro e
+consulta, então esse canal permanece registrado até ser sobrescrito.
+
 ## 5. Consulta e pagamento DDA
 
 **Quando:** pagar boletos que caíram no DDA da empresa-cliente. Fluxo: listar →

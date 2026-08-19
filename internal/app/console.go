@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -51,6 +52,13 @@ type ConsoleService struct {
 	// still removes whichever half is wired), so wiring-light tests keep working.
 	credDeleter ports.CredentialDeleter
 	certDeleter ports.BankCertificateDeleter
+	// webhookDeregistrar stops the PSP from calling us for a tenant whose bank
+	// configuration is being removed. Optional: nil leaves the previous behaviour, where
+	// removal deleted our side and left the PSP registered.
+	webhookDeregistrar ports.WebhookDeregistrar
+	// creds resolves the PIX key the PIX-webhook deregistration is keyed by. It must be
+	// read BEFORE the credential is deleted.
+	creds ports.CredentialStore
 	// invoices is the append-only Fatura store (SIN-69121). The console generates
 	// an invoice by freezing a consumption window and reads them back for the
 	// "Faturas" screen and the CSV download. Optional: a nil store disables the
@@ -163,6 +171,11 @@ type ConsoleDeps struct {
 	// a nil deleter degrades to a no-op for that half.
 	CredDeleter ports.CredentialDeleter
 	CertDeleter ports.BankCertificateDeleter
+	// WebhookDeregistrar stops the PSP calling us when a bank configuration is removed.
+	// Nil (stub / not wired) keeps the previous behaviour. Creds resolves the PIX key that
+	// deregistration is keyed by, read before the credential is deleted.
+	WebhookDeregistrar ports.WebhookDeregistrar
+	Creds              ports.CredentialStore
 	// Invoices is the append-only Fatura store (SIN-69121). Optional: nil disables
 	// the invoice use-cases (the rest of the console still works).
 	Invoices InvoiceStore
@@ -195,24 +208,26 @@ func NewConsoleService(d ConsoleDeps) *ConsoleService {
 		a = noopAudit{}
 	}
 	return &ConsoleService{
-		tenants:       d.Tenants,
-		accounts:      d.Accounts,
-		pricing:       d.Pricing,
-		ledger:        d.Ledger,
-		credWriter:    d.CredWriter,
-		creditorWrite: d.CreditorWriter,
-		credReader:    d.CredReader,
-		certWriter:    d.CertWriter,
-		certReader:    d.CertReader,
-		credDeleter:   d.CredDeleter,
-		certDeleter:   d.CertDeleter,
-		invoices:      d.Invoices,
-		webhooks:      d.OutboundWebhooks,
-		credEvictor:   ci,
-		audit:         a,
-		clock:         d.Clock,
-		ids:           d.IDs,
-		invoiceGuard:  newInvoiceBatchGuard(invoiceBatchIdempotencyTTL),
+		tenants:            d.Tenants,
+		accounts:           d.Accounts,
+		pricing:            d.Pricing,
+		ledger:             d.Ledger,
+		credWriter:         d.CredWriter,
+		creditorWrite:      d.CreditorWriter,
+		credReader:         d.CredReader,
+		certWriter:         d.CertWriter,
+		certReader:         d.CertReader,
+		credDeleter:        d.CredDeleter,
+		certDeleter:        d.CertDeleter,
+		webhookDeregistrar: d.WebhookDeregistrar,
+		creds:              d.Creds,
+		invoices:           d.Invoices,
+		webhooks:           d.OutboundWebhooks,
+		credEvictor:        ci,
+		audit:              a,
+		clock:              d.Clock,
+		ids:                d.IDs,
+		invoiceGuard:       newInvoiceBatchGuard(invoiceBatchIdempotencyTTL),
 	}
 }
 
@@ -739,6 +754,12 @@ func (s *ConsoleService) RemoveBankConfig(ctx context.Context, tenantID, bankID 
 	if !ports.IsKnownBankID(slug) {
 		return shared.NewValidationError("bank", "banco não suportado")
 	}
+	// Deregister at the PSP FIRST: the calls below authenticate with the very credential
+	// this operation is about to delete, and the PIX callback is keyed by the creditor key
+	// stored on it. Doing it after would make deregistration impossible — the PSP would
+	// keep POSTing notifications we can no longer authenticate or reconcile.
+	s.deregisterWebhooks(ctx, tenantID, slug)
+
 	if s.credDeleter != nil {
 		if err := s.credDeleter.DeleteBankCredential(ctx, tenantID, slug); err != nil {
 			return fmt.Errorf("delete bank credential: %w", err)
@@ -1055,4 +1076,34 @@ func (s *ConsoleService) AccountConsumptionInRange(ctx context.Context, accountI
 	}
 	sort.SliceStable(rep.Tenants, func(i, j int) bool { return rep.Tenants[i].TenantID < rep.Tenants[j].TenantID })
 	return rep, nil
+}
+
+// deregisterWebhooks removes the tenant's PSP callbacks, best-effort. It never fails the
+// removal: the operator asked for the configuration to go, and refusing because the bank
+// is briefly unavailable would be worse than the residue — which is exactly the state
+// every removal left behind before this existed. An already-absent registration is not an
+// error. Each outcome is logged with the tenant and bank (never the callback URL, which
+// embeds the secret ref).
+func (s *ConsoleService) deregisterWebhooks(ctx context.Context, tenantID, bankID string) {
+	if s == nil || s.webhookDeregistrar == nil || bankID != ports.BankIDC6 {
+		return
+	}
+	drop := func(name string, fn func() error) {
+		if err := fn(); err != nil && !errors.Is(err, shared.ErrNotFound) {
+			slog.WarnContext(ctx, "console: could not deregister webhook at the PSP",
+				slog.String("channel", name), slog.String("tenant_id", tenantID),
+				slog.String("bank_id", bankID), slog.String("error", err.Error()))
+		}
+	}
+	// The PIX callback is keyed by the creditor key, so it is read from the credential
+	// while that credential still exists. No key means nothing was ever registered.
+	if s.creds != nil {
+		if cred, err := s.creds.GetBankCredential(ctx, tenantID, bankID); err == nil {
+			if chave := strings.TrimSpace(cred.CreditorKey); chave != "" {
+				drop("pix", func() error { return s.webhookDeregistrar.DeleteWebhook(ctx, tenantID, chave) })
+			}
+		}
+	}
+	drop("rec", func() error { return s.webhookDeregistrar.DeleteRecWebhook(ctx, tenantID) })
+	drop("cobr", func() error { return s.webhookDeregistrar.DeleteCobRWebhook(ctx, tenantID) })
 }

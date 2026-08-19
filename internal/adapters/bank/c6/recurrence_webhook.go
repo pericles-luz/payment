@@ -117,3 +117,26 @@ func (p *Provider) getRecurrenceWebhook(ctx context.Context, tenantID, path, op 
 		CreatedAt:  parseWebhookCreatedAt(out.Criacao),
 	}, nil
 }
+
+// DeleteRecWebhook and DeleteCobRWebhook deregister the two singleton recurrence
+// callbacks. Same rationale as DeleteWebhook: a tenant whose bank configuration is removed
+// must stop being called, and both streams share the ref that removal invalidates.
+func (p *Provider) DeleteRecWebhook(ctx context.Context, tenantID string) error {
+	return p.deleteRecurrenceWebhook(ctx, tenantID, recWebhookPath, "delete_rec_webhook")
+}
+
+func (p *Provider) DeleteCobRWebhook(ctx context.Context, tenantID string) error {
+	return p.deleteRecurrenceWebhook(ctx, tenantID, cobrWebhookPath, "delete_cobr_webhook")
+}
+
+func (p *Provider) deleteRecurrenceWebhook(ctx context.Context, tenantID, path, op string) error {
+	if strings.TrimSpace(tenantID) == "" {
+		return &Error{Op: op, sentinel: shared.ErrValidation, detail: "tenant is required"}
+	}
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodDelete, p.baseURL+path, nil, "")
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Accept", webhookDeleteAccept)
+	return p.doStatus(httpReq, op)
+}

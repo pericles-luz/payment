@@ -40,6 +40,9 @@ type ProviderSet struct {
 	// wires (the in-memory stub speaks recurrence but not the proprietary surface).
 	RecurrenceWebhook ports.RecurrenceWebhookRegistrar
 	ServiceWebhook    ports.ServiceWebhookRegistrar
+	// WebhookDeregistrar removes those callbacks. Only the BACEN surfaces expose a
+	// delete, so a bank may register without being able to deregister.
+	WebhookDeregistrar ports.WebhookDeregistrar
 }
 
 // Registry maps a non-secret bank slug to its ProviderSet. It is the closed set of
