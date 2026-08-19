@@ -350,11 +350,34 @@ type c6WebhookNotification struct {
 // key, and everything else in the payload is advisory.
 type pixReceived struct {
 	EndToEndID string `json:"endToEndId"`
+	// TxID is the charge key the PIX settled against — the SAME id the charge was
+	// created under, and therefore the id our payments are stored by. The live C6
+	// notification carries it (captured SIN-69580); reconciling by EndToEndID alone
+	// looks up an id no payment row has, so a settled charge is never found.
+	TxID string `json:"txid"`
 }
 
 // pixInformation is the JSON nested inside WebhookNotificationPix.information.
 type pixInformation struct {
 	Pix []pixReceived `json:"pix"`
+}
+
+// firstPixReconcileID returns the id a received-PIX list should reconcile against,
+// preferring txid over the end-to-end id.
+//
+// The preference is what makes settlement work: a payment row is keyed by the txid the
+// charge was created under, so the txid in the notification matches it directly, while
+// the end-to-end id is the BACEN transfer identifier and matches no row. The e2e is kept
+// as a fallback for a received PIX that carries no txid (an unsolicited transfer, which
+// has no charge to reconcile anyway) so the event is still identified rather than dropped
+// as unroutable.
+func firstPixReconcileID(list []pixReceived) string {
+	for _, p := range list {
+		if tx := strings.TrimSpace(p.TxID); tx != "" {
+			return tx
+		}
+	}
+	return firstEndToEndID(list)
 }
 
 // firstEndToEndID returns the first non-empty end-to-end id in a received-PIX list.
@@ -384,19 +407,26 @@ const (
 // than reconciling against an empty id.
 func resolveWebhook(note c6WebhookNotification) (kind webhookKind, id, label string, ok bool) {
 	switch {
-	case strings.EqualFold(note.Service, webhookServicePix):
-		// The documented PIX envelope has NO external_id: the end-to-end id is the
-		// reconcile key. It can reach us three ways, so all three are accepted rather
-		// than betting on one — a settled PIX that cannot be identified is money we
-		// never reconcile.
-		if e2e := firstEndToEndID(note.Pix); e2e != "" {
-			return webhookKindPayment, e2e, webhookServicePix, true
+	// A top-level `pix` array identifies a PIX settlement on its own, with or without a
+	// `service` field. The BACEN webhook C6 actually sends carries NO discriminator at
+	// all — the live body is exactly {"pix":[{endToEndId, valor, chave, horario, txid}]}
+	// (captured SIN-69580). Gating this branch on service=="PIX" meant every real
+	// settlement notification fell through every case and was refused with 400, so paid
+	// charges stayed pending. The IDRec guard keeps the recurrence streams, which are
+	// routed by their own ids below, from being captured here.
+	case strings.EqualFold(note.Service, webhookServicePix) || (len(note.Pix) > 0 && note.IDRec == ""):
+		// The documented PIX envelope has NO external_id: the id lives in the pix
+		// element. It can reach us three ways, so all three are accepted rather than
+		// betting on one — a settled PIX that cannot be identified is money we never
+		// reconcile.
+		if pixID := firstPixReconcileID(note.Pix); pixID != "" {
+			return webhookKindPayment, pixID, webhookServicePix, true
 		}
 		if note.Information != "" {
 			var info pixInformation
 			if err := json.Unmarshal([]byte(note.Information), &info); err == nil {
-				if e2e := firstEndToEndID(info.Pix); e2e != "" {
-					return webhookKindPayment, e2e, webhookServicePix, true
+				if pixID := firstPixReconcileID(info.Pix); pixID != "" {
+					return webhookKindPayment, pixID, webhookServicePix, true
 				}
 			}
 		}
