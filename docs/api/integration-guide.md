@@ -155,13 +155,16 @@ requisições, reposição de **10 req/s** sustentadas. Exceder retorna
 `429 Too Many Requests`; faça backoff exponencial e reenvie (com a mesma
 `Idempotency-Key` nas rotas de escrita, para não duplicar).
 
-**Webhooks (conciliação).** A liquidação é notificada de forma assíncrona pelo
-banco e conciliada por nós; você recebe a atualização de status na sua
-capability-URL registrada. O webhook do C6 não é assinado — a autenticidade vem
-do segredo não-adivinhável embutido na própria URL de callback (uma por
-empresa). Não faça polling agressivo do `GET` de status; use o webhook e
-consulte sob demanda. A borda de ingress mascara o path do webhook nos logs (o
-path carrega o segredo).
+**Webhooks — são dois, e só um é seu.** Vale separar, porque confundi-los é a
+causa mais comum de integração parada:
+
+| | Quem chama quem | Você faz o quê |
+|---|---|---|
+| **Entrada (banco → nós)** | O banco notifica a **Sindireceita** numa URL secreta por empresa-cliente | **Nada.** Nós registramos essa URL no banco automaticamente quando a credencial e a chave PIX da empresa-cliente ficam completas. Você não vê nem configura essa URL. |
+| **Saída (nós → você)** | Nós notificamos **o seu endpoint**, assinado | **Tudo.** É o que você implementa — contrato completo na §12. |
+
+Não faça polling agressivo do `GET` de status: consuma o webhook de saída e
+consulte sob demanda.
 
 ## 8. Faturamento por uso
 
@@ -233,7 +236,11 @@ chamada. É o padrão "Stripe-Connect" (`Stripe-Account`).
 - O vínculo com a Conta é **server-side**: você **não** informa `account_id` no
   corpo; ele vem da chave. Uma Conta nunca cria empresa-cliente sob outra Conta.
 - A credencial bancária da nova empresa-cliente vai por `PUT /v1/bank-credential`
-  self-serve, endereçada pelo mesmo seletor (§11.3). Requer `Idempotency-Key`.
+  e o certificado mTLS por `PUT /v1/bank-certificate`, ambos self-serve e
+  endereçados pelo mesmo seletor (§11.3). Requerem `Idempotency-Key`.
+- **Assim que a credencial e a chave PIX daquela empresa-cliente ficam
+  completas, registramos os webhooks dela no banco automaticamente** — você não
+  registra nada no PSP. O que você implementa é o endpoint de saída (§12).
 
 ### 11.3 O seletor `X-Client-Tenant` (a cada chamada de negócio)
 
@@ -274,7 +281,97 @@ A bilhetagem de todas as chamadas é consolidada **na Conta**.
 Runbook operacional (bootstrap da 1ª chave, rotação, provisionamento e uso do
 seletor): `docs/ops/runbook-verz-account-key-selector.md`.
 
-## 12. Suporte
+## 12. Webhook de saída — o endpoint que **você** implementa
+
+Quando uma cobrança de uma das suas empresas-clientes liquida, nós entregamos
+uma notificação assinada no endpoint HTTPS que você cadastrar **por Conta** (um
+endpoint só, para todas as suas empresas-clientes). É a peça que você precisa
+escrever para integrar.
+
+O cadastro (URL + segredo de assinatura) é feito na área administrativa. O
+segredo é exibido **uma única vez** na criação/rotação — guarde no ato.
+
+### 12.1 O que chega
+
+`POST <seu endpoint>` com `Content-Type: application/json` e três cabeçalhos:
+
+| Cabeçalho | Conteúdo |
+|---|---|
+| `X-Webhook-Signature` | `sha256=<hex>` — HMAC-SHA256 sobre `"<timestamp>.<corpo>"` |
+| `X-Webhook-Timestamp` | unix-seconds do envio, **incluído na assinatura** |
+| `X-Webhook-Idempotency-Key` | o `event_key` do evento — estável entre reentregas |
+
+Corpo:
+
+```json
+{
+  "event_key": "E1234...|pix|CONCLUIDA",
+  "event_type": "payment.paid",
+  "tx_id": "E1234...",
+  "account_id": "<sua Conta>",
+  "timestamp": 1755561600
+}
+```
+
+> **O corpo não traz dado de pagador, valor nem PII — de propósito.** Ele
+> carrega o mínimo para você saber *o que* mudou. Precisando do detalhe da
+> cobrança, chame nossa API de volta com sua chave-de-Conta e o
+> `X-Client-Tenant` da empresa-cliente. Isso mantém PII fora de um canal que
+> atravessa a internet até um endpoint que não controlamos.
+
+### 12.2 Como validar (obrigatório)
+
+Na ordem, e **antes** de processar:
+
+1. **Frescor:** rejeite se `|agora − X-Webhook-Timestamp| > 300s`. Como o
+   timestamp entra na assinatura, isso derruba replay de um corpo capturado.
+2. **Assinatura:** recalcule `HMAC-SHA256(segredo, timestamp + "." + corpo_bruto)`
+   e compare em **tempo constante** com o valor após `sha256=`.
+3. **Idempotência:** deduplique por `X-Webhook-Idempotency-Key`. A mesma
+   notificação pode chegar mais de uma vez (retry nosso ou reentrega do banco);
+   processar duas vezes é erro seu, não nosso.
+
+Assine sobre o **corpo bruto recebido**, byte a byte — não sobre um JSON
+reserializado. Reserializar reordena campos e quebra o MAC.
+
+```python
+# referência — Python
+import hmac, hashlib, time
+
+def verificar(corpo_bruto: bytes, assinatura: str, ts: str, segredo: str) -> bool:
+    if abs(time.time() - int(ts)) > 300:
+        return False
+    esperado = "sha256=" + hmac.new(
+        segredo.encode(), ts.encode() + b"." + corpo_bruto, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(esperado, assinatura)
+```
+
+### 12.3 O que responder, e o que acontece se você cair
+
+Responda **2xx** assim que aceitar o evento. Qualquer outra coisa (ou timeout)
+conta como falha.
+
+- Fazemos até **3 tentativas** por evento, com backoff exponencial curto
+  (250 ms até 5 s). É deliberadamente pequeno: um receptor degradado não é
+  martelado.
+- Cada tentativa **re-assina com um timestamp novo** — então não guarde a
+  assinatura da tentativa anterior esperando que se repita.
+- Esgotadas as tentativas, o evento vai para nosso **dead-letter** e não é
+  reentregue automaticamente. Ele fica registrado do nosso lado para
+  reprocessamento manual — mas o caminho barato é seu endpoint responder 2xx
+  rápido e processar de forma assíncrona.
+
+Processe fora do ciclo da requisição: responda 2xx, enfileire, trabalhe depois.
+
+### 12.4 Requisitos do endpoint
+
+- **HTTPS obrigatório** — `http://` é recusado no cadastro.
+- Precisa ser alcançável pela internet pública. Endereços privados, loopback e
+  metadados de nuvem são bloqueados no momento da entrega (proteção anti-SSRF).
+- Um endpoint por Conta. Use `account_id` do corpo se você operar mais de uma.
+
+## 13. Suporte
 
 Dúvidas de integração, reemissão de token, provisionamento de credencial/cert e
 registro de webhook: canal de suporte técnico Sindireceita (a definir no contrato

@@ -925,6 +925,65 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+# Callbacks que a Sindireceita ENTREGA no endpoint do integrador — a direção
+# inversa de `paths`. Descrito aqui (OpenAPI 3.1 `webhooks`) para que um gerador
+# produza o servidor do receptor, não um cliente. Guia: integration-guide.md §12.
+webhooks:
+  paymentPaid:
+    post:
+      operationId: outboundPaymentPaid
+      summary: Notificação de liquidação entregue à Conta (assinada)
+      description: >-
+        Entregue no endpoint HTTPS cadastrado **por Conta** quando uma cobrança de
+        qualquer empresa-cliente daquela Conta liquida. O corpo é deliberadamente
+        mínimo — sem valor, pagador ou PII: para o detalhe, o receptor chama a API
+        de volta com a chave-de-Conta e o `X-Client-Tenant` da empresa-cliente.
+        **Não é autenticado por bearer**: a autenticidade vem do HMAC no header
+        `X-Webhook-Signature`, que o receptor DEVE verificar antes de processar.
+      security: []
+      parameters:
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          schema: { type: string, pattern: "^sha256=[0-9a-f]{64}$" }
+          description: >-
+            `sha256=<hex>` — HMAC-SHA256, com o segredo de assinatura da Conta,
+            sobre a string `"<X-Webhook-Timestamp>.<corpo bruto>"`. Compare em
+            tempo constante e sobre os bytes recebidos: reserializar o JSON
+            reordena campos e invalida o MAC.
+          example: sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+        - name: X-Webhook-Timestamp
+          in: header
+          required: true
+          schema: { type: integer, format: int64 }
+          description: >-
+            Instante do envio em unix-seconds, incluído no conteúdo assinado.
+            Rejeite fora de uma janela de frescor (recomendado 300 s) — com o
+            timestamp dentro do MAC, isso derruba replay de um corpo capturado.
+            Cada tentativa de reentrega re-assina com timestamp novo.
+          example: 1755561600
+        - name: X-Webhook-Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+          description: >-
+            O `event_key` do evento, estável entre reentregas. Deduplique por ele:
+            a mesma notificação pode chegar mais de uma vez (retry nosso ou
+            reentrega do banco).
+          example: E1234...|pix|CONCLUIDA
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OutboundNotification" }
+      responses:
+        "2XX":
+          description: >-
+            Aceito. Responda assim que enfileirar — processe de forma assíncrona.
+            Qualquer outro status (ou timeout) conta como falha: são até 3
+            tentativas com backoff exponencial de 250 ms a 5 s e, esgotadas, o
+            evento vai para dead-letter e não é reentregue automaticamente.
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1053,6 +1112,44 @@ components:
       required: [error]
       properties:
         error: { type: string, description: Mensagem curta e segura (sem detalhe interno). }
+
+    OutboundNotification:
+      type: object
+      description: >-
+        Envelope canônico entregue no endpoint da Conta. Carrega apenas campos de
+        roteamento/notificação — **nunca** valor, pagador ou qualquer PII que o
+        payload PIX possa conter. Um receptor que precise do detalhe da cobrança
+        chama a API de volta com sua chave-de-Conta. A ordem dos campos é estável,
+        então os bytes assinados são exatamente os bytes transmitidos.
+      required: [event_key, event_type, tx_id, account_id, timestamp]
+      properties:
+        event_key:
+          type: string
+          description: >-
+            Identificador de deduplicação, estável entre reentregas — o mesmo
+            valor do header `X-Webhook-Idempotency-Key`.
+          example: E1234...|pix|CONCLUIDA
+        event_type:
+          type: string
+          description: Evento de negócio que ocorreu.
+          example: payment.paid
+        tx_id:
+          type: string
+          description: Identificador da cobrança referenciada, para consulta de volta na API.
+          example: E1234...
+        account_id:
+          type: string
+          description: >-
+            Conta proprietária. Útil para quem opera mais de uma Conta contra o
+            mesmo endpoint receptor.
+          example: eddf5f171705697ad2fff7fb878ad948
+        timestamp:
+          type: integer
+          format: int64
+          description: >-
+            Instante do envio em unix-seconds. Repete o header
+            `X-Webhook-Timestamp`, que é o valor efetivamente usado na assinatura.
+          example: 1755561600
 
     AccountKeyIssued:
       type: object
