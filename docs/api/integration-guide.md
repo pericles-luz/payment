@@ -182,6 +182,21 @@ O caminho mais comum para "vender online via C6":
    informando os itens (valores em centavos), expiração (`expires_at` **ou**
    `expires_in_seconds`) e opções de cartão. A resposta traz o `session_id` e o
    `redirect_url` (a URL hospedada) para redirecionar o comprador.
+
+   **Valor mínimo: R$ 5,00.** Abaixo disso a sessão é recusada com `400` — é regra do
+   banco. Trate na sua tela antes do clique; um erro no meio do checkout é experiência
+   ruim para o comprador.
+
+   **Parcelas** — `max_installments` (1..12, padrão 1) é o teto oferecido ao comprador
+   num cartão de crédito. Débito não parcela: `card_type: debit` com teto acima de 1 é
+   recusado.
+
+   > Os juros do parcelamento ficam por conta do **comprador**, não da loja.
+
+   Na resposta, `max_installments` é o que **você pediu** e `installments` é quantas
+   parcelas o comprador **de fato tomou** — este último só tem valor depois de pago, e
+   também chega no webhook de saída (§12). São números diferentes: confundi-los é erro
+   de dinheiro.
 2. **Redirecionar o comprador** para a URL hospedada; ele paga (PIX/cartão
    conforme o banco).
 3. **Receber o webhook** de mudança de status na sua capability-URL, ou

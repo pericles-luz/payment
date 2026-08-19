@@ -20,6 +20,15 @@ import (
 // without a configured price for it cannot open a session.
 const CheckoutCreateEndpoint = "checkout.create"
 
+// MinCheckoutTotalCents is the PSP's hosted-checkout minimum, R$ 5,00 — confirmed on
+// the wire on 2026-08-19: a create for R$ 3,00 answers 400 with
+// "[Path '/amount'] Numeric instance is lower than the required minimum (minimum: 5)".
+//
+// Enforced here so a client learns the rule as a validation error instead of an
+// opaque PSP failure mid-checkout, and so the tenant is not billed for a call that
+// could never succeed.
+const MinCheckoutTotalCents int64 = 500
+
 // maxCheckoutItems bounds the line-item count so a single request cannot push an
 // unbounded list to the PSP (defense-in-depth with the HTTP body cap).
 const maxCheckoutItems = 100
@@ -77,7 +86,10 @@ type CreateCheckoutSessionInput struct {
 	ExpiresInSeconds      int64
 	CardType              string
 	RequireAuthentication bool
-	IdempotencyKey        string
+	// MaxInstallments is the ceiling of parcelas offered to the buyer on a credit
+	// purchase. Zero means a single payment.
+	MaxInstallments int
+	IdempotencyKey  string
 }
 
 // CreateSession opens a hosted checkout session at the bank and records the billable
@@ -98,6 +110,14 @@ func (s *CheckoutService) CreateSession(ctx context.Context, in CreateCheckoutSe
 	}
 
 	card, err := checkout.ParseCardType(in.CardType)
+	if err != nil {
+		return nil, ports.CheckoutResult{}, err
+	}
+
+	// Validado ANTES de reservar o pagamento: WithCard só roda depois da reserva, e
+	// falhar lá deixaria uma linha de pagamento órfã e uma cobrança de tarifa por uma
+	// sessão que nunca existiu.
+	maxInstallments, err := checkout.NormalizeInstallments(card, in.MaxInstallments)
 	if err != nil {
 		return nil, ports.CheckoutResult{}, err
 	}
@@ -128,6 +148,13 @@ func (s *CheckoutService) CreateSession(ctx context.Context, in CreateCheckoutSe
 			return nil, ports.CheckoutResult{}, addErr
 		}
 	}
+	// O C6 recusa abaixo de R$ 5,00 com 400 nomeando /amount (verificado no fio em
+	// 2026-08-19). Recusar aqui evita a chamada, evita cobrar a tarifa e devolve o
+	// erro antes de o comprador estar no meio de um checkout.
+	if sum < MinCheckoutTotalCents {
+		return nil, ports.CheckoutResult{}, shared.NewValidationError("items",
+			"checkout total must be at least 500 cents")
+	}
 	total, err := shared.NewMoney(sum, in.Currency)
 	if err != nil {
 		return nil, ports.CheckoutResult{}, err
@@ -143,7 +170,7 @@ func (s *CheckoutService) CreateSession(ctx context.Context, in CreateCheckoutSe
 	if err != nil {
 		return nil, ports.CheckoutResult{}, err
 	}
-	sess, err = sess.WithCard(card, in.RequireAuthentication)
+	sess, err = sess.WithCard(card, in.RequireAuthentication, maxInstallments)
 	if err != nil {
 		return nil, ports.CheckoutResult{}, err
 	}
@@ -325,6 +352,7 @@ func toCheckoutRequest(sess checkout.Session, idemKey string) ports.CheckoutRequ
 		ExpiresAt:             sess.ExpiresAt(),
 		CardType:              string(sess.CardType()),
 		RequireAuthentication: sess.RequireAuthentication(),
+		MaxInstallments:       sess.MaxInstallments(),
 		IdempotencyKey:        idemKey,
 	}
 }

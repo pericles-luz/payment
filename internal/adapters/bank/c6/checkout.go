@@ -24,13 +24,24 @@ const checkoutPath = "/v1/checkouts"
 
 // cardBody is the C6 payment.card object (schema: card). For the hosted checkout
 // flow the payer types the card on C6's page, so card_info (card_hash/token) is
-// never sent at creation — only the routing fields are. installments is fixed at 1
-// (single payment) because the current product/port models no installment plan;
-// multi-installment (with interest_type) is a future port field, not invented here.
+// never sent at creation — only the routing fields are.
+//
+// installments carries the ceiling the caller asked for (it was hardcoded to 1 until
+// SIN-65726, which meant no buyer could ever split a payment), and interest_type says
+// who pays for splitting it.
 type cardBody struct {
 	Type         string `json:"type"`                   // DEBIT | CREDIT
-	Installments int    `json:"installments"`           // 1..12
+	Installments int    `json:"installments"`           // 1..12 — validado por NÓS, não pelo C6
 	Authenticate string `json:"authenticate,omitempty"` // REQUIRED | OPTIONAL | NOT_REQUIRED
+	// InterestType decide QUEM paga os juros do parcelamento: BY_ISSUER (o
+	// comprador, via administradora) ou BY_SELLER (a loja absorve).
+	//
+	// Enviar isto não é opcional na prática. Omitir o campo faz o C6 assumir
+	// BY_SELLER — observado numa captura real de produção —, ou seja, NÃO mandar é
+	// escolher que o lojista pague, por omissão. É a pior forma de tomar uma decisão
+	// de dinheiro. BY_ISSUER foi verificado no fio em 2026-08-19: a criação
+	// respondeu 201.
+	InterestType string `json:"interest_type,omitempty"`
 }
 
 // paymentBody is the C6 payment envelope (schema: payment). For a card checkout it
@@ -101,12 +112,27 @@ func (p *Provider) CreateCheckoutSession(ctx context.Context, tenantID string, r
 		authenticate = "REQUIRED"
 	}
 
+	// A faixa e a regra do débito são NOSSAS. Sondado contra o C6 real em
+	// 2026-08-19: uma criação com installments: 13 respondeu 201, e um cartão de
+	// DÉBITO com 3 parcelas também. O PSP não valida nenhuma das duas, então um
+	// valor fora da faixa passaria pela criação e só se manifestaria quando um
+	// comprador de verdade fosse pagar — o pior lugar possível para descobrir.
+	// Falha fechada aqui, mesmo o app já tendo validado: defesa em profundidade.
+	installments := req.MaxInstallments
+	if installments <= 0 {
+		installments = 1
+	}
+	if installments > maxCardInstallments || (cardType == "DEBIT" && installments > 1) {
+		return ports.CheckoutResult{}, &Error{Op: "create_checkout", sentinel: shared.ErrValidation}
+	}
+
 	body := checkoutRequestBody{
 		Amount: brlDecimal(sum),
 		Payment: paymentBody{Card: &cardBody{
 			Type:         cardType,
-			Installments: 1,
+			Installments: installments,
 			Authenticate: authenticate,
+			InterestType: cardInterestByIssuer,
 		}},
 	}
 	if !req.ExpiresAt.IsZero() {
@@ -142,9 +168,10 @@ func (p *Provider) CreateCheckoutSession(ctx context.Context, tenantID string, r
 		status = "CREATED" // create returns {id,url}; a fresh checkout is CREATED (spec)
 	}
 	return ports.CheckoutResult{
-		SessionID:   out.ID,
-		Status:      status,
-		RedirectURL: out.URL,
+		SessionID:       out.ID,
+		Status:          status,
+		RedirectURL:     out.URL,
+		MaxInstallments: installments,
 		// AmountCents is the authorized total we sent (C6's create response does not
 		// echo it); reflecting it keeps the result self-describing for the caller.
 		AmountCents: sum,
@@ -264,3 +291,15 @@ func checkoutCaptured(out checkoutResponseBody) bool {
 	}
 	return strings.TrimSpace(out.Payment.Card.ReturnCode) == checkoutReturnCodeApproved
 }
+
+// maxCardInstallments é o teto documentado do C6 para payment.card.installments.
+// Repetido aqui, e não só no domínio, porque o PSP aceita valores acima dele.
+const maxCardInstallments = 12
+
+// cardInterestByIssuer põe os juros do parcelamento na conta do comprador, via
+// administradora do cartão, em vez de a loja absorvê-los.
+//
+// É decisão de produto, tomada explicitamente: o default do C6 quando o campo é
+// omitido é BY_SELLER, então deixar de mandar seria escolher pelo lojista sem ele
+// saber. Se algum dia a política mudar, é aqui que ela muda.
+const cardInterestByIssuer = "BY_ISSUER"

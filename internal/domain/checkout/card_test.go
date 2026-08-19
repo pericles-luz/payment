@@ -52,7 +52,7 @@ func TestSessionWithCard(t *testing.T) {
 		t.Fatalf("defaults not zero: %q %v", s.CardType(), s.RequireAuthentication())
 	}
 
-	withAuth, err := s.WithCard(CardCredit, true)
+	withAuth, err := s.WithCard(CardCredit, true, 0)
 	if err != nil {
 		t.Fatalf("WithCard: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestSessionWithCard(t *testing.T) {
 		t.Fatalf("WithCard mutated original: %q", s.CardType())
 	}
 
-	if _, err := s.WithCard(CardType("bogus"), false); !errors.Is(err, shared.ErrValidation) {
+	if _, err := s.WithCard(CardType("bogus"), false, 0); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("WithCard(bogus): want validation error, got %v", err)
 	}
 }

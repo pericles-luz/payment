@@ -182,6 +182,70 @@ func run() error {
 		return nil
 	}
 
+	// --installments: probe what C6 accepts on the checkout CREATE for parcelamento,
+	// without paying anything.
+	//
+	// Two questions block the feature and neither has been observed, only assumed:
+	//
+	//   1. Is payment.card.installments a CEILING the buyer chooses under, or the exact
+	//      number of parcelas they must take? The product decision ("the merchant caps
+	//      it") presumes the first.
+	//   2. Is interest_type: BY_ISSUER accepted? We have only ever seen BY_SELLER, which
+	//      C6 fills in by DEFAULT — meaning not sending the field is choosing that the
+	//      MERCHANT absorbs the installment interest. That is a money decision made by
+	//      omission, which is the worst way to make one.
+	//
+	// Every request here CREATES a session and none is ever paid: they simply expire.
+	// That makes the acceptance half of the experiment free. The ceiling-vs-exact half
+	// still needs a human to look at the hosted page (or a headless render of it), which
+	// is why the created URLs are printed.
+	if len(os.Args) > 2 && os.Args[2] == "--installments" {
+		exp := time.Now().Add(20 * time.Minute).UTC().Format(time.RFC3339)
+		casos := []struct {
+			nome string
+			body map[string]any
+		}{
+			{"3x, juros do EMISSOR (o que queremos mandar)", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 3, "authenticate": "NOT_REQUIRED",
+					"interest_type": "BY_ISSUER"}}}},
+			{"3x, sem interest_type (hoje: C6 assume BY_SELLER)", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 3, "authenticate": "NOT_REQUIRED"}}}},
+			{"13x (fora da faixa 1..12): C6 recusa ou aceita?", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 13, "authenticate": "NOT_REQUIRED"}}}},
+			{"DEBITO parcelado: a regra e do C6 ou nossa?", map[string]any{
+				"amount": 15.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "DEBIT", "installments": 3, "authenticate": "NOT_REQUIRED"}}}},
+			{"R$ 6,00 em 3x: existe minimo POR PARCELA?", map[string]any{
+				"amount": 6.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 3, "authenticate": "NOT_REQUIRED"}}}},
+			{"R$ 3,00 (abaixo do minimo): forma do erro", map[string]any{
+				"amount": 3.00, "expiration_date_time": exp,
+				"payment": map[string]any{"card": map[string]any{
+					"type": "CREDIT", "installments": 1, "authenticate": "NOT_REQUIRED"}}}},
+		}
+
+		for _, c := range casos {
+			section(c.nome)
+			b, err := json.Marshal(c.body)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("   enviado: %s\n", b)
+			if err := call(ctx, httpc, http.MethodPost, base+"/v1/checkouts/", token, b, "application/json"); err != nil {
+				fmt.Printf("   erro de transporte: %v\n", err)
+			}
+		}
+		return nil
+	}
+
 	// --get-checkout <sessionID>: read ONE real checkout session and print the PSP's
 	// body verbatim. It exists to settle a question our own API cannot answer: the
 	// adapter's checkoutResponseBody declares only id/status/url/amount and pins

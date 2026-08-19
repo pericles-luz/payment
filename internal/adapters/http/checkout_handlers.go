@@ -22,6 +22,10 @@ type createCheckoutRequest struct {
 	ExpiresInSeconds      int64                 `json:"expires_in_seconds"`
 	CardType              string                `json:"card_type"`
 	RequireAuthentication bool                  `json:"require_authentication"`
+	// MaxInstallments é o teto de parcelas oferecido ao comprador num cartão de
+	// crédito (1..12). Ausente ou zero significa pagamento à vista, e o corpo
+	// enviado ao PSP fica idêntico ao de sempre.
+	MaxInstallments int `json:"max_installments"`
 	// Bank optionally selects which configured bank hosts this checkout (multi-bank,
 	// SIN-66022); empty keeps header/default routing, overrides X-Bank-Id (ADR-0007).
 	Bank string `json:"bank"`
@@ -42,6 +46,12 @@ type checkoutSessionView struct {
 	AmountCents           int64  `json:"amount_cents"`
 	CardType              string `json:"card_type"`
 	RequireAuthentication bool   `json:"require_authentication"`
+	// MaxInstallments é o teto que FOI PEDIDO; Installments é quantas parcelas o
+	// comprador de fato tomou, e só tem valor depois de pago. São números
+	// diferentes e confundi-los seria erro de dinheiro.
+	MaxInstallments int    `json:"max_installments"`
+	Installments    int    `json:"installments"`
+	Message         string `json:"message"`
 }
 
 func (s *Server) handleCreateCheckout(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +73,7 @@ func (s *Server) handleCreateCheckout(w http.ResponseWriter, r *http.Request) {
 
 	in := app.CreateCheckoutSessionInput{
 		TenantID:              tenantID,
+		MaxInstallments:       req.MaxInstallments,
 		AccountID:             accountFromContext(r.Context()),
 		Currency:              req.Currency,
 		ExpiresInSeconds:      req.ExpiresInSeconds,
@@ -95,6 +106,7 @@ func (s *Server) handleCreateCheckout(w http.ResponseWriter, r *http.Request) {
 		AmountCents:           p.Amount().Cents(),
 		CardType:              res.CardType,
 		RequireAuthentication: res.RequireAuthentication,
+		MaxInstallments:       res.MaxInstallments,
 	})
 }
 
@@ -135,5 +147,8 @@ func toCheckoutSessionView(res ports.CheckoutResult) checkoutSessionView {
 		AmountCents:           res.AmountCents,
 		CardType:              res.CardType,
 		RequireAuthentication: res.RequireAuthentication,
+		MaxInstallments:       res.MaxInstallments,
+		Installments:          res.Installments,
+		Message:               res.Message,
 	}
 }
