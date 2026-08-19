@@ -29,6 +29,17 @@ type ProviderSet struct {
 	// (SIN-69560 / F2). Nil when the bank does not speak the webhook wire (the in-memory
 	// stub), which makes the in-flow registration an inert no-op.
 	PixWebhook ports.PixWebhookRegistrar
+	// RecurrenceWebhook registers/reads this bank's two singleton recurrence callbacks
+	// (mandate + recurring charge). ServiceWebhook registers/reads the PSP-PROPRIETARY
+	// per-service callbacks (checkout, boleto). Both are part of the SAME per-tenant
+	// callback URL as PixWebhook — one ref serves every channel, because the PSP routes
+	// by the service discriminator in the notification, not by the URL. They are exposed
+	// separately so the in-flow registration can keep every channel pointing at the
+	// current ref; a mint replaces the ref for all of them at once, so a channel left
+	// unregistered is a silently dead one. Nil for a bank that does not speak these
+	// wires (the in-memory stub speaks recurrence but not the proprietary surface).
+	RecurrenceWebhook ports.RecurrenceWebhookRegistrar
+	ServiceWebhook    ports.ServiceWebhookRegistrar
 }
 
 // Registry maps a non-secret bank slug to its ProviderSet. It is the closed set of

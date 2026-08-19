@@ -71,8 +71,8 @@ func main() {
 }
 
 func run() error {
-	if len(os.Args) != 2 {
-		return fmt.Errorf("usage: c6-webhook-probe <tenantID>")
+	if len(os.Args) < 2 {
+		return fmt.Errorf("usage: c6-webhook-probe <tenantID> [--discover-proprietary]")
 	}
 	tenantID := strings.TrimSpace(os.Args[1])
 
@@ -123,6 +123,38 @@ func run() error {
 	fmt.Printf("   token obtido (len=%d)\n", len(token))
 
 	base := strings.TrimRight(cfg.C6.BaseURL, "/")
+
+	// Discovery mode for the C6-PROPRIETARY webhook surface (/v1/webhooks), which backs
+	// boleto/checkout and is documented only as a shape in the runbook — never exercised.
+	// READ-ONLY: it lists what is registered under both Accept values so the real contract
+	// (field names, service enum, header requirements) can be read off the response before
+	// any code is written against it. No write is attempted here on purpose.
+	if len(os.Args) > 2 && os.Args[2] == "--discover-proprietary" {
+		// This family answers the OPPOSITE of the BACEN one: it demands
+		// Accept: application/json and rejects application/problem+json. It also requires
+		// the `service` discriminator as a QUERY parameter on the read.
+		section("GET /v1/webhooks?service=CHECKOUT (estado atual)")
+		if err := call(ctx, httpc, http.MethodGet, base+"/v1/webhooks?service=CHECKOUT", token, nil, "application/json"); err != nil {
+			return err
+		}
+		// Elicit the WRITE contract without creating anything: an empty and then a partial
+		// body make the PSP name the fields it requires. A validation rejection happens
+		// before any mutation (the same property the Accept rejections demonstrated), so
+		// nothing is registered by these calls.
+		for _, probe := range []struct {
+			method, label, body string
+		}{
+			{http.MethodPost, "POST corpo vazio", `{}`},
+			{http.MethodPost, "POST so service", `{"service":"CHECKOUT"}`},
+			{http.MethodPut, "PUT corpo vazio", `{}`},
+		} {
+			section(probe.label + " /v1/webhooks")
+			if err := call(ctx, httpc, probe.method, base+"/v1/webhooks", token, []byte(probe.body), "application/json"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	// --- 2. Read-only business call ---------------------------------------------
 	section("2. GET /v1/statement (somente leitura, superficie ja provada)")
