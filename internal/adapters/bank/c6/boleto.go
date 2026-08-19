@@ -31,49 +31,6 @@ const bankSlipsPath = "/v2/bank_slips"
 // adapter (ADR-0005).
 const dueDateLayout = "2006-01-02"
 
-// boletoDiscountBody is the transport JSON for one early-payment discount tier
-// (roteiro grupo 3). Exactly one of Bps/FixedCents is non-zero.
-type boletoDiscountBody struct {
-	DaysBeforeDue int   `json:"days_before_due"`
-	Bps           int64 `json:"bps,omitempty"`
-	FixedCents    int64 `json:"fixed_cents,omitempty"`
-}
-
-// boletoAddressBody is the payer address in the C6 bank_slips contract. number is an
-// integer per the contract (ADR-0005 "Riscos conhecidos": "S/N"/alphanumeric numbers
-// are an open homologation question).
-type boletoAddressBody struct {
-	Street  string `json:"street"`
-	Number  int    `json:"number"`
-	City    string `json:"city"`
-	State   string `json:"state"`
-	ZipCode string `json:"zip_code"`
-}
-
-// boletoPayerBody is the `payer` object the C6 bank_slips contract requires.
-type boletoPayerBody struct {
-	Name    string            `json:"name"`
-	TaxID   string            `json:"tax_id"`
-	Address boletoAddressBody `json:"address"`
-}
-
-// boletoRequestBody is the LEGACY /boletos/{id} amend body (UpdateBoleto only). Its real
-// contract is uncaptured, so it keeps the prior invented shape (amount in cents,
-// fine_bps/etc) and is deliberately out of SIN-65953's scope. Registration uses the real
-// bankSlipRequestBody below; do not route new work through this struct.
-type boletoRequestBody struct {
-	Amount              int64           `json:"amount"`
-	DueDate             string          `json:"due_date"`
-	ExternalReferenceID string          `json:"external_reference_id"`
-	ValidUntil          string          `json:"valid_until,omitempty"`
-	Payer               boletoPayerBody `json:"payer"`
-	// --- rate parameters (roteiro grupos 1–3); wire names unconfirmed by a real 201 ---
-	FineBps            int64                `json:"fine_bps"`
-	FineFixedCents     int64                `json:"fine_fixed_cents,omitempty"`
-	MonthlyInterestBps int64                `json:"monthly_interest_bps"`
-	Discounts          []boletoDiscountBody `json:"discounts,omitempty"`
-}
-
 // externalReferenceID derives the C6 external_reference_id (^[a-zA-Z0-9]{1,10}$) from
 // the boleto id. The boleto id is a UUID (>10 chars, contains hyphens), so it cannot
 // be sent verbatim. The derivation is a pure function of the id — deterministic and
@@ -90,32 +47,6 @@ func externalReferenceID(boletoID string) string {
 	}
 	return ref
 }
-
-// boletoResponseBody is the subset of C6's boleto representation we consume: the
-// status plus the scannable artifacts (PIX EMV payload and boleto barcode) and the
-// registered parameters echoed back for reconciliation (roteiro 6.a).
-type boletoResponseBody struct {
-	BoletoID           string               `json:"boleto_id"`
-	TxID               string               `json:"txid"`
-	Status             string               `json:"status"`
-	QRCode             string               `json:"qr_code"`
-	Barcode            string               `json:"barcode"`
-	AmountCents        int64                `json:"amount_cents"`
-	DueDate            time.Time            `json:"due_date"`
-	ValidUntil         *time.Time           `json:"valid_until"`
-	FineBps            int64                `json:"fine_bps"`
-	FineFixedCents     int64                `json:"fine_fixed_cents"`
-	MonthlyInterestBps int64                `json:"monthly_interest_bps"`
-	Discounts          []boletoDiscountBody `json:"discounts"`
-}
-
-// --- Real C6 /v1/bank_slips contract (201 captured, SIN-65888) -----------------
-//
-// The register path has its own request/response DTOs: the captured 201 is shape-
-// incompatible with the legacy /boletos/{id} representation above (still used by the
-// id-addressed read/cancel/amend ops, contract uncaptured). On the wire amount is REAIS
-// DECIMAIS (e.g. 12.34), NOT cents; fees are {value,type} objects; the response is
-// id/our_number/bar_code/digitable_line (none of the legacy keys exist).
 
 // brlDecimal is a money quantity carried in the port as integer minor units (centavos)
 // but serialized to / parsed from the C6 wire as a JSON decimal number with exactly two
@@ -503,62 +434,6 @@ func applyBankSlipFees(res *ports.BoletoResult, fees *bankSlipFees) {
 	}
 }
 
-// toDiscountBodies maps the port discount tiers to their transport JSON.
-func toDiscountBodies(in []ports.BoletoDiscountTier) []boletoDiscountBody {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]boletoDiscountBody, len(in))
-	for i, d := range in {
-		out[i] = boletoDiscountBody{DaysBeforeDue: d.DaysBeforeDue, Bps: d.Bps, FixedCents: d.FixedCents}
-	}
-	return out
-}
-
-// fromDiscountBodies maps the transport discount JSON back to the port tiers.
-func fromDiscountBodies(in []boletoDiscountBody) []ports.BoletoDiscountTier {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]ports.BoletoDiscountTier, len(in))
-	for i, d := range in {
-		out[i] = ports.BoletoDiscountTier{DaysBeforeDue: d.DaysBeforeDue, Bps: d.Bps, FixedCents: d.FixedCents}
-	}
-	return out
-}
-
-// toBoletoRequestBody maps the port request to the LEGACY /boletos/{id} amend JSON
-// (UpdateBoleto only — the real amend contract is uncaptured, so this path is out of
-// SIN-65953's scope and keeps its prior shape). The payer is optional here (amend does
-// not carry it); due_date/valid_until are yyyy-MM-dd and external_reference_id is derived
-// from the boleto id. Registration goes through toBankSlipRequestBody, not this.
-func toBoletoRequestBody(req ports.BoletoRequest) boletoRequestBody {
-	body := boletoRequestBody{
-		Amount:              req.AmountCents,
-		DueDate:             req.DueDate.Format(dueDateLayout),
-		ExternalReferenceID: externalReferenceID(req.BoletoID),
-		Payer: boletoPayerBody{
-			Name:  req.Payer.Name,
-			TaxID: req.Payer.TaxID,
-			Address: boletoAddressBody{
-				Street:  req.Payer.Address.Street,
-				Number:  req.Payer.Address.Number,
-				City:    req.Payer.Address.City,
-				State:   req.Payer.Address.State,
-				ZipCode: req.Payer.Address.ZipCode,
-			},
-		},
-		FineBps:            req.FineBps,
-		FineFixedCents:     req.FineFixedCents,
-		MonthlyInterestBps: req.MonthlyInterestBps,
-		Discounts:          toDiscountBodies(req.Discounts),
-	}
-	if !req.ValidUntil.IsZero() {
-		body.ValidUntil = req.ValidUntil.Format(dueDateLayout)
-	}
-	return body
-}
-
 // validatePayer enforces the C6 bank_slips mandatory payer block. Number is allowed to
 // be zero (the "S/N"/no-number homologation case is open — ADR-0005). Returns an
 // adapter validation error wrapping shared.ErrValidation so callers branch with
@@ -583,27 +458,6 @@ func validatePayer(op string, p ports.BoletoPayer) error {
 		return &Error{Op: op, detail: "missing required " + missing, sentinel: shared.ErrValidation}
 	}
 	return nil
-}
-
-// toBoletoResult maps a parsed C6 boleto representation to the port result.
-func toBoletoResult(out boletoResponseBody) ports.BoletoResult {
-	res := ports.BoletoResult{
-		BoletoID:           out.BoletoID,
-		TxID:               out.TxID,
-		Status:             out.Status,
-		QRCode:             out.QRCode,
-		Barcode:            out.Barcode,
-		AmountCents:        out.AmountCents,
-		DueDate:            out.DueDate,
-		FineBps:            out.FineBps,
-		FineFixedCents:     out.FineFixedCents,
-		MonthlyInterestBps: out.MonthlyInterestBps,
-		Discounts:          fromDiscountBodies(out.Discounts),
-	}
-	if out.ValidUntil != nil {
-		res.ValidUntil = *out.ValidUntil
-	}
-	return res
 }
 
 // CreateBoleto registers a BolePix boleto at C6 and returns the scannable

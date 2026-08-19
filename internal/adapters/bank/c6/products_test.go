@@ -34,7 +34,6 @@ type productServer struct {
 	boletoCreate http.HandlerFunc
 	boletoGet    http.HandlerFunc
 	boletoCancel http.HandlerFunc
-	boletoUpdate http.HandlerFunc
 	checkout     http.HandlerFunc
 	// cobvPut backs both create and amend (both PUT /v2/pix/cobv/{txid}); cobvGet
 	// backs the reconcile read (roteiro 7.5–7.7).
