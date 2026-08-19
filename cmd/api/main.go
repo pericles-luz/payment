@@ -108,10 +108,12 @@ func run() error {
 	var webhookRegistrar ports.PixWebhookRegistrar
 	var recWebhookRegistrar ports.RecurrenceWebhookRegistrar
 	var svcWebhookRegistrar ports.ServiceWebhookRegistrar
+	var webhookDeregistrar ports.WebhookDeregistrar
 	if set, ok := registry.Get(ports.BankIDC6); ok {
 		webhookRegistrar = set.PixWebhook
 		recWebhookRegistrar = set.RecurrenceWebhook
 		svcWebhookRegistrar = set.ServiceWebhook
+		webhookDeregistrar = set.WebhookDeregistrar
 	}
 	// The per-port routers dispatch each request to the bank resolved at the HTTP
 	// boundary (carried on the context). The application services depend on these,
@@ -262,23 +264,28 @@ func run() error {
 	})
 
 	console := app.NewConsoleService(app.ConsoleDeps{
-		Tenants:          store,
-		Accounts:         store,
-		Pricing:          store,
-		Ledger:           store,
-		CredWriter:       creds,
-		CreditorWriter:   creds,
-		CredReader:       creds,
-		CertWriter:       certs,
-		CertReader:       certs,
-		CredDeleter:      creds,
-		CertDeleter:      certs,
-		Invoices:         store,
-		OutboundWebhooks: outboundWebhooks,
-		CredInvalidator:  credInvalidator,
-		Audit:            store,
-		Clock:            system.Clock{},
-		IDs:              system.IDProvider{},
+		Tenants:        store,
+		Accounts:       store,
+		Pricing:        store,
+		Ledger:         store,
+		CredWriter:     creds,
+		CreditorWriter: creds,
+		CredReader:     creds,
+		CertWriter:     certs,
+		CertReader:     certs,
+		CredDeleter:    creds,
+		CertDeleter:    certs,
+		// Removing a bank configuration must also stop the PSP from calling us: without
+		// this the bank keeps POSTing notifications whose credential we just deleted
+		// (SIN-69580). Nil for the stub, which speaks no webhook wire.
+		WebhookDeregistrar: webhookDeregistrar,
+		Creds:              creds,
+		Invoices:           store,
+		OutboundWebhooks:   outboundWebhooks,
+		CredInvalidator:    credInvalidator,
+		Audit:              store,
+		Clock:              system.Clock{},
+		IDs:                system.IDProvider{},
 	})
 
 	// Self-contained console login (ADR-0001 Opção B, SIN-69265): username +
@@ -724,6 +731,9 @@ func buildProviderSet(generic ports.BankProvider, raw ports.PixProvider) bank.Pr
 	}
 	if v, ok := raw.(ports.ServiceWebhookRegistrar); ok {
 		set.ServiceWebhook = v
+	}
+	if v, ok := raw.(ports.WebhookDeregistrar); ok {
+		set.WebhookDeregistrar = v
 	}
 	return set
 }

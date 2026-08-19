@@ -57,8 +57,11 @@ const (
 	webhookRegistrationAccept = "application/problem+json"
 )
 
-// compile-time assertion that Provider satisfies the webhook-registrar port.
-var _ ports.PixWebhookRegistrar = (*Provider)(nil)
+// compile-time assertions that Provider satisfies the webhook ports.
+var (
+	_ ports.PixWebhookRegistrar = (*Provider)(nil)
+	_ ports.WebhookDeregistrar  = (*Provider)(nil)
+)
 
 // webhookRequestBody is the BACEN PIX webhook registration payload: the single
 // HTTPS callback URL C6 will POST settlement notifications to for the recebedor
@@ -178,4 +181,37 @@ func (p *Provider) doStatus(req *http.Request, op string) error {
 		return mapError(op, resp.StatusCode, body)
 	}
 	return nil
+}
+
+// webhookDeleteAccept is the Accept sent on the deregistration calls. The PSP negotiates
+// against the response types an operation DECLARES: the registration PUT declares only a
+// problem+json error body (its 200 has none), which is why it rejects application/json;
+// the readback GET declares application/json on its 200 and accepts that. DELETE declares
+// NO content type at all — 204 plus typed-less errors — so neither value can be inferred
+// from the contract. Offering both in one header lets the negotiation match whichever the
+// gateway looks for, instead of guessing and shipping a call that 400s the first time an
+// operator uses it. Accept is a list by definition; the PSP's own error message echoes it
+// parsed as one.
+const webhookDeleteAccept = "application/json, application/problem+json"
+
+// DeleteWebhook deregisters the PIX settlement callback for pixKey (DELETE
+// /v2/pix/webhook/{chave}). It exists so removing a tenant's bank configuration can stop
+// the PSP from calling us: without it, C6 keeps POSTing to a URL whose credential we just
+// deleted and whose ref may be revoked — deliveries that can never reconcile. An already
+// absent registration surfaces as shared.ErrNotFound, which the caller may treat as done.
+func (p *Provider) DeleteWebhook(ctx context.Context, tenantID, pixKey string) error {
+	const op = "delete_webhook"
+	if strings.TrimSpace(tenantID) == "" {
+		return &Error{Op: op, sentinel: shared.ErrValidation, detail: "tenant is required"}
+	}
+	if strings.TrimSpace(pixKey) == "" {
+		return &Error{Op: op, sentinel: shared.ErrValidation, detail: "pix key is required"}
+	}
+	endpoint := p.baseURL + pixWebhookPath + "/" + url.PathEscape(pixKey)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodDelete, endpoint, nil, "")
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Accept", webhookDeleteAccept)
+	return p.doStatus(httpReq, op)
 }
