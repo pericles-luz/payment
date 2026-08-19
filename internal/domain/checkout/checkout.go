@@ -211,6 +211,37 @@ func NormalizeInstallments(card CardType, maxInstallments int) (int, error) {
 	return maxInstallments, nil
 }
 
+// MinInstallmentCents is the PSP's floor for EACH parcela: R$ 5,00. It is the same
+// number as the checkout total minimum, and not a coincidence — a single-payment
+// purchase is one parcela.
+const MinInstallmentCents int64 = 500
+
+// AffordableInstallments caps a requested ceiling at what the total can actually be
+// split into: each parcela must clear MinInstallmentCents.
+//
+// This rule is NOT enforced when the session is created. Probed against the live C6:
+// R$ 6,00 split in 3x (R$ 2,00 a parcela) answered 201, and R$ 15,00 in 6x answered
+// 201 too — and then the hosted page refused with "Link de Pagamento não encontrado".
+// So the PSP accepts the session and breaks at the worst possible moment: with the
+// buyer already on the payment page, holding a link that will never work.
+//
+// Capping here turns that into an offer the buyer can actually take: a R$ 30,00
+// purchase offers up to 6x, a R$ 15,00 one up to 3x, and a R$ 4,00 one is not a card
+// purchase at all (the total minimum already refuses it).
+func AffordableInstallments(totalCents int64, maxInstallments int) int {
+	if maxInstallments <= 1 || totalCents <= 0 {
+		return DefaultInstallments
+	}
+	cabem := int(totalCents / MinInstallmentCents)
+	if cabem < DefaultInstallments {
+		return DefaultInstallments
+	}
+	if cabem < maxInstallments {
+		return cabem
+	}
+	return maxInstallments
+}
+
 // MaxInstallments returns the ceiling of parcelas offered to the buyer (1 when the
 // purchase is a single payment).
 func (s Session) MaxInstallments() int { return s.maxInstallments }

@@ -1401,9 +1401,15 @@ components:
             zero significa pagamento à vista. Débito não parcela: `card_type: debit`
             com teto acima de 1 é recusado com 400.
 
-            A faixa 1..12 e a regra do débito são validadas por NÓS: o PSP aceita
-            valores fora delas na criação, e o problema só apareceria quando um
-            comprador de verdade fosse pagar.
+            O comprador escolhe de 1x até este teto na página do banco.
+
+            Cada parcela precisa ficar em pelo menos R$ 5,00, e o teto é reduzido
+            automaticamente ao que o valor comporta (R$ 15,00 com teto de 6x abre com
+            3x). A resposta traz o teto que de fato valeu.
+
+            A faixa 1..12, a regra do débito e o mínimo por parcela são validados por
+            NÓS: o PSP aceita tudo isso na criação e só recusa na página hospedada,
+            com o comprador já no meio do pagamento.
 
             Os juros do parcelamento ficam por conta do COMPRADOR (o emissor do
             cartão), não da loja.

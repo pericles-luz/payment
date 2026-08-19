@@ -48,6 +48,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -180,6 +181,37 @@ func run() error {
 			}
 		}
 		return nil
+	}
+
+	// --parcelas <n>: open ONE hosted checkout with a ceiling of n parcelas and a
+	// LONG expiry, so a human has time to open the page and answer the one question
+	// the wire cannot: does the page offer a CHOICE of parcelas up to n, or does it
+	// force exactly n? The product decision ("the merchant caps it") presumes a
+	// choice, and shipping the wrong reading would force every buyer into n parcelas.
+	//
+	// Nothing is paid: the session simply expires.
+	if len(os.Args) > 3 && os.Args[2] == "--parcelas" {
+		n, convErr := strconv.Atoi(strings.TrimSpace(os.Args[3]))
+		if convErr != nil || n < 1 || n > 12 {
+			return fmt.Errorf("parcelas deve ser 1..12, recebi %q", os.Args[3])
+		}
+		exp := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+		// R$ 30,00 e não R$ 15,00: cada parcela precisa passar do mínimo de R$ 5,00 do
+		// PSP, e o C6 só aplica essa regra na PÁGINA — a criação responde 201 e o link
+		// depois diz "Link de Pagamento não encontrado". Com 30 reais, até 6x cabe.
+		body := map[string]any{
+			"amount": 30.00, "expiration_date_time": exp,
+			"payment": map[string]any{"card": map[string]any{
+				"type": "CREDIT", "installments": n, "authenticate": "NOT_REQUIRED",
+				"interest_type": "BY_ISSUER"}},
+		}
+		b, mErr := json.Marshal(body)
+		if mErr != nil {
+			return mErr
+		}
+		section(fmt.Sprintf("checkout de R$ 30,00 com teto de %dx, valido por 24h", n))
+		fmt.Printf("   enviado: %s\n", b)
+		return call(ctx, httpc, http.MethodPost, base+"/v1/checkouts/", token, b, "application/json")
 	}
 
 	// --installments: probe what C6 accepts on the checkout CREATE for parcelamento,

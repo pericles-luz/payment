@@ -155,6 +155,11 @@ func (s *CheckoutService) CreateSession(ctx context.Context, in CreateCheckoutSe
 		return nil, ports.CheckoutResult{}, shared.NewValidationError("items",
 			"checkout total must be at least 500 cents")
 	}
+	// O teto pedido é reduzido ao que o valor comporta: cada parcela precisa passar
+	// do mínimo do PSP. Não é recusa — é oferecer o que o comprador pode de fato
+	// aceitar. Uma compra de R$ 15,00 com teto de 6x vira 3x.
+	maxInstallments = checkout.AffordableInstallments(sum, maxInstallments)
+
 	total, err := shared.NewMoney(sum, in.Currency)
 	if err != nil {
 		return nil, ports.CheckoutResult{}, err
