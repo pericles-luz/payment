@@ -129,6 +129,16 @@ var _ ports.CredentialInvalidator = (*Provider)(nil)
 // (ADR-0003). Safe to call for an unknown tenant (no-op).
 func (p *Provider) InvalidateToken(tenantID string) {
 	p.tokens.invalidate(tenantID)
+	// Uma rotação também precisa alcançar a camada TLS. O certificado de um tenant é
+	// escolhido no handshake, então uma conexão que já está no pool continua
+	// apresentando o certificado ANTIGO por tempo indefinido — a varredura de webhook
+	// a mantém quente e ela nunca expira. Descartar o transporte do tenant faz a
+	// próxima requisição discar do zero, com o certificado que acabou de ser gravado.
+	if p.httpc != nil {
+		if tr, ok := p.httpc.Transport.(*mtlsRoundTripper); ok {
+			tr.dropTenant(tenantID)
+		}
+	}
 }
 
 // New validates the config and builds a Provider. Both endpoints must be absolute
