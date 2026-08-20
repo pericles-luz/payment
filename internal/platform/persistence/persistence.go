@@ -139,6 +139,8 @@ type CredentialVault interface {
 	DeleteBankCredential(ctx context.Context, tenantID, bankID string) error
 	SetCreditorKey(ctx context.Context, tenantID, creditorKey string) error
 	ListTenantsWithC6Credential(ctx context.Context) ([]string, error)
+	FindTenantsByCreditorKey(ctx context.Context, bankID, creditorKey string) ([]string, error)
+	FindTenantsByClientID(ctx context.Context, bankID, clientID string) ([]string, error)
 	Reseal(ctx context.Context, oldCipher *secret.Cipher) (int, error)
 }
 

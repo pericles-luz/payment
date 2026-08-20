@@ -3,12 +3,14 @@ package postgres_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/postgres"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/billing"
+	"github.com/ia-dev-sindireceita/payment/internal/ports"
 	migrations "github.com/ia-dev-sindireceita/payment/migrations/pg"
 )
 
@@ -165,3 +167,62 @@ func TestLedgerOrderingAcrossFractionBoundary(t *testing.T) {
 
 // mapFS is a minimal fs.FS over an in-memory file set, enough for Migrate: it only
 // ever needs ReadDir and ReadFile, which fstest.MapFS already provides.
+
+// O incidente do SIN-69368 no SQLite: a marca de anti-replay, primeira escrita da
+// transacao de liquidacao, esbarrou no trabalhador de entrega de saida e foi RECUSADA
+// na hora com SQLITE_BUSY. Um cartao pago virou 500 — e como a marca nao gravou, a
+// repeticao do C6 foi reprocessada com o anti-replay valendo nada.
+//
+// No PostgreSQL essa forma de falha nao existe: MVCC nao poe leitor contra escritor, e
+// duas escritas em linhas diferentes nem se veem. Nao ha busy_timeout a configurar —
+// e por isso o Open daqui nao tem o equivalente ao withBusyTimeout do sqlite. Este
+// teste fixa a propriedade (escritas simultaneas em transacoes separadas esperam ou
+// passam, nunca falham de imediato) para que ela nao se perca numa mudanca futura de
+// isolamento ou de pool.
+func TestEscritasConcorrentesNaoFalhamDeImediato(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := postgres.Open(testDSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := postgres.Migrate(ctx, db, migrations.FS); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	s := postgres.NewStore(db)
+	seedTenant(t, s, "t-conc")
+
+	const writers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	start := make(chan struct{})
+	for i := range writers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			// Cada uma em sua propria transacao, como a liquidacao e o trabalhador.
+			errs <- s.WithinTx(ctx, func(r ports.Repository) error {
+				_, err := r.MarkProcessed(ctx, "t-conc", fmt.Sprintf("evt-%d", i))
+				return err
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("escrita concorrente falhou: %v", err)
+		}
+	}
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM processed_events WHERE tenant_id = 't-conc'`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != writers {
+		t.Fatalf("gravou %d marcas, esperava %d", n, writers)
+	}
+}
