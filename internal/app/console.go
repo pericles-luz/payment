@@ -419,6 +419,9 @@ func (s *ConsoleService) SetBankCredential(ctx context.Context, tenantID, client
 	// Single-bank write path: persists under the default bank (BankIDC6),
 	// preserving current behaviour. A per-bank selector in the console is the
 	// routing/UX workstream (SIN-66022 / SIN-66017), not this schema change.
+	if err := s.assertClientIDFree(ctx, tenantID, ports.BankIDC6, clientID); err != nil {
+		return err
+	}
 	if err := s.credWriter.SetBankCredential(ctx, tenantID, ports.BankIDC6, clientID, secret); err != nil {
 		// Wrap with non-sensitive context only; never include the secret.
 		return fmt.Errorf("set bank credential: %w", err)
@@ -634,6 +637,9 @@ func (s *ConsoleService) SetBankCredentialFor(ctx context.Context, tenantID, ban
 	slug := ports.NormalizeBankID(bankID)
 	if !ports.IsKnownBankID(slug) {
 		return shared.NewValidationError("bank", "banco não suportado")
+	}
+	if err := s.assertClientIDFree(ctx, tenantID, slug, clientID); err != nil {
+		return err
 	}
 	if err := s.credWriter.SetBankCredential(ctx, tenantID, slug, clientID, secret); err != nil {
 		return fmt.Errorf("set bank credential: %w", err)
@@ -1121,49 +1127,17 @@ func (s *ConsoleService) AccountConsumptionInRange(ctx context.Context, accountI
 // every removal left behind before this existed. An already-absent registration is not an
 // error. Each outcome is logged with the tenant and bank (never the callback URL, which
 // embeds the secret ref).
-// assertCreditorKeyFree enforces the invariant that a PIX creditor key belongs to ONE
-// ACTIVE empresa at a time. It runs on SetCreditorKey, which is the single write path
-// for the key (console and self-serve both funnel through it).
-//
-// Duas empresas ativas com a mesma chave se destroem mutuamente: no C6 o webhook é
-// registrado por chave, com uma URL só por chave, então elas se sobrescrevem a cada
-// registro. O aviso de pagamento chega por um ref que não é do dono da cobrança, é
-// recusado, e a liquidação passa a depender de varredura. Foi exatamente o que a
-// empresa 27 viveu (SIN-69368) — e barrar na gravação é o único lugar onde o problema
-// custa uma mensagem de erro em vez de um pagamento que não avisa.
-//
-// Um detentor SUSPENSO não bloqueia: ele não registra webhook nenhum (ver
-// WebhookRegistrationService.tenantMayRegister), então não disputa. Só o ativo importa.
-//
-// Falha fechado: se a consulta não puder responder, a gravação não passa. Uma chave
-// gravada por engano é cara de descobrir e cara de desfazer; um erro transitório na
-// gravação custa um "tente de novo".
-//
-// Vazamento assumido: a recusa confirma que a chave já está em uso NESTA plataforma.
-// Quem consegue sondar já tem token de tenant válido, e o preço de não avisar seria
-// deixar a colisão acontecer. Está registrado aqui de propósito.
+// assertCreditorKeyFree delegates to the package guard; see bank_identity.go for why
+// the invariant exists and why a suspended holder does not block.
 func (s *ConsoleService) assertCreditorKeyFree(ctx context.Context, tenantID, creditorKey string) error {
-	if s.sharing == nil || creditorKey == "" {
-		return nil
-	}
-	holders, err := s.sharing.FindTenantsByCreditorKey(ctx, ports.BankIDC6, creditorKey)
-	if err != nil {
-		return fmt.Errorf("check creditor key holders: %w", err)
-	}
-	for _, other := range holders {
-		if other == tenantID {
-			continue
-		}
-		active, err := s.tenantIsActive(ctx, other)
-		if err != nil {
-			return fmt.Errorf("resolve creditor key holder: %w", err)
-		}
-		if active {
-			return shared.NewValidationError("creditor_key",
-				"esta chave PIX já está registrada para outra empresa ativa")
-		}
-	}
-	return nil
+	return assertCreditorKeyUnclaimed(ctx, s.sharing, s.tenants, tenantID, ports.BankIDC6, creditorKey)
+}
+
+// assertClientIDFree rejects a PSP account (client_id) already used by another ACTIVE
+// empresa. Dividir a conta quebra recorrência e CHECKOUT — o aviso de pagamento com
+// cartão —, mesmo que as chaves PIX sejam diferentes.
+func (s *ConsoleService) assertClientIDFree(ctx context.Context, tenantID, bankID, clientID string) error {
+	return assertClientIDUnclaimed(ctx, s.sharing, s.tenants, tenantID, bankID, clientID)
 }
 
 // tenantIsActive resolves a tenant's ACTIVE flag. A tenant that no longer exists counts
