@@ -58,10 +58,21 @@ curl -sS --resolve payment.lmhost.com.br:443:143.198.66.140 https://payment.lmho
 
 ## Passo 2 — mover a aplicação (janela curta)
 
-**Pré-requisito, fora da janela:** rodar o `db-migrate -dry-run` contra uma cópia
-do `payment.db` real. O SQLite rodava `PRAGMA foreign_keys` numa conexão só de um
-pool ilimitado, então o enforcement lá era inconsistente; o Postgres cobra todas,
-e uma linha órfã aborta o ETL. Descubra isso com calma, não na janela.
+**Pré-requisito, fora da janela: ensaio a seco. Já feito em 20/08/2026** —
+snapshot consistente do `payment.db` de produção (via `Connection.backup()`, não
+cópia crua: o app estava escrevendo), carga real num banco descartável e
+verificação criptográfica. Resultado:
+
+- **271 linhas** carregadas em 14 tabelas, **sem violação de FK**. O risco de linha
+  órfã — o SQLite rodava `PRAGMA foreign_keys` numa conexão só de um pool
+  ilimitado, então o enforcement lá era inconsistente — **não se materializou**.
+- **3 credenciais e 3 certificados selados abriram** com a KEK de produção, via
+  `vault-reseal` com a mesma chave nos dois campos (migração só-de-AAD). A cópia
+  byte a byte preserva o vínculo AAD `(tenantID, bankID)`.
+- Tempo total do ETL: **abaixo de 1 segundo**.
+
+Repetir o ensaio só é necessário se o schema mudar. O `.db` do ensaio foi
+destruído com `shred`; o corte usa um snapshot novo, tirado depois do congelamento.
 
 O `payment.db` precisa ser copiado para o `pre-prod`: nenhum host vê os dois
 lados (o servidor antigo não alcança a VLAN privada — medido).
@@ -93,12 +104,12 @@ recarregar o Caddy e religar o app antigo. O SQLite antigo fica intocado.
 |---|---|
 | `systemctl stop` | instantâneo |
 | copiar 360 KB | segundos |
-| ETL de 289 linhas em 23 tabelas | ~1–2 s |
+| ETL de 271 linhas em 14 tabelas | **< 1 s** (medido no ensaio) |
 | boot até `/healthz` responder | **0,36–0,49 s** (medido, 3 execuções) |
 | reload do Caddy | ~1 s |
 
 Soma mecânica abaixo de 30 s; com um operador conferindo entre os passos, **1 a 3
-minutos**.
+minutos**. Todos os números acima são medidos, não estimados.
 
 Não é indisponibilidade igual para todos: os webhooks do C6 recebem 502 e são
 **reentregues** (o código conta com isso — `errSettlementLag` devolve erro de
