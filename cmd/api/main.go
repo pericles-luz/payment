@@ -357,6 +357,7 @@ func run() error {
 		creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
 		webhookCallbackBaseURL(), slog.Default()).
 		WithRefLookup(webhookRefStore).
+		WithTenants(store).
 		WithRecurrenceRegistrar(recWebhookRegistrar).
 		WithServiceRegistrar(svcWebhookRegistrar, c6.ServiceCheckout)
 

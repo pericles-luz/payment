@@ -8,8 +8,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
@@ -403,5 +405,115 @@ func assertNoSecretLeak(t *testing.T, logOutput, ref string) {
 	}
 	if strings.Contains(logOutput, webhookCallbackPathPrefix+ref) && ref != "" {
 		t.Fatalf("log leaked the full callback path: %s", logOutput)
+	}
+}
+
+// fakeTenantReader resolves a tenant with a scripted active flag, or an error.
+type fakeTenantReader struct {
+	active bool
+	err    error
+	calls  int
+}
+
+func (f *fakeTenantReader) FindTenantByID(_ context.Context, id string) (*tenant.Tenant, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	tn, err := tenant.New(id, "empresa "+id, time.Unix(0, 0).UTC())
+	if err != nil {
+		return nil, err
+	}
+	if !f.active {
+		tn.Deactivate()
+	}
+	return tn, nil
+}
+
+// TestTryRegisterSkipsInactiveTenant: um tenant SUSPENSO não registra webhook.
+//
+// Suspender não remove a credencial, e a varredura enumera justamente por presença de
+// credencial — então o suspenso continuava agindo. Quando ele e uma empresa ATIVA
+// compartilham a chave PIX (foi o caso da empresa 27 em produção), o estrago é
+// concreto: no C6 há uma URL só por chave, os dois se sobrescrevem a cada 60 segundos,
+// e o aviso de pagamento da empresa ativa passa a chegar por um ref que não é dela e
+// ser recusado. Cada rodada ainda gasta chamadas cobradas do PSP.
+//
+// O portão tem de barrar ANTES de qualquer chamada ao banco: nada de cunhar ref, nada
+// de GET de sondagem, nada de PUT.
+func TestTryRegisterSkipsInactiveTenant(t *testing.T) {
+	t.Parallel()
+	creds := &fakeCredStore{cred: completeCred()}
+	minter := &fakeMinter{ref: strings.Repeat("A", 43)}
+	reg := &fakeRegistrar{
+		getResults: []ports.WebhookRegistration{{}, {WebhookURL: testBaseURL + webhookCallbackPathPrefix + strings.Repeat("A", 43)}},
+		getErrs:    []error{shared.ErrNotFound, nil},
+	}
+	logger, buf := newBufLogger()
+	tenants := &fakeTenantReader{active: false}
+
+	s := NewWebhookRegistrationService(creds, reg, minter, testBaseURL, logger).WithTenants(tenants)
+	s.TryRegister(context.Background(), "t-suspenso")
+
+	if tenants.calls != 1 {
+		t.Fatalf("o portão não consultou o tenant (calls=%d)", tenants.calls)
+	}
+	if minter.mints != 0 {
+		t.Fatalf("tenant suspenso cunhou %d refs: cada cunhagem aposenta o ref anterior\ne mata os canais que ainda o usavam", minter.mints)
+	}
+	if len(reg.registered) != 0 || reg.getCalls != 0 {
+		t.Fatalf("tenant suspenso falou com o C6: %d PUT, %d GET — é assim que ele\ndisputa a chave PIX de uma empresa ativa", len(reg.registered), reg.getCalls)
+	}
+	if creds.calls != 0 {
+		t.Fatalf("credencial lida para um tenant suspenso (calls=%d)", creds.calls)
+	}
+	if strings.Contains(buf.String(), "registered and confirmed") {
+		t.Fatalf("log diz que registrou um tenant suspenso: %s", buf.String())
+	}
+}
+
+// TestTryRegisterActiveTenantStillRegisters: a contrapartida — o portão não pode
+// estorvar quem está ativo.
+func TestTryRegisterActiveTenantStillRegisters(t *testing.T) {
+	t.Parallel()
+	creds := &fakeCredStore{cred: completeCred()}
+	minter := &fakeMinter{ref: strings.Repeat("B", 43)}
+	reg := &fakeRegistrar{
+		getResults: []ports.WebhookRegistration{{}, {WebhookURL: testBaseURL + webhookCallbackPathPrefix + strings.Repeat("B", 43)}},
+		getErrs:    []error{shared.ErrNotFound, nil},
+	}
+	logger, buf := newBufLogger()
+
+	s := NewWebhookRegistrationService(creds, reg, minter, testBaseURL, logger).
+		WithTenants(&fakeTenantReader{active: true})
+	s.TryRegister(context.Background(), "t-ativo")
+
+	if len(reg.registered) != 1 {
+		t.Fatalf("tenant ativo registrou %d URLs, want 1", len(reg.registered))
+	}
+	if !strings.Contains(buf.String(), "registered and confirmed") {
+		t.Fatalf("esperava log de sucesso, veio: %s", buf.String())
+	}
+}
+
+// TestTryRegisterSkipsWhenTenantUnresolvable: falha fechado. Um erro de infraestrutura
+// ao ler o tenant não autoriza registrar em nome dele — a varredura tenta de novo em 60
+// segundos, então adiar não custa nada e agir por engano custa a chave de outra empresa.
+func TestTryRegisterSkipsWhenTenantUnresolvable(t *testing.T) {
+	t.Parallel()
+	creds := &fakeCredStore{cred: completeCred()}
+	minter := &fakeMinter{ref: strings.Repeat("C", 43)}
+	reg := &fakeRegistrar{}
+	logger, buf := newBufLogger()
+
+	s := NewWebhookRegistrationService(creds, reg, minter, testBaseURL, logger).
+		WithTenants(&fakeTenantReader{err: errors.New("database is locked")})
+	s.TryRegister(context.Background(), "t-indeterminado")
+
+	if minter.mints != 0 || len(reg.registered) != 0 {
+		t.Fatalf("registrou com o tenant indeterminado: %d mints, %d PUT", minter.mints, len(reg.registered))
+	}
+	if !strings.Contains(buf.String(), "tenant lookup failed") {
+		t.Fatalf("a falha de leitura tem de aparecer no log, veio: %s", buf.String())
 	}
 }
