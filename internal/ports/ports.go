@@ -474,6 +474,27 @@ type CredentialDeleter interface {
 	DeleteBankCredential(ctx context.Context, tenantID, bankID string) error
 }
 
+// CreditorKeySharingLookup answers WHICH tenants already hold a given bank identity.
+// It exists to keep one invariant: a PIX creditor key, and the C6 account behind a
+// client_id, belong to ONE active empresa at a time.
+//
+// Duas empresas ativas com a mesma chave PIX se destroem mutuamente. No C6 o webhook é
+// registrado POR CHAVE, com uma URL só por chave: as duas se sobrescrevem, o aviso de
+// pagamento chega por um ref que não é do dono da cobrança e é recusado, e a liquidação
+// passa a depender de varredura. Aconteceu em produção (SIN-69368).
+//
+// A busca por chave devolve o tenant, nunca a chave de ninguém: quem pergunta já tem em
+// mãos a chave que está tentando gravar, e nada além disso sai daqui.
+type CreditorKeySharingLookup interface {
+	// FindTenantsByCreditorKey returns every tenant id whose registered creditor key for
+	// bankID equals creditorKey. Empty result (never ErrNotFound) when nobody holds it.
+	FindTenantsByCreditorKey(ctx context.Context, bankID, creditorKey string) ([]string, error)
+	// FindTenantsByClientID returns every tenant id registered under the same bank
+	// client_id — i.e. sharing the PSP ACCOUNT, which is what the account-level webhook
+	// channels (rec/cobr) are keyed by.
+	FindTenantsByClientID(ctx context.Context, bankID, clientID string) ([]string, error)
+}
+
 // CreditorKeyWriter is the admin-plane write path for a tenant's registered PIX
 // creditor key (chave do recebedor). It is kept deliberately separate from
 // CredentialWriter so the secret-rotation capability and the fund-routing

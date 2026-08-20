@@ -280,6 +280,7 @@ func run() error {
 		// (SIN-69580). Nil for the stub, which speaks no webhook wire.
 		WebhookDeregistrar: webhookDeregistrar,
 		Creds:              creds,
+		Sharing:            creds,
 		Invoices:           store,
 		OutboundWebhooks:   outboundWebhooks,
 		CredInvalidator:    credInvalidator,
@@ -520,6 +521,10 @@ type credentialAdapter interface {
 	ports.CredentialDeleter
 	ports.CreditorKeyWriter
 	ports.CredentialEnumerator
+	// CreditorKeySharingLookup keeps a PIX key / PSP account from being claimed by two
+	// ACTIVE empresas at once, and stops a removal from tearing down a webhook that
+	// still belongs to another one (SIN-69368). Both vaults implement it.
+	ports.CreditorKeySharingLookup
 }
 
 // certificateAdapter is the union of mTLS-certificate ports the wiring depends on.
