@@ -72,6 +72,9 @@ type Deps struct {
 	// Kept separate from Credentials (the reader) so each service depends only on
 	// the capability it needs.
 	CredWriter ports.CredentialWriter
+	// Sharing keeps a bank identity (PIX key / PSP account) from being claimed by two
+	// ACTIVE empresas at once. Optional; nil disables the guard. See bank_identity.go.
+	Sharing ports.CreditorKeySharingLookup
 	// CertWriter is the admin-plane write path for per-(tenant,bank) mTLS client
 	// certificates (SIN-66087). Kept separate from CredWriter (a different secret
 	// aggregate) so the AdminService depends only on the capability it needs. When

@@ -17,9 +17,12 @@ import (
 // privileged (RBAC enforced at the boundary) and every successful mutation is
 // recorded to the append-only audit trail with the operator's identity.
 type AdminService struct {
-	tenants     ports.TenantRepository
-	pricing     ports.PricingRepository
-	credWriter  ports.CredentialWriter
+	tenants    ports.TenantRepository
+	pricing    ports.PricingRepository
+	credWriter ports.CredentialWriter
+	// sharing keeps a PSP account (client_id) from being claimed by two ACTIVE empresas
+	// at once. Optional: nil leaves the historical behaviour. See bank_identity.go.
+	sharing     ports.CreditorKeySharingLookup
 	certWriter  ports.BankCertificateWriter
 	credEvictor ports.CredentialInvalidator
 	audit       ports.AuditLog
@@ -55,7 +58,7 @@ func NewAdminService(d Deps) *AdminService {
 	if ci == nil {
 		ci = noopCredInvalidator{}
 	}
-	return &AdminService{tenants: d.Tenants, pricing: d.Pricing, credWriter: d.CredWriter, certWriter: d.CertWriter, credEvictor: ci, audit: a, clock: d.Clock, ids: d.IDs}
+	return &AdminService{tenants: d.Tenants, pricing: d.Pricing, credWriter: d.CredWriter, sharing: d.Sharing, certWriter: d.CertWriter, credEvictor: ci, audit: a, clock: d.Clock, ids: d.IDs}
 }
 
 // recordAudit appends an audit entry for a privileged action. who is derived
@@ -175,6 +178,9 @@ func (s *AdminService) setBankCredential(ctx context.Context, tenantID, bank, cl
 	}
 	if _, err := s.tenants.FindTenantByID(ctx, tenantID); err != nil {
 		return fmt.Errorf("resolve tenant: %w", err)
+	}
+	if err := assertClientIDUnclaimed(ctx, s.sharing, s.tenants, tenantID, bank, clientID); err != nil {
+		return err
 	}
 	if err := s.credWriter.SetBankCredential(ctx, tenantID, bank, clientID, secret); err != nil {
 		// Wrap with a non-sensitive context only; never include the secret.

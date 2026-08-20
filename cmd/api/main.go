@@ -171,6 +171,7 @@ func run() error {
 		OutboundAttributor: outboundAttributor,
 		Credentials:        creds,
 		CredWriter:         creds,
+		Sharing:            creds,
 		CertWriter:         certs,
 		CredInvalidator:    credInvalidator,
 		Audit:              store,
