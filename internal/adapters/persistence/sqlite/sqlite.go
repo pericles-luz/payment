@@ -28,10 +28,44 @@ import (
 
 const tsLayout = time.RFC3339Nano
 
-// Open opens a SQLite database at dsn (e.g. a file path or ":memory:") with
-// foreign keys enabled. The returned *sql.DB is owned by the caller.
+// busyTimeout is how long a statement waits for a write lock before giving up.
+//
+// SQLite permite UM escritor por vez. Sem espera, a segunda escrita concorrente falha
+// NA HORA com SQLITE_BUSY — e "na hora" aqui significa em microssegundos, por uma
+// disputa que teria acabado sozinha em milissegundos.
+const busyTimeout = 5 * time.Second
+
+// Open opens a SQLite database at dsn (e.g. a file path or ":memory:") with foreign
+// keys enabled and a busy timeout. The returned *sql.DB is owned by the caller.
+//
+// A concorrência é deliberada e apertada, por causa de um pagamento real (SIN-69368).
+// Um cartão de R$ 15,00 foi pago, o C6 avisou, e o aviso foi RECUSADO com 500:
+//
+//	mark processed: database is locked (5) (SQLITE_BUSY)
+//
+// A gravação da marca de anti-replay é a primeira coisa dentro da transação de
+// liquidação, e ela esbarrou no trabalhador de entrega de saída, que escreve a cada
+// DOIS segundos. Nenhuma das duas estava errada; o banco é que não tinha instrução para
+// esperar. O pagamento só não se perdeu porque o C6 repetiu o aviso sozinho — sorte,
+// não desenho, e a marca não gravada significava que a repetição seria reprocessada do
+// zero, sem a proteção de anti-replay valer para nada.
+//
+// A correção é o busy_timeout: a escrita ESPERA o lock em vez de desistir. Cinco
+// segundos é ordens de grandeza acima de qualquer transação daqui, então na prática só
+// um travamento de verdade estoura o prazo — e aí falhar é o certo.
+//
+// O pragma vai no DSN, não num Exec: assim vale para TODA conexão que o driver abrir,
+// inclusive uma reaberta depois de a anterior morrer. Um Exec valeria só para a conexão
+// que por acaso o atendeu.
+//
+// NÃO serializamos com SetMaxOpenConns(1), que seria o remédio óbvio. Tentei, e ele
+// TRAVA este código: ListInvoices consulta invoice_items dentro do rows ainda aberto de
+// invoices, e com uma conexão só a consulta de dentro espera para sempre a que a de
+// fora está segurando. Uma conexão única transformaria um erro barulhento numa
+// requisição pendurada, que é troca ruim. Serializar só depois de eliminar as consultas
+// aninhadas — e aí o busy_timeout continua valendo, de graça.
 func Open(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", withBusyTimeout(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -40,6 +74,20 @@ func Open(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 	return db, nil
+}
+
+// withBusyTimeout adds the busy-timeout pragma to a modernc sqlite DSN, preserving any
+// parameters the caller already set. A DSN that already names busy_timeout is left
+// alone — quem foi explícito tem a última palavra.
+func withBusyTimeout(dsn string) string {
+	if strings.Contains(dsn, "busy_timeout") {
+		return dsn
+	}
+	pragma := fmt.Sprintf("_pragma=busy_timeout(%d)", busyTimeout.Milliseconds())
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + pragma
+	}
+	return dsn + "?" + pragma
 }
 
 // Migrate applies every *.up.sql file from the given filesystem in lexical order,
