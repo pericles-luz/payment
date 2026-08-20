@@ -40,6 +40,8 @@ func TestWebhookAcceptsLiveC6PixNotification(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	_, txID := seedCharge(t, f)
+	// O banco confirma o pagamento: é a única situação em que o C6 avisa.
+	f.bank.MarkSettled(f.tenantID, txID)
 
 	rec := postRaw(t, f.handler, "/webhooks/c6/"+webhookRef, liveC6PixBody(txID))
 	if rec.Code != http.StatusAccepted {
@@ -54,6 +56,8 @@ func TestWebhookRoutesPixWithoutServiceField(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	_, txID := seedCharge(t, f)
+	// O banco confirma o pagamento: é a única situação em que o C6 avisa.
+	f.bank.MarkSettled(f.tenantID, txID)
 
 	body := []byte(`{"pix":[{"endToEndId":"E0041696820260819AAAA","txid":"` + txID + `"}]}`)
 	if rec := postRaw(t, f.handler, "/webhooks/c6/"+webhookRef, body); rec.Code != http.StatusAccepted {
@@ -67,6 +71,8 @@ func TestWebhookPrefersTxIDOverEndToEndID(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	_, txID := seedCharge(t, f)
+	// O banco confirma o pagamento: é a única situação em que o C6 avisa.
+	f.bank.MarkSettled(f.tenantID, txID)
 
 	// The e2e here belongs to no payment. If it were used as the reconcile key the
 	// lookup would miss and this would not settle.

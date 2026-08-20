@@ -94,3 +94,47 @@ func TestWebhookEntregaRepetidaDepoisDeLiquidarContinuaSendoNoOp(t *testing.T) {
 		t.Fatalf("status = %v, want paid", reloaded.Status())
 	}
 }
+
+// O aviso que AFIRMA liquidação e que a leitura ainda não confirma NÃO pode ser
+// confirmado ao PSP.
+//
+// É a outra metade do incidente, e a que mais importa: o C6 entrega UMA vez e não
+// reenvia o que foi confirmado com 2xx. Responder "recebi e tratei" nessa janela é a
+// última notícia que teremos daquele pagamento — foi assim que três PIX reais de
+// R$ 1,00 entraram na conta e nunca liquidaram.
+//
+// Devolver erro faz o PSP reentregar, e na reentrega a leitura já concorda.
+func TestWebhookAvisoDeLiquidacaoNaoConfirmadaDevolveErro(t *testing.T) {
+	t.Parallel()
+	h, deps, tenantID := settleDivergenceHarness(t)
+
+	charges := app.NewChargeService(deps)
+	p, err := charges.CreateCharge(context.Background(), app.CreateChargeInput{
+		TenantID: tenantID, Endpoint: "pix.create", AmountCents: 100, Currency: "BRL", IdempotencyKey: "k-lag",
+	})
+	if err != nil {
+		t.Fatalf("create charge: %v", err)
+	}
+
+	wh := app.NewWebhookService(deps)
+	ev := app.PaymentEvent{
+		TenantID: tenantID, TxID: p.TxID(), EventKey: p.TxID() + "|pix|",
+		ClaimsSettlement: true, // o aviso trouxe um PIX recebido
+	}
+
+	// A cobrança ainda não consta paga: o aviso NÃO pode ser confirmado.
+	if err := wh.HandlePaymentEvent(context.Background(), ev); err == nil {
+		t.Fatal("o aviso foi confirmado sem a liquidação estar visível — o PSP não vai " +
+			"reenviar, e o pagamento se perde")
+	}
+
+	// O banco alcança, e a reentrega liquida.
+	h.bank.MarkSettled(tenantID, p.TxID())
+	if err := wh.HandlePaymentEvent(context.Background(), ev); err != nil {
+		t.Fatalf("reentrega deveria liquidar, got %v", err)
+	}
+	reloaded, _ := charges.GetPayment(context.Background(), tenantID, p.ID())
+	if reloaded.Status() != payment.StatusPaid {
+		t.Fatalf("status = %v, want paid", reloaded.Status())
+	}
+}

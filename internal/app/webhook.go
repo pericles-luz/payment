@@ -75,6 +75,15 @@ type PaymentEvent struct {
 	TenantID string
 	TxID     string
 	EventKey string
+	// ClaimsSettlement diz que o AVISO afirma que houve pagamento — por exemplo, um
+	// aviso PIX que traz o array de pix recebidos.
+	//
+	// NÃO é usado para liquidar: a decisão continua vindo da leitura autoritativa no
+	// banco. É usado para decidir o que fazer quando as duas discordam. O PSP avisa
+	// no instante em que o dinheiro entra, e o estado da cobrança dele leva alguns
+	// segundos para refletir isso; confirmar o aviso nessa janela perde o pagamento
+	// para sempre, porque ele não reenvia o que já foi confirmado.
+	ClaimsSettlement bool
 }
 
 // reconcileFunc reconciles the authoritative state of the resource named by a webhook
@@ -133,6 +142,11 @@ func (s *WebhookService) reconcileCheckout(ctx context.Context, tenantID, sessio
 // ponto onde é devolvido: manter a marca aqui já custou um pagamento real.
 var errNotYetPayable = errors.New("cobrança ainda não paga")
 
+// errSettlementLag é o aviso de liquidação que a leitura autoritativa ainda não
+// confirma. Diferente de errNotYetPayable, ele PRECISA chegar como erro ao PSP: é o
+// que provoca a reentrega, e sem reentrega o pagamento se perde.
+var errSettlementLag = errors.New("liquidação anunciada ainda não visível na cobrança")
+
 // settle reconciles and settles a payment. Duplicate deliveries are acked without side
 // effects. The webhook payload is never trusted as financial truth — settlement
 // requires a positive reconciliation (via reconcile) with the bank.
@@ -183,6 +197,24 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 			return fmt.Errorf("reconcile charge: %w", err)
 		}
 		if !strings.EqualFold(res.Status, bankStatusPaid) {
+			// O aviso AFIRMA que houve pagamento e a leitura ainda não concorda.
+			//
+			// Isto não é caso raro: o C6 avisa no instante em que o PIX entra, e a
+			// cobrança dele leva segundos para virar CONCLUIDA. Aconteceu em TRÊS
+			// pagamentos reais seguidos — 100% das vezes, não uma corrida infeliz.
+			//
+			// Confirmar aqui perde o dinheiro. O C6 entrega UMA vez e não reenvia o
+			// que foi confirmado com 2xx, então um "recebi e tratei" prematuro é a
+			// última notícia que teremos daquele pagamento. Devolver erro faz o PSP
+			// reentregar, e na reentrega a leitura já concorda.
+			//
+			// A marca de anti-replay também não sobrevive: o erro desfaz a transação
+			// inteira, então a reentrega é processada de verdade em vez de ser
+			// descartada como repetida.
+			if ev.ClaimsSettlement {
+				return fmt.Errorf("aviso afirma pagamento mas a cobrança ainda não consta paga (status %q): %w",
+					res.Status, errSettlementLag)
+			}
 			// NOT yet payable — and this is NOT a terminal outcome, so the anti-replay
 			// key must NOT survive. Rolling the unit of work back discards MarkProcessed
 			// and lets a later delivery of the same event be processed again.

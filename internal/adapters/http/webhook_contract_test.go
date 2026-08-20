@@ -27,6 +27,9 @@ func TestWebhookAcceptsDocumentedProprietaryEnvelope(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	_, txID := seedCharge(t, f)
+	// O banco confirma o pagamento: é a única situação em que o C6 avisa, e desde
+	// SIN-69580 um aviso de liquidação que a leitura não confirma NÃO é confirmado.
+	f.bank.MarkSettled(f.tenantID, txID)
 
 	// Exactly the documented fields — including date_time and partner_id, whose mere
 	// presence used to produce a 400.
@@ -48,6 +51,9 @@ func TestWebhookToleratesUnknownFields(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	_, txID := seedCharge(t, f)
+	// O banco confirma o pagamento: é a única situação em que o C6 avisa, e desde
+	// SIN-69580 um aviso de liquidação que a leitura não confirma NÃO é confirmado.
+	f.bank.MarkSettled(f.tenantID, txID)
 
 	body := map[string]any{
 		"external_id":    txID,
@@ -109,6 +115,9 @@ func TestWebhookResolvesPixEndToEndID(t *testing.T) {
 			t.Parallel()
 			f := newFixture(t)
 			_, txID := seedCharge(t, f)
+			// O banco confirma o pagamento: é a única situação em que o C6 avisa, e desde
+			// SIN-69580 um aviso de liquidação que a leitura não confirma NÃO é confirmado.
+			f.bank.MarkSettled(f.tenantID, txID)
 			rec := do(t, f.handler, http.MethodPost, "/webhooks/c6/"+webhookRef, "", nil, tc.body(txID))
 			if rec.Code != http.StatusAccepted {
 				t.Fatalf("want 202, got %d (%s)", rec.Code, rec.Body.String())
