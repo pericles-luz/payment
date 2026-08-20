@@ -41,3 +41,4 @@ go.work.sum
 
 # binario compilado da ferramenta de diagnostico (nao versionar)
 /c6-webhook-probe
+build/
