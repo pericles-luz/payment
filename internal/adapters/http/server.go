@@ -10,6 +10,7 @@ import (
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/adminweb"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
+	"github.com/ia-dev-sindireceita/payment/internal/ports"
 	"github.com/ia-dev-sindireceita/payment/internal/version"
 )
 
@@ -91,6 +92,10 @@ type Server struct {
 	// never affects the write response. When nil (stub bank / feature not wired) the
 	// self-serve write paths skip the registration entirely. See Config.WebhookRegistrar.
 	webhookReg WebhookInFlowRegistrar
+	// bankCaps answers which payment methods a tenant's bank credential authorises, so
+	// an empresa-cliente can configure only what its conta actually contratou. Optional:
+	// nil makes GET /v1/bank-capabilities answer 503 rather than guess.
+	bankCaps ports.BankCapabilityReader
 }
 
 // WebhookInFlowRegistrar is the narrow slice of app.WebhookRegistrationService the
@@ -225,6 +230,9 @@ type Config struct {
 	// nil (stub bank / feature not wired, e.g. tests and stub deployments) the self-serve
 	// write paths skip the registration entirely.
 	WebhookRegistrar WebhookInFlowRegistrar
+	// BankCapabilities resolves a tenant's authorised payment methods from the bank.
+	// Optional; nil disables GET /v1/bank-capabilities (503).
+	BankCapabilities ports.BankCapabilityReader
 }
 
 // NewServer builds a Server from its config.
@@ -257,6 +265,7 @@ func NewServer(c Config) *Server {
 		clientProvisioner:      c.ClientProvisioner,
 		accountOutboundWebhook: c.AccountOutboundWebhook,
 		webhookReg:             c.WebhookRegistrar,
+		bankCaps:               c.BankCapabilities,
 	}
 }
 
@@ -443,6 +452,12 @@ func (s *Server) Router() http.Handler {
 			// The tenant is derived from the credential, never the query — no parameter
 			// selects which tenant's extrato is read (threat H1/P1).
 			r.Get("/statement", s.handleGetStatement)
+
+			// Capacidades do banco por tenant (SIN-69368). Deliberadamente FORA da flag de
+			// intake self-serve: aquela flag protege ESCRITAS de segredo, e esta é uma
+			// leitura que a loja precisa para montar a tela de pagamento. Prendê-la à mesma
+			// flag faria a tela depender de uma chave que existe por outro motivo.
+			r.Get("/bank-capabilities", s.handleTenantBankCapabilities)
 
 			// Self-serve credential intake (SIN-69196 / trilha E2, flag-gated). An
 			// empresa-cliente rotates its OWN bank credential with its tenant token; the

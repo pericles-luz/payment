@@ -29,6 +29,10 @@ const fallbackTokenTTL = 60 * time.Second
 type cachedToken struct {
 	accessToken string
 	expiresAt   time.Time
+	// scope is the space-separated list the PSP actually GRANTED. It is not
+	// necessarily what we asked for: C6 grants what the conta contratou, so this is
+	// the only honest source for "esta empresa pode cobrar por cartão?" (SIN-69368).
+	scope string
 }
 
 // tokenState is the per-tenant cache slot. Its own mutex serializes refreshes for
@@ -113,6 +117,37 @@ func (m *tokenManager) token(ctx context.Context, tenantID string) (string, erro
 	return tok.accessToken, nil
 }
 
+// grantedScopes returns the scopes the PSP GRANTED this tenant, as a set. It reuses the
+// token cache, so asking costs a network round trip only when the token is stale — the
+// scopes ride along on a fetch that would happen anyway.
+//
+// O que a empresa PEDE e o que a conta dela TEM são coisas diferentes. Descobrimos do
+// jeito caro: a conta da empresa 27 não tinha o produto Checkout, e a única evidência
+// era o C6 responder 403 no meio de uma compra. O escopo concedido diz isso ANTES, e é
+// o que permite a tela de configuração explicar em vez de deixar o comprador tropeçar.
+func (m *tokenManager) grantedScopes(ctx context.Context, tenantID string) (map[string]struct{}, error) {
+	st := m.stateFor(tenantID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.tok.accessToken == "" || !m.now().Before(st.tok.expiresAt.Add(-m.skew)) {
+		cred, err := m.creds.GetBankCredential(ctx, tenantID, m.bankID)
+		if err != nil {
+			return nil, err
+		}
+		tok, err := m.fetch(withTenant(ctx, tenantID), cred)
+		if err != nil {
+			return nil, err
+		}
+		st.tok = tok
+	}
+	out := make(map[string]struct{})
+	for _, sc := range strings.Fields(st.tok.scope) {
+		out[strings.ToLower(sc)] = struct{}{}
+	}
+	return out, nil
+}
+
 // invalidate drops any cached token for tenantID so the next token() call mints a
 // fresh one under the tenant's current credential. It is the eviction half of the
 // token-revocation-lag fix (ADR-0003): a rotated/revoked credential takes effect
@@ -141,6 +176,7 @@ type tokenResponse struct {
 	AccessToken string `json:"access_token"`
 	TokenType   string `json:"token_type"`
 	ExpiresIn   int64  `json:"expires_in"`
+	Scope       string `json:"scope"`
 }
 
 // fetch performs the OAuth2 client_credentials grant. The secret travels only in
@@ -182,5 +218,5 @@ func (m *tokenManager) fetch(ctx context.Context, cred ports.BankCredential) (ca
 	if ttl <= 0 {
 		ttl = fallbackTokenTTL
 	}
-	return cachedToken{accessToken: tr.AccessToken, expiresAt: m.now().Add(ttl)}, nil
+	return cachedToken{accessToken: tr.AccessToken, expiresAt: m.now().Add(ttl), scope: tr.Scope}, nil
 }

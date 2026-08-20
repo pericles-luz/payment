@@ -474,6 +474,30 @@ type CredentialDeleter interface {
 	DeleteBankCredential(ctx context.Context, tenantID, bankID string) error
 }
 
+// BankCapabilities says which payment methods a tenant's bank credential ACTUALLY
+// authorises. It is deliberately in OUR vocabulary, not the PSP's: a bank grants
+// whatever the conta contratou, under its own scope names, and the adapter translates.
+// Adding a second bank means a new translation, not a new concept here.
+type BankCapabilities struct {
+	// PIX reports whether the credential may create and read PIX charges.
+	PIX bool
+	// Card reports whether it may open the hosted card checkout.
+	Card bool
+}
+
+// BankCapabilityReader resolves a tenant's BankCapabilities from the bank.
+//
+// Existe porque o que a empresa PEDE e o que a conta dela TEM são coisas diferentes, e
+// descobrir a diferença no meio de uma compra é o pior lugar possível: a conta de uma
+// empresa não tinha o produto Checkout contratado, e a única evidência foi o C6
+// responder 403 quando o comprador já estava com o cartão na mão (SIN-69368). Lido
+// ANTES, o mesmo fato vira um aviso na tela de configuração.
+type BankCapabilityReader interface {
+	// BankCapabilities returns what tenantID's credential authorises. A tenant with no
+	// credential surfaces shared.ErrNotFound — "não configurado", not "não pode".
+	BankCapabilities(ctx context.Context, tenantID string) (BankCapabilities, error)
+}
+
 // CreditorKeySharingLookup answers WHICH tenants already hold a given bank identity.
 // It exists to keep one invariant: a PIX creditor key, and the C6 account behind a
 // client_id, belong to ONE active empresa at a time.

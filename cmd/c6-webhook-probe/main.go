@@ -209,6 +209,20 @@ func run() error {
 			base+"/v2/pix/webhook/"+url.PathEscape(cred.CreditorKey), token, nil, "application/json")
 	}
 
+	// --webhook-servico <SERVICO>: READ the callback C6 currently holds for a
+	// C6-PROPRIETARY service channel (CHECKOUT is the one that carries a CARD payment
+	// notification). Read-only, like --webhook-atual.
+	//
+	// Existe porque este canal é registrado pela CONTA por trás do client_id, não pela
+	// chave PIX — então --webhook-atual não o enxerga. E porque a varredura de renovação
+	// foi desligada: ninguém mais reconfere sozinho se ele continua de pé.
+	if len(os.Args) > 3 && os.Args[2] == "--webhook-servico" {
+		svc := strings.ToUpper(strings.TrimSpace(os.Args[3]))
+		section("GET /v1/webhooks?service=" + svc)
+		return call(ctx, httpc, http.MethodGet,
+			base+"/v1/webhooks?service="+url.QueryEscape(svc), token, nil, "application/json")
+	}
+
 	// --parcelas <n>: open ONE hosted checkout with a ceiling of n parcelas and a
 	// LONG expiry, so a human has time to open the page and answer the one question
 	// the wire cannot: does the page offer a CHOICE of parcelas up to n, or does it
