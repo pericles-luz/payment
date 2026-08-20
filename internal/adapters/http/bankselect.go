@@ -114,7 +114,7 @@ func bankRouteMiddleware(resolver *BankResolver) func(http.Handler) http.Handler
 			tenantID := tenantFromContext(r.Context())
 			bankID, err := resolver.Resolve(r.Context(), tenantID, r.Header.Get("X-Bank-Id"))
 			if err != nil {
-				writeDomainError(w, err)
+				writeDomainError(w, r, err)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(bankctx.WithBankID(r.Context(), bankID)))
@@ -136,7 +136,7 @@ func (s *Server) rebindBank(w http.ResponseWriter, r *http.Request, bodyBank str
 	}
 	bankID, err := s.bankResolver.Resolve(r.Context(), tenantFromContext(r.Context()), bodyBank)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return r, false
 	}
 	return r.WithContext(bankctx.WithBankID(r.Context(), bankID)), true

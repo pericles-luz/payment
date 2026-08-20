@@ -109,7 +109,7 @@ func (s *Server) handleProvisionClient(w http.ResponseWriter, r *http.Request) {
 		t, err = s.clientProvisioner.ProvisionClient(r.Context(), accountID, req.Name, idemKey)
 	}
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	view := clientView{TenantID: t.ID(), AccountID: t.AccountID(), Name: t.Name()}

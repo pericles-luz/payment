@@ -133,7 +133,7 @@ func (s *Server) mintAccountKey(w http.ResponseWriter, r *http.Request, accountI
 		return
 	}
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	// 201 Created + the plaintext, ONCE. No read endpoint, no second response shape

@@ -100,7 +100,7 @@ func (s *Server) handleCreatePix(w http.ResponseWriter, r *http.Request) {
 	}
 	p, qr, err := s.pix.CreateImmediateCharge(r.Context(), in)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, toPixChargeView(qr, p.Amount().Cents()))
@@ -111,7 +111,7 @@ func (s *Server) handleGetPix(w http.ResponseWriter, r *http.Request) {
 	txID := chi.URLParam(r, "txid")
 	qr, err := s.pix.GetImmediateCharge(r.Context(), tenantID, txID)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toPixChargeView(qr, qr.ExpectedAmountCents))
@@ -159,7 +159,7 @@ func (s *Server) handleListPix(w http.ResponseWriter, r *http.Request) {
 		PageSize: pageSize,
 	})
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 

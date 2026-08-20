@@ -198,7 +198,7 @@ func (s *Server) handleCreateBoleto(w http.ResponseWriter, r *http.Request) {
 
 	p, res, err := s.boleto.RegisterBoleto(r.Context(), in)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, toBoletoView(res, p.Amount().Cents()))
@@ -209,7 +209,7 @@ func (s *Server) handleGetBoleto(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	res, err := s.boleto.GetBoleto(r.Context(), tenantID, id)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toBoletoView(res, res.AmountCents))
@@ -221,7 +221,7 @@ func (s *Server) handleDeleteBoleto(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	id := chi.URLParam(r, "id")
 	if err := s.boleto.CancelBoleto(r.Context(), tenantID, id); err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -270,7 +270,7 @@ func (s *Server) handleUpdateBoleto(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.boleto.UpdateBoleto(r.Context(), tenantID, id, in)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toBoletoView(res, res.AmountCents))

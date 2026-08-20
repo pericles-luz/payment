@@ -96,7 +96,7 @@ func (s *Server) handleCreateCheckout(w http.ResponseWriter, r *http.Request) {
 
 	p, res, err := s.checkout.CreateSession(r.Context(), in)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, checkoutSessionView{
@@ -118,7 +118,7 @@ func (s *Server) handleGetCheckout(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	res, err := s.checkout.GetSession(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toCheckoutSessionView(res))
@@ -131,7 +131,7 @@ func (s *Server) handleCancelCheckout(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	res, err := s.checkout.CancelSession(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toCheckoutSessionView(res))
