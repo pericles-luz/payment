@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
+	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/webhookref"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
@@ -57,6 +58,13 @@ type WebhookRegistrationService struct {
 	refs         webhookRefLookup
 	baseURL      string
 	logger       *slog.Logger
+	tenants      tenantActiveLookup
+}
+
+// tenantActiveLookup is the narrow slice of ports.TenantRepository this service needs:
+// resolve a tenant so its ACTIVE flag can be read. ports.TenantRepository satisfies it.
+type tenantActiveLookup interface {
+	FindTenantByID(ctx context.Context, id string) (*tenant.Tenant, error)
 }
 
 // webhookRefLookup is the narrow slice of ports.WebhookRefStore the idempotency gate
@@ -136,6 +144,17 @@ func (s *WebhookRegistrationService) WithRefLookup(refs webhookRefLookup) *Webho
 	return s
 }
 
+// WithTenants wires the tenant reader so registration is gated on the tenant still
+// being ACTIVE. Optional, following WithRefLookup: unwired, the gate is inert and
+// behaviour is exactly the historical one — but cmd/api DOES wire it, and a deployment
+// without it keeps the defect described in tenantMayRegister.
+func (s *WebhookRegistrationService) WithTenants(t tenantActiveLookup) *WebhookRegistrationService {
+	if s != nil {
+		s.tenants = t
+	}
+	return s
+}
+
 // WithRecurrenceRegistrar adds the two BACEN recurrence channels (mandate + recurring
 // charge) to the set registered in-flow. Optional: unwired, those channels are simply not
 // part of the tenant's channel set, and behaviour is exactly as before.
@@ -190,6 +209,10 @@ func (s *WebhookRegistrationService) TryRegister(ctx context.Context, tenantID s
 	}
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
+		return
+	}
+
+	if !s.tenantMayRegister(ctx, tenantID) {
 		return
 	}
 
@@ -264,6 +287,49 @@ func (s *WebhookRegistrationService) TryRegister(ctx context.Context, tenantID s
 		return
 	}
 	s.logger.InfoContext(ctx, "webhook in-flow registration: registered and confirmed", attrs...)
+}
+
+// tenantMayRegister reports whether the webhook machinery may act on tenantID's behalf.
+// A SUSPENDED tenant must not — it is not merely idle, it actively causes harm.
+//
+// A empresa 27 e um tenant suspenso foram configurados com a MESMA chave PIX. No C6 o
+// webhook é registrado por chave, com uma URL só por chave: os dois se sobrescreviam a
+// cada 60 segundos, cada varredura cunhando um ref novo que aposentava o anterior. O
+// aviso de pagamento chegava pelo ref de quem tinha vencido o último registro, era
+// recusado (o txid não é daquele tenant, e recusar fechado está certo), e a liquidação
+// passava a depender da varredura em vez do webhook. O suspenso não tinha nada a
+// registrar e mesmo assim disputava — e cada rodada gastava chamadas cobradas do PSP.
+//
+// A varredura enumera por PRESENÇA DE CREDENCIAL (SELECT ... FROM bank_credentials),
+// que nada diz sobre o tenant estar ativo; suspender não removia a credencial. Este é o
+// ponto de estrangulamento das duas entradas — a varredura e o registro em fluxo — então
+// o portão fica aqui, e não na consulta, para não espalhar a política por duas camadas.
+//
+// Falha fechado: um tenant que não conseguimos confirmar como ativo não registra. Um
+// erro transitório apenas adia para a próxima varredura, 60 segundos depois.
+func (s *WebhookRegistrationService) tenantMayRegister(ctx context.Context, tenantID string) bool {
+	if s.tenants == nil {
+		// Wiring sem o leitor de tenants (testes antigos, adaptadores parciais): portão
+		// inerte, comportamento histórico preservado.
+		return true
+	}
+	t, err := s.tenants.FindTenantByID(ctx, tenantID)
+	if err != nil {
+		if !errors.Is(err, shared.ErrNotFound) {
+			s.logger.WarnContext(ctx, "webhook in-flow registration: tenant lookup failed",
+				slog.String("tenant_id", tenantID), slog.String("error", err.Error()))
+		}
+		return false
+	}
+	if !t.Active() {
+		// Debug, não Info: um tenant suspenso com credencial repetiria esta linha a cada
+		// varredura, para sempre. Depois da correção, o sinal em produção é a AUSÊNCIA
+		// das linhas de registro dele.
+		s.logger.DebugContext(ctx, "webhook in-flow registration: skipped, tenant is not active",
+			slog.String("tenant_id", tenantID))
+		return false
+	}
+	return true
 }
 
 // webhookChannel is one PSP notification channel. All of a tenant's channels point at the
