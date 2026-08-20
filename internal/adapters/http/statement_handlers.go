@@ -61,7 +61,7 @@ func (s *Server) handleGetStatement(w http.ResponseWriter, r *http.Request) {
 		End:      end,
 	})
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 

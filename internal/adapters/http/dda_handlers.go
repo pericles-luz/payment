@@ -68,12 +68,12 @@ type removeDDAItemsRequest struct {
 // (trimming or submitting a frozen/approved group) is a 409 Conflict — the request is
 // well-formed but the resource is not in a state that permits it. Everything else falls
 // through to the shared mapping (validation→400, not-found→404, etc.).
-func writeDDAError(w http.ResponseWriter, err error) {
+func writeDDAError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, shared.ErrInvalidTransition) {
 		writeError(w, http.StatusConflict, "conflict")
 		return
 	}
-	writeDomainError(w, err)
+	writeDomainError(w, r, err)
 }
 
 // handleListDDABoletos returns the boletos open in the authenticated tenant's DDA
@@ -82,7 +82,7 @@ func (s *Server) handleListDDABoletos(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	boletos, err := s.dda.ListOpenBoletos(r.Context(), tenantID)
 	if err != nil {
-		writeDDAError(w, err)
+		writeDDAError(w, r, err)
 		return
 	}
 	out := make([]ddaBoletoView, len(boletos))
@@ -117,7 +117,7 @@ func (s *Server) handleCreateDDAGroup(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: idemKey,
 	})
 	if err != nil {
-		writeDDAError(w, err)
+		writeDDAError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, toDDAGroupView(group))
@@ -130,7 +130,7 @@ func (s *Server) handleGetDDAGroupItems(w http.ResponseWriter, r *http.Request) 
 	tenantID := tenantFromContext(r.Context())
 	items, err := s.dda.GetPaymentGroupItems(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		writeDDAError(w, err)
+		writeDDAError(w, r, err)
 		return
 	}
 	out := make([]ddaItemView, len(items))
@@ -150,7 +150,7 @@ func (s *Server) handleRemoveDDAGroupItems(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := s.dda.RemovePaymentGroupItems(r.Context(), tenantID, chi.URLParam(r, "id"), req.ItemIDs); err != nil {
-		writeDDAError(w, err)
+		writeDDAError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -161,7 +161,7 @@ func (s *Server) handleRemoveDDAGroupItems(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleRemoveDDAGroupItem(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	if err := s.dda.RemovePaymentGroupItem(r.Context(), tenantID, chi.URLParam(r, "id"), chi.URLParam(r, "itemID")); err != nil {
-		writeDDAError(w, err)
+		writeDDAError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -178,7 +178,7 @@ func (s *Server) handleSubmitDDAGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.dda.SubmitPaymentGroup(r.Context(), tenantID, chi.URLParam(r, "id"), idemKey); err != nil {
-		writeDDAError(w, err)
+		writeDDAError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

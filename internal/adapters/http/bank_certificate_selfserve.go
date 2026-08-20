@@ -59,7 +59,7 @@ func (s *Server) handleTenantSetBankCertificate(w http.ResponseWriter, r *http.R
 	}
 	meta, err := s.admin.SetBankCertificateSelfServe(r.Context(), tenantID, bank, req.CertPEM, req.KeyPEM)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	// The mTLS cert is what lets the live C6 handshake succeed, so a cert write can be

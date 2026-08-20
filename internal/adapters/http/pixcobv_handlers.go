@@ -125,7 +125,7 @@ func (s *Server) handleCreatePixCobV(w http.ResponseWriter, r *http.Request) {
 
 	p, res, err := s.pixCobV.CreateDueCharge(r.Context(), toDueChargeInput(tenantID, accountFromContext(r.Context()), idemKey, req, due))
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, toCobvView(res, p.Amount().Cents()))
@@ -136,7 +136,7 @@ func (s *Server) handleGetPixCobV(w http.ResponseWriter, r *http.Request) {
 	txID := chi.URLParam(r, "txid")
 	res, err := s.pixCobV.GetDueCharge(r.Context(), tenantID, txID)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toCobvView(res, res.ExpectedAmountCents))
@@ -162,7 +162,7 @@ func (s *Server) handleUpdatePixCobV(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.pixCobV.UpdateDueCharge(r.Context(), tenantID, txID, toDueChargeInput(tenantID, accountFromContext(r.Context()), idemKey, req, due))
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toCobvView(res, res.ExpectedAmountCents))

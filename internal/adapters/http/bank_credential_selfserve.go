@@ -71,7 +71,7 @@ func (s *Server) handleTenantSetBankCredential(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := s.admin.SetBankCredentialSelfServe(r.Context(), tenantID, bank, req.ClientID, req.Secret); err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	// A credential write may complete the cred+PIX-key pair — attempt the in-flow C6

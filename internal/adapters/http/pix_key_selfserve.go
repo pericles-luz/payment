@@ -48,7 +48,7 @@ func (s *Server) handleTenantSetCreditorKey(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := s.console.SetCreditorKeySelfServe(r.Context(), tenantID, req.CreditorKey); err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	// Registering the key may complete the credential+key pair — the same in-flow C6

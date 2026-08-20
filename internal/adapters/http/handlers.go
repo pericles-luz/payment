@@ -98,7 +98,7 @@ func (s *Server) handleCreateCharge(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: idemKey,
 	})
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, toPaymentView(p))
@@ -109,7 +109,7 @@ func (s *Server) handleGetCharge(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	p, err := s.charges.GetPayment(r.Context(), tenantID, id)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toPaymentView(p))
@@ -134,7 +134,7 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	t, err := s.admin.CreateTenant(r.Context(), req.Name)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, tenantView{ID: t.ID(), Name: t.Name(), Active: t.Active()})
@@ -159,7 +159,7 @@ func (s *Server) handleSetPrice(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := s.admin.SetEndpointPrice(r.Context(), tenantID, req.Endpoint, req.PriceCents)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, priceView{TenantID: p.TenantID(), Endpoint: p.Endpoint(), PriceCents: p.PriceCents()})
@@ -201,7 +201,7 @@ func (s *Server) handleSetBankCredential(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.admin.SetBankCredential(r.Context(), tenantID, bank, req.ClientID, req.Secret); err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	// A credential write may complete the cred+PIX-key pair — attempt the in-flow C6
@@ -259,7 +259,7 @@ func (s *Server) handleSetBankCertificate(w http.ResponseWriter, r *http.Request
 	}
 	meta, err := s.admin.SetBankCertificate(r.Context(), tenantID, bank, req.CertPEM, req.KeyPEM)
 	if err != nil {
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	// A certificate write may complete the mTLS half needed to reach C6 — attempt the
@@ -591,7 +591,7 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 		// A handler failure (the 500s observed in production) is as opaque as a
 		// rejection without the body that caused it, so it logs the same way.
 		s.logWebhookReject(r.Context(), id.TenantID, "handler_failed", raw, err)
-		writeDomainError(w, err)
+		writeDomainError(w, r, err)
 		return
 	}
 	s.logWebhookAccepted(r.Context(), id.TenantID, eventKey, raw)
