@@ -726,8 +726,9 @@ func (s *ConsoleService) SetBankCertificate(ctx context.Context, tenantID, bankI
 		// Wrap with non-sensitive context only; never include key material.
 		return ports.BankCertificateMeta{}, fmt.Errorf("set bank certificate: %w", err)
 	}
-	// Evict any cached transport/token state keyed on the tenant credential so the
-	// certificate rotation takes effect without waiting out a cache TTL (ADR-0003).
+	// Evict the tenant's cached token AND its pooled mTLS connections, so the
+	// certificate just written is the one presented on the next handshake (ADR-0003,
+	// SIN-69368) instead of only after the next restart.
 	s.credEvictor.InvalidateToken(tenantID)
 	// Audit the provisioning with who/tenant/bank/fingerprint (never the key).
 	// Fail-closed: a forensic-record error surfaces rather than dropping the trail.

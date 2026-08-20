@@ -18,9 +18,9 @@ import (
 // LoadTLSCertificate method: the private key is re-assembled inside the adapter and
 // handed back only inside the opaque *tls.Certificate — it never crosses this
 // boundary as raw PEM, preserving the vault's write-only-key posture. A missing
-// (tenantID, bankID) pair returns shared.ErrNotFound so the transport can fall back
-// to the bootstrap (path §8) certificate. Both secret.CertStore and
-// sqlite.CertificateVault satisfy it.
+// (tenantID, bankID) pair returns shared.ErrNotFound, and the transport then presents
+// NO certificate for that tenant — never another identity's. Both secret.CertStore
+// and sqlite.CertificateVault satisfy it.
 type CertProvider interface {
 	LoadTLSCertificate(ctx context.Context, tenantID, bankID string) (*tls.Certificate, error)
 }
@@ -90,13 +90,11 @@ func MTLSHTTPClient(certPath, keyPath string, timeout time.Duration) (*http.Clie
 // that tenant; connections are therefore never shared across tenants. The number of
 // transports is bounded by the number of tenants that actually transact with C6.
 //
-// Fallback (env-as-bootstrap, mirrors the credential vault): when a tenant has no
-// vault row the transport falls back to the certificate loaded from the §8 path
-// (fallbackCertPath/fallbackKeyPath). A load failure of those paths fails the boot
-// closed (explicit error), exactly as MTLSHTTPClient does. When BOTH paths are empty
-// there is no bootstrap cert; a tenant without a vault row then presents no client
-// certificate (C6 rejects the handshake), preserving the prior "no cert configured"
-// behaviour rather than silently trusting a wrong identity.
+// Bootstrap (fallbackCertPath/fallbackKeyPath): the certificate loaded from the §8
+// path serves ONLY requests that carry no tenant at all. A load failure of those paths
+// fails the boot closed (explicit error), exactly as MTLSHTTPClient does. A tenant
+// WITHOUT a vault row never reaches it: it presents no client certificate and C6
+// rejects the handshake. See clientCertFor for why that is the only safe outcome.
 //
 // Rotation: GetClientCertificate re-reads the vault on each new handshake, so a
 // rotated certificate (self-serve PUT) is picked up on the next new connection
@@ -167,10 +165,50 @@ func (m *mtlsRoundTripper) transportFor(tenantID string) *http.Transport {
 	return tr
 }
 
+// dropTenant discards tenantID's transport and closes the connections it pooled, so
+// the tenant's NEXT request dials fresh and re-reads the vault. The certificate write
+// paths call it through InvalidateToken.
+//
+// Sem isso, gravar um certificado não chega ao fio. O pool do Go reaproveita uma
+// conexão já estabelecida sem repetir GetClientCertificate, e a varredura de webhook,
+// de 60 em 60 segundos, mantém essa conexão abaixo do tempo ocioso de 90 — ela nunca
+// expira sozinha. O comentário de rotação acima só é verdade porque este método
+// existe: "pega na próxima conexão nova" não vale nada se conexão nova nunca houver.
+//
+// Seguro para um tenant desconhecido (nada a fazer) e para chamada concorrente com
+// uma requisição em voo: a requisição em voo termina no transporte antigo, e como ele
+// saiu do mapa nenhuma outra o alcança.
+func (m *mtlsRoundTripper) dropTenant(tenantID string) {
+	m.mu.Lock()
+	tr, ok := m.perTenant[tenantID]
+	delete(m.perTenant, tenantID)
+	m.mu.Unlock()
+	if ok {
+		tr.CloseIdleConnections()
+	}
+}
+
 // clientCertFor returns the handshake callback for tenantID: the vault certificate
-// when a row exists, else the bootstrap certificate, else no client certificate. A
-// vault error OTHER than ErrNotFound (e.g. a wrong KEK) fails the handshake closed
-// rather than silently degrading to the bootstrap identity.
+// when a row exists, and NOTHING otherwise. A vault error OTHER than ErrNotFound
+// (e.g. a wrong KEK) fails the handshake closed rather than silently degrading.
+//
+// UM TENANT NUNCA CAI NO CERTIFICADO DE BOOTSTRAP. Ele é a identidade de outra
+// empresa, e apresentá-lo enquanto se age por um tenant é confusão de identidade — o
+// PSP autenticaria o comerciante errado.
+//
+// Isso também causou uma interrupção real (SIN-69368). Um tenant configurado em
+// tempo de execução tem a credencial gravada primeiro e o certificado segundos
+// depois. Nessa janela a varredura de webhook, que roda a cada 60 segundos, já
+// enumera o tenant: ela abriu conexão sob a identidade de bootstrap, e a conexão foi
+// para o pool. O certificado chegar depois não mudou nada — conexão no pool não
+// refaz handshake, e a própria cadência de 60 segundos da varredura a manteve abaixo
+// do tempo ocioso de 90, então ela também nunca expirou. Toda requisição daquele
+// tenant falhou com 500 não mapeado, por mais de uma hora, até um reinício limpar o
+// pool.
+//
+// Falhar o handshake fechado torna essa janela inofensiva: nenhuma conexão é
+// estabelecida, nenhuma vai para o pool, e a primeira requisição depois de o
+// certificado chegar negocia limpo, com a identidade certa.
 func (m *mtlsRoundTripper) clientCertFor(tenantID string) func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 	return func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 		if tenantID != "" {
@@ -179,7 +217,10 @@ func (m *mtlsRoundTripper) clientCertFor(tenantID string) func(*tls.CertificateR
 			case err == nil:
 				return cert, nil
 			case errors.Is(err, shared.ErrNotFound):
-				// No vault row for this tenant — fall through to the bootstrap cert.
+				// Sem certificado para este tenant: NÃO apresenta nenhum. O C6 recusa o
+				// handshake, que é o desfecho certo — melhor falhar agora do que se
+				// autenticar como outra empresa.
+				return &tls.Certificate{}, nil
 			default:
 				return nil, err
 			}

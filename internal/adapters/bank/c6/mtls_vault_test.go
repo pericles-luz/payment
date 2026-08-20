@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -69,15 +70,23 @@ func TestVaultMTLSPresentsTenantCertFromVault(t *testing.T) {
 	}
 }
 
-// TestVaultMTLSFallsBackToPathWhenNoRow: a tenant with no vault row uses the §8 path
-// (bootstrap) certificate — env-as-bootstrap, mirroring the credential vault.
-func TestVaultMTLSFallsBackToPathWhenNoRow(t *testing.T) {
+// TestVaultMTLSNoRowNeverUsesBootstrapCert: um tenant SEM certificado no cofre não
+// apresenta nenhum — nunca o de bootstrap, que é a identidade de outra empresa. O
+// handshake falha, e falhar é o desfecho certo.
+//
+// Isto derrubou o tenant 27 em produção (SIN-69368): entre gravar a credencial e
+// gravar o certificado, 40 segundos, a varredura de webhook abriu conexão sob a
+// identidade de bootstrap e ela ficou no pool. Como a varredura roda a cada 60s e o
+// tempo ocioso é 90s, a conexão errada nunca expirou; o tenant respondeu 500 por mais
+// de uma hora, até o reinício. Sem handshake não há conexão para envenenar o pool.
+func TestVaultMTLSNoRowNeverUsesBootstrapCert(t *testing.T) {
 	t.Parallel()
 	ca := newCA(t)
 	serverCert, _, _ := ca.issue(t, "127.0.0.1", true)
 	srv := mTLSServer(t, ca, serverCert)
 
-	// Bootstrap cert on disk (path §8); the vault is EMPTY for this tenant.
+	// Certificado de bootstrap em disco (caminho §8); o cofre está VAZIO para este
+	// tenant. O de bootstrap é válido para o servidor — se vazasse, a chamada passaria.
 	_, bootCertPEM, bootKeyPEM := ca.issue(t, "bootstrap-client", false)
 	certPath, keyPath := writePEM(t, bootCertPEM, bootKeyPEM)
 	store := secret.NewCertStore()
@@ -89,8 +98,33 @@ func TestVaultMTLSFallsBackToPathWhenNoRow(t *testing.T) {
 	trustVaultServer(t, c, "tenant-without-row", ca)
 
 	resp, err := tenantGet(t, c, srv.URL, "tenant-without-row")
+	if err == nil {
+		defer resp.Body.Close()
+		t.Fatalf("tenant sem certificado próprio conectou (status %d): apresentou a\nidentidade de bootstrap, que pertence a outra empresa", resp.StatusCode)
+	}
+}
+
+// A contrapartida: uma requisição SEM tenant algum continua usando o certificado de
+// bootstrap. É o caminho de infraestrutura (sondagem, registro inicial), e cortá-lo
+// junto quebraria a inicialização.
+func TestVaultMTLSBootstrapStillServesUntenantedRequests(t *testing.T) {
+	t.Parallel()
+	ca := newCA(t)
+	serverCert, _, _ := ca.issue(t, "127.0.0.1", true)
+	srv := mTLSServer(t, ca, serverCert)
+
+	_, bootCertPEM, bootKeyPEM := ca.issue(t, "bootstrap-client", false)
+	certPath, keyPath := writePEM(t, bootCertPEM, bootKeyPEM)
+
+	c, err := NewVaultMTLSClient(secret.NewCertStore(), ports.BankIDC6, certPath, keyPath, 5*time.Second)
 	if err != nil {
-		t.Fatalf("expected the fallback bootstrap cert to connect, got: %v", err)
+		t.Fatalf("NewVaultMTLSClient: %v", err)
+	}
+	trustVaultServer(t, c, "", ca)
+
+	resp, err := tenantGet(t, c, srv.URL, "")
+	if err != nil {
+		t.Fatalf("requisição sem tenant deveria usar o certificado de bootstrap: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -252,4 +286,78 @@ func mTLSServerRecording(t *testing.T, ca *certAuthority, serverCert tls.Certifi
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// TestInvalidateTokenDropsPooledTenantConnection: gravar um certificado novo tem de
+// alcançar o FIO, não só o cofre.
+//
+// O certificado do cliente é escolhido no handshake. Uma conexão que já está no pool
+// não refaz handshake, então continua apresentando o certificado ANTIGO — e a
+// varredura de webhook, de 60 em 60 segundos, mantém essa conexão abaixo do tempo
+// ocioso de 90, de modo que ela nunca expira sozinha. Sem descartar o transporte do
+// tenant, uma rotação só passa a valer no próximo reinício do processo.
+//
+// O teste é sobre a fiação inteira: quem chama é Provider.InvalidateToken, que é o
+// que os dois caminhos de gravação de certificado (admin e self-serve) já invocam.
+func TestInvalidateTokenDropsPooledTenantConnection(t *testing.T) {
+	t.Parallel()
+	ca := newCA(t)
+	serverCert, _, _ := ca.issue(t, "127.0.0.1", true)
+
+	seenCN := make(chan string, 3)
+	srv := mTLSServerRecording(t, ca, serverCert, seenCN)
+
+	const tenant = "tenant-rotativo"
+	store := secret.NewCertStore()
+	_, oldCertPEM, oldKeyPEM := ca.issue(t, "cert-antigo", false)
+	seedCertStore(t, store, tenant, ports.BankIDC6, oldCertPEM, oldKeyPEM)
+
+	c, err := NewVaultMTLSClient(store, ports.BankIDC6, "", "", 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewVaultMTLSClient: %v", err)
+	}
+	trustVaultServer(t, c, tenant, ca)
+
+	p, err := New(Config{BaseURL: srv.URL, TokenURL: srv.URL + "/oauth/token", HTTPClient: c}, oneTenant(tenant, "cli", "seg"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Primeira chamada: estabelece a conexão e a devolve ao pool (corpo drenado).
+	drainTenantGet(t, c, srv.URL, tenant)
+	if cn := <-seenCN; cn != "cert-antigo" {
+		t.Fatalf("primeira conexão: want cert-antigo, got %q", cn)
+	}
+
+	// A empresa envia um certificado novo. O cofre já reflete a troca...
+	_, newCertPEM, newKeyPEM := ca.issue(t, "cert-novo", false)
+	seedCertStore(t, store, tenant, ports.BankIDC6, newCertPEM, newKeyPEM)
+
+	// ...e a eviction que o caminho de gravação dispara tem de derrubar a conexão
+	// antiga junto. Sem isso, a chamada abaixo reaproveita o pool e o servidor
+	// continua vendo cert-antigo.
+	p.InvalidateToken(tenant)
+	trustVaultServer(t, c, tenant, ca) // o transporte é novo: reensina a CA do teste
+
+	drainTenantGet(t, c, srv.URL, tenant)
+	if cn := <-seenCN; cn != "cert-novo" {
+		t.Fatalf("depois da rotação o C6 ainda vê %q: a conexão antiga continuou no\npool e o certificado novo nunca chegou ao fio", cn)
+	}
+}
+
+// drainTenantGet faz o GET com tenant e ESVAZIA o corpo antes de fechar, que é a
+// condição para a conexão voltar ao pool — sem isso o teste não exercitaria reuso.
+func drainTenantGet(t *testing.T, c *http.Client, url, tenantID string) {
+	t.Helper()
+	resp, err := tenantGet(t, c, url, tenantID)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drenar corpo: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", resp.StatusCode)
+	}
 }
