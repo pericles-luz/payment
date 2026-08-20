@@ -605,6 +605,61 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /v1/bank-capabilities:
+    get:
+      operationId: getBankCapabilities
+      tags: [Onboarding]
+      summary: Quais formas de pagamento a conta bancária da própria empresa-cliente autoriza
+      description: |
+        Diz se a credencial bancária desta empresa-cliente autoriza cobrança por **PIX**
+        e por **cartão**, para a loja oferecer só o que o banco vai aceitar.
+
+        Existe por causa de uma compra que falhou no pior lugar possível: a conta de uma
+        empresa não tinha o produto de checkout contratado, nada no sistema sabia disso,
+        a loja mostrou o botão de cartão, e o comprador só descobriu quando o banco
+        recusou — com o cartão na mão. A resposta aqui vem do escopo que o banco
+        **concede** no token, que é o mesmo fato, sabido antes.
+
+        O tenant vem do token; não há seletor no contrato, então um token só enxerga as
+        próprias capacidades.
+
+        `configured: false` significa "esta empresa ainda não tem credencial bancária" —
+        estado normal de quem está configurando, e diferente de "configurou, mas a conta
+        não contratou o produto". As duas situações pedem mensagens diferentes na tela,
+        por isso são campos separados.
+
+        Uma falha ao consultar o banco **não** vira `pode`: sobe como erro, para a tela
+        dizer "não consegui verificar" em vez de habilitar o que seria recusado.
+      security: [{ bearerAuth: [] }, { accountKeyAuth: [] }]
+      responses:
+        "200":
+          description: Capacidades resolvidas
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant_id, configured, pix, card]
+                properties:
+                  tenant_id: { type: string }
+                  configured:
+                    type: boolean
+                    description: false quando a empresa-cliente ainda não tem credencial bancária
+                  pix:
+                    type: boolean
+                    description: a conta autoriza criar cobrança PIX
+                  card:
+                    type: boolean
+                    description: a conta autoriza abrir checkout de cartão
+              examples:
+                semCartao:
+                  summary: Conta com PIX, sem o produto de checkout contratado
+                  value: { tenant_id: "a58d…", configured: true, pix: true, card: false }
+                naoConfigurada:
+                  summary: Empresa-cliente ainda sem credencial
+                  value: { tenant_id: "a58d…", configured: false, pix: false, card: false }
+        "401": { description: Token ausente ou inválido }
+        "503": { description: Consulta de capacidades não disponível nesta implantação }
+
   /v1/pix-key:
     put:
       operationId: setSelfServePixKey
