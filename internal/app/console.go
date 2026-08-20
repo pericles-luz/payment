@@ -59,6 +59,12 @@ type ConsoleService struct {
 	// creds resolves the PIX key the PIX-webhook deregistration is keyed by. It must be
 	// read BEFORE the credential is deleted.
 	creds ports.CredentialStore
+	// sharing answers which OTHER tenants hold the same PIX key / PSP account, so one
+	// empresa can neither take a key another ACTIVE empresa is using nor, on removal,
+	// tear down that empresa's live webhook. Optional: nil leaves the historical
+	// behaviour (no exclusivity check, unconditional deregistration), which keeps
+	// wiring-light tests working — but cmd/api DOES wire it.
+	sharing ports.CreditorKeySharingLookup
 	// invoices is the append-only Fatura store (SIN-69121). The console generates
 	// an invoice by freezing a consumption window and reads them back for the
 	// "Faturas" screen and the CSV download. Optional: a nil store disables the
@@ -157,6 +163,9 @@ type ConsoleDeps struct {
 	// privilege): the console grants the creditor-key capability independently of the
 	// secret-rotation capability (SIN-66092 / ADR-0008).
 	CreditorWriter ports.CreditorKeyWriter
+	// Sharing answers which tenants already hold a PIX key / PSP account. Optional;
+	// nil disables the exclusivity check and the removal guard. See ConsoleService.sharing.
+	Sharing ports.CreditorKeySharingLookup
 	// CertWriter / CertReader are the per-(tenant,bank) mTLS certificate vault
 	// (SIN-66087). CertWriter stores the validated cert/key pair (write-only key);
 	// CertReader projects only the stored certificate's public metadata into the
@@ -221,6 +230,7 @@ func NewConsoleService(d ConsoleDeps) *ConsoleService {
 		certDeleter:        d.CertDeleter,
 		webhookDeregistrar: d.WebhookDeregistrar,
 		creds:              d.Creds,
+		sharing:            d.Sharing,
 		invoices:           d.Invoices,
 		webhooks:           d.OutboundWebhooks,
 		credEvictor:        ci,
@@ -669,7 +679,11 @@ func (s *ConsoleService) SetCreditorKey(ctx context.Context, tenantID, creditorK
 	if _, err := s.tenants.FindTenantByID(ctx, tenantID); err != nil {
 		return fmt.Errorf("resolve tenant: %w", err)
 	}
-	if err := s.creditorWrite.SetCreditorKey(ctx, tenantID, strings.TrimSpace(creditorKey)); err != nil {
+	key := strings.TrimSpace(creditorKey)
+	if err := s.assertCreditorKeyFree(ctx, tenantID, key); err != nil {
+		return err
+	}
+	if err := s.creditorWrite.SetCreditorKey(ctx, tenantID, key); err != nil {
 		// Wrap with non-sensitive context only; never include the key value.
 		return fmt.Errorf("set creditor key: %w", err)
 	}
@@ -1107,6 +1121,96 @@ func (s *ConsoleService) AccountConsumptionInRange(ctx context.Context, accountI
 // every removal left behind before this existed. An already-absent registration is not an
 // error. Each outcome is logged with the tenant and bank (never the callback URL, which
 // embeds the secret ref).
+// assertCreditorKeyFree enforces the invariant that a PIX creditor key belongs to ONE
+// ACTIVE empresa at a time. It runs on SetCreditorKey, which is the single write path
+// for the key (console and self-serve both funnel through it).
+//
+// Duas empresas ativas com a mesma chave se destroem mutuamente: no C6 o webhook é
+// registrado por chave, com uma URL só por chave, então elas se sobrescrevem a cada
+// registro. O aviso de pagamento chega por um ref que não é do dono da cobrança, é
+// recusado, e a liquidação passa a depender de varredura. Foi exatamente o que a
+// empresa 27 viveu (SIN-69368) — e barrar na gravação é o único lugar onde o problema
+// custa uma mensagem de erro em vez de um pagamento que não avisa.
+//
+// Um detentor SUSPENSO não bloqueia: ele não registra webhook nenhum (ver
+// WebhookRegistrationService.tenantMayRegister), então não disputa. Só o ativo importa.
+//
+// Falha fechado: se a consulta não puder responder, a gravação não passa. Uma chave
+// gravada por engano é cara de descobrir e cara de desfazer; um erro transitório na
+// gravação custa um "tente de novo".
+//
+// Vazamento assumido: a recusa confirma que a chave já está em uso NESTA plataforma.
+// Quem consegue sondar já tem token de tenant válido, e o preço de não avisar seria
+// deixar a colisão acontecer. Está registrado aqui de propósito.
+func (s *ConsoleService) assertCreditorKeyFree(ctx context.Context, tenantID, creditorKey string) error {
+	if s.sharing == nil || creditorKey == "" {
+		return nil
+	}
+	holders, err := s.sharing.FindTenantsByCreditorKey(ctx, ports.BankIDC6, creditorKey)
+	if err != nil {
+		return fmt.Errorf("check creditor key holders: %w", err)
+	}
+	for _, other := range holders {
+		if other == tenantID {
+			continue
+		}
+		active, err := s.tenantIsActive(ctx, other)
+		if err != nil {
+			return fmt.Errorf("resolve creditor key holder: %w", err)
+		}
+		if active {
+			return shared.NewValidationError("creditor_key",
+				"esta chave PIX já está registrada para outra empresa ativa")
+		}
+	}
+	return nil
+}
+
+// tenantIsActive resolves a tenant's ACTIVE flag. A tenant that no longer exists counts
+// as inactive (an orphan credential row must not block a legitimate write).
+func (s *ConsoleService) tenantIsActive(ctx context.Context, tenantID string) (bool, error) {
+	t, err := s.tenants.FindTenantByID(ctx, tenantID)
+	if err != nil {
+		if errors.Is(err, shared.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return t.Active(), nil
+}
+
+// sharesBankIdentityWithActiveTenant reports whether ANOTHER ACTIVE tenant is registered
+// under the same PIX key or the same PSP account (client_id) as tenantID.
+//
+// Falha FECHADO para o chamador que a usa: quando não dá para responder, tratamos como
+// "compartilha", porque o estrago de desregistrar o webhook de uma empresa ativa é bem
+// pior do que o de deixar uma inscrição órfã no PSP.
+func (s *ConsoleService) sharesBankIdentityWithActiveTenant(ctx context.Context, tenantID, bankID, chave, clientID string) bool {
+	if s.sharing == nil {
+		return false
+	}
+	lookups := []func() ([]string, error){
+		func() ([]string, error) { return s.sharing.FindTenantsByCreditorKey(ctx, bankID, chave) },
+		func() ([]string, error) { return s.sharing.FindTenantsByClientID(ctx, bankID, clientID) },
+	}
+	for _, lookup := range lookups {
+		holders, err := lookup()
+		if err != nil {
+			return true
+		}
+		for _, other := range holders {
+			if other == tenantID {
+				continue
+			}
+			active, err := s.tenantIsActive(ctx, other)
+			if err != nil || active {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *ConsoleService) deregisterWebhooks(ctx context.Context, tenantID, bankID string) {
 	if s == nil || s.webhookDeregistrar == nil || bankID != ports.BankIDC6 {
 		return
@@ -1120,12 +1224,33 @@ func (s *ConsoleService) deregisterWebhooks(ctx context.Context, tenantID, bankI
 	}
 	// The PIX callback is keyed by the creditor key, so it is read from the credential
 	// while that credential still exists. No key means nothing was ever registered.
+	var chave, clientID string
 	if s.creds != nil {
 		if cred, err := s.creds.GetBankCredential(ctx, tenantID, bankID); err == nil {
-			if chave := strings.TrimSpace(cred.CreditorKey); chave != "" {
-				drop("pix", func() error { return s.webhookDeregistrar.DeleteWebhook(ctx, tenantID, chave) })
-			}
+			chave = strings.TrimSpace(cred.CreditorKey)
+			clientID = strings.TrimSpace(cred.ClientID)
 		}
+	}
+
+	// Desregistrar é uma operação sobre a IDENTIDADE no PSP, não sobre este tenant. O
+	// canal PIX é apagado POR CHAVE e os canais de recorrência pela CONTA do client_id —
+	// então remover a config de um tenant que divide chave ou conta com outro derruba a
+	// inscrição VIVA do outro, e nada a refaz (a varredura de renovação está desligada).
+	//
+	// Aconteceu de verdade: a Verz tinha o mesmo cadastro duas vezes, um suspenso e um
+	// ativo, com a mesma chave. Limpar o suspenso teria deixado a empresa ativa sem
+	// webhook, em silêncio, até alguém regravar a credencial dela.
+	//
+	// Então: se outro tenant ATIVO divide a identidade, apagamos só o NOSSO lado e
+	// deixamos o PSP como está. A inscrição que sobra pertence a quem ainda a usa.
+	if s.sharesBankIdentityWithActiveTenant(ctx, tenantID, bankID, chave, clientID) {
+		slog.InfoContext(ctx, "console: PSP deregistration skipped, bank identity shared with an active tenant",
+			slog.String("tenant_id", tenantID), slog.String("bank_id", bankID))
+		return
+	}
+
+	if chave != "" {
+		drop("pix", func() error { return s.webhookDeregistrar.DeleteWebhook(ctx, tenantID, chave) })
 	}
 	drop("rec", func() error { return s.webhookDeregistrar.DeleteRecWebhook(ctx, tenantID) })
 	drop("cobr", func() error { return s.webhookDeregistrar.DeleteCobRWebhook(ctx, tenantID) })

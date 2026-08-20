@@ -245,6 +245,83 @@ func (v *CredentialVault) ListTenantsWithC6Credential(ctx context.Context) ([]st
 	return ids, nil
 }
 
+// FindTenantsByCreditorKey implements ports.CreditorKeySharingLookup.
+//
+// The stored key is SEALED with a per-row AAD, so two rows holding the same key have
+// different ciphertexts — comparing columns is impossible by construction. This opens
+// each row and compares the plaintext, which costs one AES-GCM open per row with a key
+// registered for the bank. That is O(rows) on a path that runs only when someone
+// GRAVA uma chave (raro), never on a transaction, so the cost is paid where nobody is
+// waiting. The alternative — a stored hash column — would put a brute-forceable
+// derivative of a low-entropy secret (CPF, telefone, e-mail) on disk, and this check is
+// not worth that.
+//
+// A row that fails to open is SKIPPED, not fatal: one row sealed under a rotated KEK
+// must not block every future key write. It is logged nowhere here (the adapter has no
+// logger); the caller sees a shorter list, which fails OPEN for that row — the reason
+// the caller must not treat this as an authorisation decision.
+func (v *CredentialVault) FindTenantsByCreditorKey(ctx context.Context, bankID, creditorKey string) ([]string, error) {
+	bankID = secret.DefaultBankID(bankID)
+	if creditorKey == "" {
+		return nil, nil
+	}
+	rows, err := v.db.QueryContext(ctx,
+		`SELECT tenant_id, creditor_key_sealed FROM bank_credentials
+		 WHERE bank_id = ? AND creditor_key_sealed IS NOT NULL`, bankID)
+	if err != nil {
+		return nil, fmt.Errorf("list creditor key holders: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var (
+			tenantID string
+			sealed   []byte
+		)
+		if err := rows.Scan(&tenantID, &sealed); err != nil {
+			return nil, fmt.Errorf("scan creditor key holder: %w", err)
+		}
+		plain, err := v.cipher.OpenWithAAD(sealed, secret.RowAAD(tenantID, bankID))
+		if err != nil {
+			continue
+		}
+		if string(plain) == creditorKey {
+			out = append(out, tenantID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate creditor key holders: %w", err)
+	}
+	return out, nil
+}
+
+// FindTenantsByClientID implements ports.CreditorKeySharingLookup. client_id is an
+// identity, not a secret, so it is stored plaintext and compared in SQL.
+func (v *CredentialVault) FindTenantsByClientID(ctx context.Context, bankID, clientID string) ([]string, error) {
+	bankID = secret.DefaultBankID(bankID)
+	if clientID == "" {
+		return nil, nil
+	}
+	rows, err := v.db.QueryContext(ctx,
+		`SELECT tenant_id FROM bank_credentials WHERE bank_id = ? AND client_id = ?`, bankID, clientID)
+	if err != nil {
+		return nil, fmt.Errorf("list client id holders: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var tenantID string
+		if err := rows.Scan(&tenantID); err != nil {
+			return nil, fmt.Errorf("scan client id holder: %w", err)
+		}
+		out = append(out, tenantID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate client id holders: %w", err)
+	}
+	return out, nil
+}
+
 // now returns the current instant formatted as RFC3339-UTC (the adapter-wide layout).
 func (v *CredentialVault) now() string {
 	return v.clock.Now().UTC().Format(tsLayout)

@@ -104,6 +104,41 @@ func (s *Store) ListTenantsWithC6Credential(_ context.Context) ([]string, error)
 	return out, nil
 }
 
+// FindTenantsByCreditorKey implements ports.CreditorKeySharingLookup over the
+// in-memory store, matching the SQLite vault's contract exactly.
+func (s *Store) FindTenantsByCreditorKey(_ context.Context, bankID, creditorKey string) ([]string, error) {
+	if creditorKey == "" {
+		return nil, nil
+	}
+	bankID = defaultBankID(bankID)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for _, c := range s.creds {
+		if defaultBankID(c.BankID) == bankID && c.CreditorKey == creditorKey {
+			out = append(out, c.TenantID)
+		}
+	}
+	return out, nil
+}
+
+// FindTenantsByClientID implements ports.CreditorKeySharingLookup over the in-memory store.
+func (s *Store) FindTenantsByClientID(_ context.Context, bankID, clientID string) ([]string, error) {
+	if clientID == "" {
+		return nil, nil
+	}
+	bankID = defaultBankID(bankID)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for _, c := range s.creds {
+		if defaultBankID(c.BankID) == bankID && c.ClientID == clientID {
+			out = append(out, c.TenantID)
+		}
+	}
+	return out, nil
+}
+
 // Set stores/replaces a credential for the (tenantID, c.BankID) pair (used by the
 // admin plane / config reload). It stamps the tenant id and normalises an empty
 // bank to the default BankIDC6.
