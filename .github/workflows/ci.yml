@@ -78,6 +78,14 @@ jobs:
       - name: test + coverage gate (>85%)
         run: bash scripts/coverage.sh 85
 
+      # coverage.sh drops ./cmd/ from the packages it runs (the entrypoints are
+      # wiring, and counting them would drag the gate down for no signal). That used
+      # to mean cmd/ had no tests to lose; cmd/db-migrate has them, and they are the
+      # only end-to-end proof that the SQLite -> PostgreSQL copy preserves sealed
+      # bytes and normalises timestamps. Run them separately, outside the gate.
+      - name: test ./cmd/...
+        run: go test -count=1 ./cmd/...
+
   staticcheck:
     name: staticcheck
     runs-on: ubuntu-latest
