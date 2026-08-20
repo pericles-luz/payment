@@ -42,3 +42,8 @@ go.work.sum
 # binario compilado da ferramenta de diagnostico (nao versionar)
 /c6-webhook-probe
 build/
+
+# binarios de build local dos entrypoints
+/api
+/vault-reseal
+/db-migrate

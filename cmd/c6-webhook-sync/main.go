@@ -35,12 +35,12 @@ import (
 	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank/c6"
-	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
+	"github.com/ia-dev-sindireceita/payment/internal/platform/persistence"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
@@ -81,16 +81,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("PAYMENT_BANK_VAULT_KEY invalid: %w", err)
 	}
-	db, err := sqlite.Open(cfg.DBPath)
+	db, err := persistence.Open(ctx, cfg.DBDSN, cfg.DBPath)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
 	clock := system.Clock{}
-	credVault := sqlite.NewCredentialVault(db, cipher, clock)
-	certVault := sqlite.NewCertificateVault(db, cipher, clock)
-	refStore := sqlite.NewWebhookRefStore(db, clock)
+	credVault := db.CredentialVault(cipher, clock)
+	certVault := db.CertificateVault(cipher, clock)
+	refStore := db.WebhookRefStore(clock)
 
 	cred, err := credVault.GetBankCredential(ctx, tenantID, ports.BankIDC6)
 	if err != nil {

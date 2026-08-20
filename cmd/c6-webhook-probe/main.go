@@ -53,10 +53,10 @@ import (
 	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank/c6"
-	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
+	"github.com/ia-dev-sindireceita/payment/internal/platform/persistence"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
@@ -482,19 +482,19 @@ func loadTenantMaterial(ctx context.Context, cfg config.Config, tenantID string)
 	if err != nil {
 		return ports.BankCredential{}, nil, fmt.Errorf("PAYMENT_BANK_VAULT_KEY invalid: %w", err)
 	}
-	db, err := sqlite.Open(cfg.DBPath)
+	db, err := persistence.Open(ctx, cfg.DBDSN, cfg.DBPath)
 	if err != nil {
 		return ports.BankCredential{}, nil, fmt.Errorf("open db: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
-	cred, err := sqlite.NewCredentialVault(db, cipher, system.Clock{}).GetBankCredential(ctx, tenantID, ports.BankIDC6)
+	cred, err := db.CredentialVault(cipher, system.Clock{}).GetBankCredential(ctx, tenantID, ports.BankIDC6)
 	if err != nil {
 		return ports.BankCredential{}, nil, err
 	}
 	// A missing certificate is not fatal: report it and let the caller use the §8 path,
 	// which is exactly what the live transport does.
-	cert, certErr := sqlite.NewCertificateVault(db, cipher, system.Clock{}).LoadTLSCertificate(ctx, tenantID, ports.BankIDC6)
+	cert, certErr := db.CertificateVault(cipher, system.Clock{}).LoadTLSCertificate(ctx, tenantID, ports.BankIDC6)
 	if certErr != nil {
 		fmt.Printf("aviso: sem certificado no cofre para este tenant (%v)\n", certErr)
 		return cred, nil, nil

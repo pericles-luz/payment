@@ -1,0 +1,12 @@
+-- GERADO por scripts/gen-pg-migrations.py a partir de ../0014_account_outbound_webhook.down.sql — NAO EDITE A MAO.
+-- Regras: BLOB->BYTEA; *_cents INTEGER->BIGINT. Veja o script para o porque.
+-- 0014_account_outbound_webhook.down.sql — backward-compatible rollback of 0014.
+--
+-- Drops the durable account-scoped outbound webhook configuration. Reversible by
+-- re-applying 0014.up (which recreates the empty table). No other table referenced
+-- it, so nothing else changes. Rolling back discards any configured endpoints —
+-- acceptable because the feature is DARK behind PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK
+-- (default-off) and performs no forwarding in F0, so no live delivery depends on it.
+--
+-- No indexes beyond the implicit PRIMARY KEY, so drop the table directly.
+DROP TABLE IF EXISTS account_outbound_webhook;
