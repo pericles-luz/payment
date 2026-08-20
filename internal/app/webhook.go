@@ -75,6 +75,15 @@ type PaymentEvent struct {
 	TenantID string
 	TxID     string
 	EventKey string
+	// ClaimsSettlement diz que o AVISO afirma que houve pagamento — por exemplo, um
+	// aviso PIX que traz o array de pix recebidos.
+	//
+	// NÃO é usado para liquidar: a decisão continua vindo da leitura autoritativa no
+	// banco. É usado para decidir o que fazer quando as duas discordam. O PSP avisa
+	// no instante em que o dinheiro entra, e o estado da cobrança dele leva alguns
+	// segundos para refletir isso; confirmar o aviso nessa janela perde o pagamento
+	// para sempre, porque ele não reenvia o que já foi confirmado.
+	ClaimsSettlement bool
 }
 
 // reconcileFunc reconciles the authoritative state of the resource named by a webhook
@@ -126,6 +135,18 @@ func (s *WebhookService) reconcileCheckout(ctx context.Context, tenantID, sessio
 	}, nil
 }
 
+// errNotYetPayable sinaliza, DENTRO da transação, que a cobrança ainda não foi paga.
+//
+// É devolvido como erro só para desfazer a unidade de trabalho — e com ela a marca de
+// anti-replay —, nunca para virar erro na resposta ao PSP. Ver o comentário extenso no
+// ponto onde é devolvido: manter a marca aqui já custou um pagamento real.
+var errNotYetPayable = errors.New("cobrança ainda não paga")
+
+// errSettlementLag é o aviso de liquidação que a leitura autoritativa ainda não
+// confirma. Diferente de errNotYetPayable, ele PRECISA chegar como erro ao PSP: é o
+// que provoca a reentrega, e sem reentrega o pagamento se perde.
+var errSettlementLag = errors.New("liquidação anunciada ainda não visível na cobrança")
+
 // settle reconciles and settles a payment. Duplicate deliveries are acked without side
 // effects. The webhook payload is never trusted as financial truth — settlement
 // requires a positive reconciliation (via reconcile) with the bank.
@@ -136,8 +157,11 @@ func (s *WebhookService) reconcileCheckout(ctx context.Context, tenantID, sessio
 // marked — the bank's redelivery was then acked as a duplicate no-op and the
 // payment was never settled (exactly-once-settlement silently lost). Now a
 // transient failure rolls the whole unit of work back, including the mark, so the
-// redelivery re-attempts and eventually settles. The mark is durable only once
-// the terminal outcome (settled, or authoritatively not-yet-payable) is durable.
+// redelivery re-attempts and eventually settles.
+//
+// The mark is durable only once a TERMINAL outcome is: settled, an audited amount
+// divergence, or a charge the PSP considers dead. "Not paid yet" is deliberately NOT
+// terminal — see errNotYetPayable. Treating it as terminal lost a real payment.
 func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile reconcileFunc) error {
 	if strings.TrimSpace(ev.TenantID) == "" {
 		return shared.NewValidationError("tenant_id", "tenant id is required")
@@ -173,8 +197,46 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 			return fmt.Errorf("reconcile charge: %w", err)
 		}
 		if !strings.EqualFold(res.Status, bankStatusPaid) {
-			// Authoritatively not payable yet; record the delivery as processed.
-			return nil
+			// O aviso AFIRMA que houve pagamento e a leitura ainda não concorda.
+			//
+			// Isto não é caso raro: o C6 avisa no instante em que o PIX entra, e a
+			// cobrança dele leva segundos para virar CONCLUIDA. Aconteceu em TRÊS
+			// pagamentos reais seguidos — 100% das vezes, não uma corrida infeliz.
+			//
+			// Confirmar aqui perde o dinheiro. O C6 entrega UMA vez e não reenvia o
+			// que foi confirmado com 2xx, então um "recebi e tratei" prematuro é a
+			// última notícia que teremos daquele pagamento. Devolver erro faz o PSP
+			// reentregar, e na reentrega a leitura já concorda.
+			//
+			// A marca de anti-replay também não sobrevive: o erro desfaz a transação
+			// inteira, então a reentrega é processada de verdade em vez de ser
+			// descartada como repetida.
+			if ev.ClaimsSettlement {
+				return fmt.Errorf("aviso afirma pagamento mas a cobrança ainda não consta paga (status %q): %w",
+					res.Status, errSettlementLag)
+			}
+			// NOT yet payable — and this is NOT a terminal outcome, so the anti-replay
+			// key must NOT survive. Rolling the unit of work back discards MarkProcessed
+			// and lets a later delivery of the same event be processed again.
+			//
+			// It used to keep the mark, and that silently lost real money. The C6 PIX
+			// notification carries NO status field (verified on the wire, SIN-69580), so
+			// the event key degenerates to "<txid>|pix|" — byte-identical for every
+			// delivery about that charge. A notification that lands in the seconds
+			// BEFORE the PSP finishes settling therefore burned the key for good: the
+			// settlement delivery that followed was deduped as a duplicate and dropped,
+			// the charge stayed pending forever, and nothing anywhere said so.
+			//
+			// That is exactly what happened in production: PIX received at 12:33:23, our
+			// notification at 12:33:26 read the charge still ATIVA, and the payment was
+			// never settled from the webhook path.
+			//
+			// The cost of rolling back is a re-reconcile (one billed read) on each
+			// redelivery of a charge that is not yet paid — bounded by the PSP's own
+			// retry policy, and cheap next to a payment that never settles. The
+			// duplicate-suppression this key exists for still holds for every TERMINAL
+			// outcome: settled, divergence, and authoritatively dead all keep the mark.
+			return errNotYetPayable
 		}
 
 		// Reconcile the MONEY, not only the status (threat W3, SIN-64777). A charge
@@ -224,6 +286,13 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 		return nil
 	})
 	if err != nil {
+		// Não-pagável-ainda não é erro para quem chamou: a entrega foi aceita, só não
+		// produziu desfecho. Devolver erro faria o PSP receber 5xx e retentar em
+		// pânico; o que se quer é justamente que ele reentregue no ritmo normal dele,
+		// quando o pagamento existir.
+		if errors.Is(err, errNotYetPayable) {
+			return nil
+		}
 		return err
 	}
 	if settled == nil {

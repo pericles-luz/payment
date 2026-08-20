@@ -543,6 +543,18 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	//    settling. Every path shares the same dedup + reconcile-before-settle unit of
 	//    work, and the EventKey carries the kind label, so a checkout and a charge event
 	//    for the same id never collide.
+	// O aviso AFIRMA liquidação quando traz um PIX recebido, ou quando o envelope
+	// proprietário diz PAID. Isso não decide nada sobre o pagamento — a verdade vem da
+	// releitura no banco —, mas decide o que fazer quando os dois discordam: um aviso
+	// de liquidação que não conseguimos confirmar NÃO pode ser confirmado ao PSP.
+	claimsSettlement := len(note.Pix) > 0 || strings.EqualFold(note.Status, "PAID")
+	if !claimsSettlement && note.Information != "" {
+		var info pixInformation
+		if err := json.Unmarshal([]byte(note.Information), &info); err == nil {
+			claimsSettlement = len(info.Pix) > 0
+		}
+	}
+
 	kind, objectID, label, ok := resolveWebhook(note)
 	if !ok {
 		// The body parsed as JSON but carries no shape this receiver recognises — the
@@ -559,6 +571,7 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	case webhookKindCheckout:
 		err = s.webhooks.HandleCheckoutEvent(r.Context(), app.PaymentEvent{
 			TenantID: id.TenantID, TxID: objectID, EventKey: eventKey,
+			ClaimsSettlement: claimsSettlement,
 		})
 	case webhookKindRec:
 		err = s.webhooks.HandleRecEvent(r.Context(), app.RecEvent{
@@ -571,6 +584,7 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	default:
 		err = s.webhooks.HandlePaymentEvent(r.Context(), app.PaymentEvent{
 			TenantID: id.TenantID, TxID: objectID, EventKey: eventKey,
+			ClaimsSettlement: claimsSettlement,
 		})
 	}
 	if err != nil {

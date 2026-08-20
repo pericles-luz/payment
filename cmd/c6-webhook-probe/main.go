@@ -183,6 +183,32 @@ func run() error {
 		return nil
 	}
 
+	// --pix <txid>: read one immediate-PIX charge from C6, verbatim.
+	//
+	// Read-only, and the only way to answer "did the money actually arrive?" without
+	// the Account key of whichever Conta owns the tenant.
+	if len(os.Args) > 3 && os.Args[2] == "--pix" {
+		txid := strings.TrimSpace(os.Args[3])
+		section("GET /v2/pix/cob/" + txid + " (corpo bruto)")
+		return call(ctx, httpc, http.MethodGet,
+			base+"/v2/pix/cob/"+url.PathEscape(txid), token, nil, "application/json")
+	}
+
+	// --webhook-atual: READ the callback C6 currently holds for this tenant's PIX key,
+	// and print it. Read-only on purpose — the default flow of this probe PUTs, which
+	// would overwrite the very registration we are trying to inspect.
+	//
+	// It exists to answer one question: when two tenants are configured with the SAME
+	// PIX key, C6 has only ONE webhook slot for that key, so they overwrite each
+	// other. Running this for both tenants and getting the same URL back proves the
+	// collision.
+	if len(os.Args) > 2 && os.Args[2] == "--webhook-atual" {
+		section("GET /v2/pix/webhook/{chave do tenant}")
+		fmt.Printf("   chave (mascarada): %s (len=%d)\n", maskTail(cred.CreditorKey), len(cred.CreditorKey))
+		return call(ctx, httpc, http.MethodGet,
+			base+"/v2/pix/webhook/"+url.PathEscape(cred.CreditorKey), token, nil, "application/json")
+	}
+
 	// --parcelas <n>: open ONE hosted checkout with a ceiling of n parcelas and a
 	// LONG expiry, so a human has time to open the page and answer the one question
 	// the wire cannot: does the page offer a CHOICE of parcelas up to n, or does it
