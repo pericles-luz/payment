@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -30,14 +29,13 @@ import (
 	httpadapter "github.com/ia-dev-sindireceita/payment/internal/adapters/http"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/messaging/inmemory"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/outbound"
-	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
+	"github.com/ia-dev-sindireceita/payment/internal/platform/persistence"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/stgseed"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
-	"github.com/ia-dev-sindireceita/payment/migrations"
 )
 
 func main() {
@@ -52,21 +50,22 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := sqlite.Open(cfg.DBPath)
+	// Engine selection lives in one place (internal/platform/persistence): PostgreSQL
+	// when PAYMENT_DB_DSN is set, the SQLite file otherwise. Migrations for the chosen
+	// engine are applied here, on every boot, guarded by the schema_migrations ledger.
+	db, err := persistence.Open(ctx, cfg.DBDSN, cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	if err := sqlite.Migrate(ctx, db, migrations.FS); err != nil {
-		return err
-	}
+	log.Printf("api: persistence engine is %s", db.Engine)
 
-	store := sqlite.NewStore(db)
+	store := db.Store()
 	// Account-key store (ADR-0011 §3, B1/SIN-69278): durable, hash-at-rest bearer
 	// keys keyed by Account. Wired as the choke-point's AccountKeyAuth; it only ever
 	// runs when the PAYMENT_ACCOUNT_KEY_SELECTOR flag is on (model (b)), so building
 	// it here is inert in the default model (a) deployment.
-	accountKeys := sqlite.NewAccountKeyStore(db, system.Clock{})
+	accountKeys := db.AccountKeyStore(system.Clock{})
 	// Bank OAuth-credential and mTLS-certificate vaults. With PAYMENT_BANK_VAULT_KEY
 	// set (a 32-byte AES-256 KEK, hex), both are the DURABLE, encrypted-at-rest
 	// SQLite adapters (SIN-69366): a runtime-configured C6 credential/cert survives a
@@ -140,7 +139,7 @@ func run() error {
 	// F0 config store); it is always durable (sqlite over the shared db). The resolver
 	// reads the tenant's owning Account from the same store the choke-point uses, but
 	// surfaces read errors so an indeterminable owner fails-closed to a dead-letter.
-	outboundDeliveries := sqlite.NewOutboundDeliveryStore(db)
+	outboundDeliveries := db.OutboundDeliveryStore()
 	outboundAttributor := app.NewOutboundAttributor(app.OutboundAttributorDeps{
 		Enabled:     cfg.AccountOutboundWebhook,
 		Resolver:    app.NewStoreAccountResolver(store),
@@ -221,7 +220,7 @@ func run() error {
 	// receive C6 webhooks with no operator edit and no restart. It stores ONLY the ref's
 	// sha256 (never the ref) — no secret to seal — so it is wired unconditionally (unlike
 	// the vault-gated credential stores). The authenticator falls back to it on a map miss.
-	webhookRefStore := sqlite.NewWebhookRefStore(db, system.Clock{})
+	webhookRefStore := db.WebhookRefStore(system.Clock{})
 	auth := httpadapter.NewStaticTokenAuthWithRoles(cfg.TenantTokens, adminRoles, webhookRefs).
 		WithWebhookRefStore(webhookRefStore).
 		WithCredentialStore(creds) // B4 (SIN-69585): populate ClientID on durable-ref path
@@ -240,7 +239,7 @@ func run() error {
 	// vaults.
 	var outboundWebhooks app.OutboundWebhookStore
 	if vaultCipher != nil {
-		outboundWebhooks = sqlite.NewOutboundWebhookVault(db, vaultCipher, system.Clock{})
+		outboundWebhooks = db.OutboundWebhookVault(vaultCipher, system.Clock{})
 	}
 
 	// Outbound webhook FORWARD (SIN-69492, F2 of SIN-69486): a background consumer of the
@@ -310,8 +309,8 @@ func run() error {
 	var consoleCreds app.ConsoleCredentialStore = consoleSessions
 	var consoleReplay app.TOTPReplayStore = consoleSessions
 	if vaultCipher != nil {
-		consoleCreds = sqlite.NewConsoleCredentialVault(db, vaultCipher, system.Clock{})
-		consoleReplay = sqlite.NewConsoleReplayStore(db, system.Clock{})
+		consoleCreds = db.ConsoleCredentialVault(vaultCipher, system.Clock{})
+		consoleReplay = db.ConsoleReplayStore(system.Clock{})
 		log.Print("api: durable encrypted-at-rest console credential store ENABLED — the console login survives a restart")
 	} else {
 		log.Print("api: console credential store is IN-MEMORY (PAYMENT_BANK_VAULT_KEY unset) — /console/bootstrap must be re-run after each restart")
@@ -592,16 +591,16 @@ func newVaultCipher(cfg config.Config) (*secret.Cipher, error) {
 // cipher it returns the in-memory vaults (previous behaviour), logging the
 // restart-durability caveat so an operator running a real deployment without a key
 // sees it. The cipher is built once by newVaultCipher and shared across all vaults.
-func newBankVaults(ctx context.Context, cfg config.Config, db *sql.DB, cipher *secret.Cipher) (credentialAdapter, certificateAdapter, error) {
+func newBankVaults(ctx context.Context, cfg config.Config, db *persistence.DB, cipher *secret.Cipher) (credentialAdapter, certificateAdapter, error) {
 	if cipher == nil {
 		log.Print("api: bank secret vault is IN-MEMORY (PAYMENT_BANK_VAULT_KEY unset) — runtime-configured credentials/certificates do NOT survive a restart")
 		return secret.NewStore(cfg.BankCreds), secret.NewCertStore(), nil
 	}
-	credVault := sqlite.NewCredentialVault(db, cipher, system.Clock{})
+	credVault := db.CredentialVault(cipher, system.Clock{})
 	if err := credVault.Seed(ctx, cfg.BankCreds); err != nil {
 		return nil, nil, fmt.Errorf("api: seed durable credential vault: %w", err)
 	}
-	certVault := sqlite.NewCertificateVault(db, cipher, system.Clock{})
+	certVault := db.CertificateVault(cipher, system.Clock{})
 	log.Print("api: durable encrypted-at-rest bank secret vault ENABLED (PAYMENT_BANK_VAULT_KEY set) — credentials/certificates survive a restart")
 	return credVault, certVault, nil
 }

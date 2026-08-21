@@ -23,6 +23,29 @@ jobs:
   build-test:
     name: build, vet, test, coverage
     runs-on: ubuntu-latest
+
+    # The PostgreSQL adapter suite runs against a real server — the port's whole
+    # risk surface (SQLSTATE mapping, multi-statement migrations, lexical ordering
+    # of TEXT timestamps) is engine behaviour that no fake reproduces. Without
+    # PAYMENT_TEST_DB_DSN that suite SKIPS, so a missing service here would go
+    # unnoticed as a silent loss of coverage rather than a red build; the coverage
+    # gate below is what catches it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      PAYMENT_TEST_DB_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
 
@@ -44,8 +67,24 @@ jobs:
             echo "These files are not gofmt-ed:"; echo "$unformatted"; exit 1
           fi
 
+      - name: pg migrations are in sync with their sqlite source
+        run: |
+          python3 scripts/gen-pg-migrations.py
+          if ! git diff --quiet -- migrations/pg; then
+            echo "migrations/pg is stale — re-run scripts/gen-pg-migrations.py and commit:"
+            git diff --stat -- migrations/pg; exit 1
+          fi
+
       - name: test + coverage gate (>85%)
         run: bash scripts/coverage.sh 85
+
+      # coverage.sh drops ./cmd/ from the packages it runs (the entrypoints are
+      # wiring, and counting them would drag the gate down for no signal). That used
+      # to mean cmd/ had no tests to lose; cmd/db-migrate has them, and they are the
+      # only end-to-end proof that the SQLite -> PostgreSQL copy preserves sealed
+      # bytes and normalises timestamps. Run them separately, outside the gate.
+      - name: test ./cmd/...
+        run: go test -count=1 ./cmd/...
 
   staticcheck:
     name: staticcheck

@@ -24,11 +24,10 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
-	"github.com/ia-dev-sindireceita/payment/migrations"
+	"github.com/ia-dev-sindireceita/payment/internal/platform/persistence"
 )
 
 func main() {
@@ -63,23 +62,17 @@ func run() error {
 		return fmt.Errorf("previous key: %w", err)
 	}
 
-	db, err := sqlite.Open(cfg.DBPath)
+	db, err := persistence.Open(ctx, cfg.DBDSN, cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	if err := sqlite.Migrate(ctx, db, migrations.FS); err != nil {
-		return err
-	}
-
-	clock := system.Clock{}
-	credVault := sqlite.NewCredentialVault(db, newCipher, clock)
-	certVault := sqlite.NewCertificateVault(db, newCipher, clock)
+	log.Printf("vault-reseal: persistence engine is %s", db.Engine)
 
 	// Rotate both tables in ONE transaction (SIN-69372): if the certificate rewrite
 	// fails after the credential rewrite has been staged, nothing is committed and the
 	// vault stays fully readable with the OLD key, so a retry with the same pair works.
-	credN, certN, err := sqlite.ResealAll(ctx, credVault, certVault, oldCipher)
+	credN, certN, err := db.ResealAll(ctx, newCipher, oldCipher, system.Clock{})
 	if err != nil {
 		return err
 	}

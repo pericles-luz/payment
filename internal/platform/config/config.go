@@ -17,8 +17,13 @@ import (
 
 // Config is the resolved process configuration.
 type Config struct {
-	HTTPAddr       string
-	DBPath         string
+	HTTPAddr string
+	// DBPath is the SQLite file. Used only when DBDSN is empty.
+	DBPath string
+	// DBDSN is the PostgreSQL connection string. When set it selects PostgreSQL and
+	// DBPath is ignored — a deployment pointed at the cluster must never quietly fall
+	// back to a local file, which would come up empty and read as data loss.
+	DBDSN          string
 	TenantTokens   map[string]string // token -> tenantID
 	AdminTokens    []string          // full-access admin tokens (RoleAdmin)
 	OperatorTokens []string          // read-only admin tokens (RoleOperator)
@@ -207,6 +212,7 @@ func FromEnv() Config {
 	return Config{
 		HTTPAddr:               getenv("PAYMENT_HTTP_ADDR", ":8080"),
 		DBPath:                 getenv("PAYMENT_DB_PATH", "payment.db"),
+		DBDSN:                  os.Getenv("PAYMENT_DB_DSN"),
 		TenantTokens:           parseKV(os.Getenv("PAYMENT_TENANT_TOKENS")),
 		AdminTokens:            splitNonEmpty(os.Getenv("PAYMENT_ADMIN_TOKENS")),
 		OperatorTokens:         splitNonEmpty(os.Getenv("PAYMENT_OPERATOR_TOKENS")),
