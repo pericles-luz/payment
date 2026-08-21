@@ -82,6 +82,27 @@ journalctl -u payment-api-sbx | grep vault-materialize | tail -5
 | `segredo sem PAYMENT_BANK_VAULT_KEY` | o KV foi gravado incompleto — **não** contorne subindo sem KEK |
 | `valor multilinha em X` | alguém gravou um PEM fora dos campos `C6_CLIENT_*_PEM` |
 
+## Nunca materialize no diretório do serviço
+
+`vault-materialize.py <inst>` escreve em `/run/payment/<inst>` — que é onde o
+processo em execução guarda os PEMs que apresenta ao C6. Uma ferramenta de
+operador que materialize ali e depois limpe leva junto os arquivos do serviço.
+Aconteceu: um script de diagnóstico fez exatamente isso, e o `payment-api` só não
+quebrou porque já tinha lido tudo no boot.
+
+Passe um destino próprio, e rode como o usuário `payment` (rodando como root os
+arquivos ficam 0700 do root e o serviço não os lê):
+
+```sh
+sudo install -d -o payment -g payment -m 0700 /run/payment-ops
+sudo -u payment python3 /opt/payment/bin/vault-materialize.py prod /run/payment-ops/prod
+# ... use ...
+sudo rm -rf /run/payment-ops
+```
+
+Os caminhos dos PEMs no env são derivados do destino, não copiados do cofre, para
+que o valor e o arquivo não possam divergir.
+
 ## Operações
 
 Ver a forma do segredo (chaves, sem valores), em `minio`:
