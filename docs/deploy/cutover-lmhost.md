@@ -1,5 +1,14 @@
 # Corte do payment para a infra lmhost
 
+> **EXECUTADO em 21/08/2026 00:00Z.** Janela de **38 segundos** para produção.
+> As duas instâncias rodam em `pre-prod` sobre PostgreSQL, com segredos vindos do
+> Vault. Contagens conferidas contra a origem, incluindo os 25 `processed_events`.
+> Certificados já migrados para ACME automático (vencem 18/nov/2026, renovação
+> pelo Caddy). CD apontado para o `pre-prod`, com a chave de deploy e o comando
+> forçado replicados.
+>
+> **Pendente: desmontar o host antigo** — ver "Passo 3", deliberadamente adiado.
+
 Sequência de corte (Fase 5 da migração, SIN-70001), com o porquê de cada ordem.
 O que está escrito aqui foi medido nas máquinas, não presumido.
 
@@ -116,7 +125,16 @@ Não é indisponibilidade igual para todos: os webhooks do C6 recebem 502 e são
 propósito para provocar reentrega). Chamadas `/v1/*` e o console tomam 502 de
 verdade pelo tempo da janela.
 
-## Passo 3 — limpeza
+## Passo 3 — limpeza (ADIADA de propósito)
+
+> Nada aqui foi feito ainda, e é intencional: no dia do corte o serviço não teve
+> tráfego real, então a stack nova ainda não se provou em uso. Enquanto isso, o
+> host antigo é o rollback — o SQLite está lá, no estado do momento do corte, e o
+> app volta a servir com `systemctl start payment-api` mais um `reverse_proxy` de
+> volta para `payment.someu.com.br` no Caddy.
+>
+> Fazer o que está abaixo depois de alguns dias de uso real.
+
 
 1. Remover `bk_payment` e `bk_payment_sbx` do `/etc/haproxy/haproxy.cfg` antigo.
    **Não desligar aquela máquina:** ela ainda serve `contador.someu.com.br`,
