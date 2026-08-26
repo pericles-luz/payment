@@ -35,14 +35,13 @@ import (
 	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank/c6"
-	"github.com/ia-dev-sindireceita/payment/internal/adapters/persistence/sqlite"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/secret"
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/system"
 	"github.com/ia-dev-sindireceita/payment/internal/app"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/platform/config"
+	"github.com/ia-dev-sindireceita/payment/internal/platform/persistence"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
-	"github.com/ia-dev-sindireceita/payment/migrations"
 )
 
 // defaultWebhookBaseURL is the receiver's public origin. The callback path is
@@ -157,20 +156,16 @@ func durableSources(ctx context.Context, cfg config.Config, logger *log.Logger) 
 	if err != nil {
 		return nil, nil, func() {}, fmt.Errorf("PAYMENT_BANK_VAULT_KEY invalid: %w", err)
 	}
-	db, err := sqlite.Open(cfg.DBPath)
+	db, err := persistence.Open(ctx, cfg.DBDSN, cfg.DBPath)
 	if err != nil {
 		return nil, nil, func() {}, err
 	}
 	closer := func() { _ = db.Close() }
-	if err := sqlite.Migrate(ctx, db, migrations.FS); err != nil {
-		closer()
-		return nil, nil, func() {}, err
-	}
 	clock := system.Clock{}
 	// Vault first, env bootstrap second: a self-serve client resolves from the vault; an
 	// env-only bootstrap tenant still resolves via the fallback (SIN-69366 discipline).
-	credStore := secret.NewFallbackStore(sqlite.NewCredentialVault(db, cipher, clock), envStore)
-	refResolver := app.NewWebhookRefResolver(sqlite.NewWebhookRefStore(db, clock))
+	credStore := secret.NewFallbackStore(db.CredentialVault(cipher, clock), envStore)
+	refResolver := app.NewWebhookRefResolver(db.WebhookRefStore(clock))
 	logger.Printf("durable vault enabled: resolving credentials from the encrypted vault and ref bindings from the durable store, env as fallback")
 	return credStore, refResolver, closer, nil
 }

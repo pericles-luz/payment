@@ -1,0 +1,25 @@
+-- GERADO por scripts/gen-pg-migrations.py a partir de ../0010_audit_origin.up.sql — NAO EDITE A MAO.
+-- Regras: BLOB->BYTEA; *_cents INTEGER->BIGINT. Veja o script para o porque.
+-- 0010_audit_origin.up.sql — records the ORIGIN of a privileged action on the
+-- audit trail (SIN-69196 / trilha E2 of the C6 go-live SIN-69118; threat model
+-- docs/security/threat-model-self-serve-credential-intake.md, gate SIN-69195 R1).
+--
+-- WHY: the self-serve credential intake (PUT /v1/bank-credential) lets an
+-- empresa-cliente rotate its OWN bank credential using its tenant token, in
+-- addition to the existing admin-plane write. Both paths reach the same
+-- credential.set audit action, so the forensic trail must distinguish WHICH
+-- surface performed the write — an admin operator vs the tenant itself. The new
+-- origin column carries exactly that.
+--
+-- SECURITY: origin is a closed, non-secret label ('admin' | 'self-serve'). Like
+-- every other column on audit_log it NEVER holds a secret, credential, client id
+-- or PII (threat C1/C4) — audit.Entry has no secret field by construction.
+--
+-- Reversibility: additive (ADD COLUMN with a default); 0010_*.down.sql drops it.
+-- Backward-compatible: every existing row and every write from code paths that do
+-- not set an origin default to 'admin' (the prior, admin-only world), so no
+-- backfill is needed and a mixed old/new deployment reads consistently.
+--
+-- Portability (same conventions as 0001..0009): TEXT, no SQLite-only types, so it
+-- ports to Postgres unchanged.
+ALTER TABLE audit_log ADD COLUMN origin TEXT NOT NULL DEFAULT 'admin';
