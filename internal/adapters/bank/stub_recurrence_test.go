@@ -164,11 +164,14 @@ func TestStubCobRLifecycle(t *testing.T) {
 		t.Fatalf("GetCobR: %+v / %v", got, err)
 	}
 
-	rev := req
-	rev.ValorCents = 2000
-	revised, err := s.ReviseCobR(ctx, "t1", rev)
-	if err != nil || revised.ValorCents != 2000 {
-		t.Fatalf("ReviseCobR: %+v / %v", revised, err)
+	cancelled, err := s.CancelCobR(ctx, "t1", "tx1")
+	if err != nil || cancelled.Status != "CANCELADA" {
+		t.Fatalf("CancelCobR: %+v / %v", cancelled, err)
+	}
+	// Idempotent: cancelling twice is the same effect, not an error.
+	again, err := s.CancelCobR(ctx, "t1", "tx1")
+	if err != nil || again.Status != "CANCELADA" {
+		t.Fatalf("CancelCobR retry: %+v / %v", again, err)
 	}
 
 	retried, err := s.RetryCobR(ctx, "t1", "tx1", "2026-09-08")
@@ -205,14 +208,14 @@ func TestStubCobRErrors(t *testing.T) {
 	if _, err := s.GetCobR(ctx, "other", "x"); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("creds checked on read: %v", err)
 	}
-	if _, err := s.ReviseCobR(ctx, "t1", good); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("ReviseCobR missing: %v", err)
+	if _, err := s.CancelCobR(ctx, "t1", "missing"); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("CancelCobR missing: %v", err)
 	}
-	if _, err := s.ReviseCobR(ctx, "other", good); !errors.Is(err, shared.ErrNotFound) {
-		t.Fatalf("creds checked on revise: %v", err)
+	if _, err := s.CancelCobR(ctx, "other", "x"); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("creds checked on cancel: %v", err)
 	}
-	if _, err := s.ReviseCobR(ctx, "t1", ports.CreateCobRRequest{IDRec: "RR1", TxID: ""}); !errors.Is(err, shared.ErrValidation) {
-		t.Fatalf("revise validation: %v", err)
+	if _, err := s.CancelCobR(ctx, "t1", "  "); !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("cancel validation: %v", err)
 	}
 	if _, err := s.RetryCobR(ctx, "t1", "missing", "2026-09-08"); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("RetryCobR missing: %v", err)

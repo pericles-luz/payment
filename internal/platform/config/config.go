@@ -89,6 +89,19 @@ type Config struct {
 	// (production credentials are provisioned via the admin intake); it is a
 	// fast-follow convenience. Set PAYMENT_SELFSERVE_CRED_INTAKE truthy to enable.
 	SelfServeCredIntake bool
+	// PixRecurrence enables the PIX Automático (recorrência) tenant surface: the
+	// mandate, activation-request, payload-location and recurring-charge routes under
+	// /v1/pix. Defaults to false (secure / dark-ship): when off the routes are not
+	// registered at all, so rollback is a config flip and no integrator can reach a
+	// half-wired journey. Set PAYMENT_PIX_RECURRENCE truthy to enable.
+	//
+	// Turning it on is NOT sufficient for the journey to work end to end. The mandate
+	// READ path (which is what composes the QR the payer scans) is fail-secure and stays
+	// closed until PAYMENT_C6_REC_JWKS_URL is set — see
+	// docs/ops/c6-recurrence-jws-go-live-runbook.md. The two flags are deliberately
+	// separate: this one exposes the surface, that one decides whether an unverified
+	// mandate document could ever be trusted.
+	PixRecurrence bool
 	// WebhookLogPayload logs the RAW body of SUCCESSFULLY processed inbound webhooks.
 	// Rejected webhooks always log their body, regardless of this flag (SIN-69580):
 	// silent 400s made a live settlement outage indistinguishable from the PSP never
@@ -224,6 +237,7 @@ func FromEnv() Config {
 		SecureCookies:          getenvBool("PAYMENT_SECURE_COOKIES", true),
 		TrustedProxyHops:       getenvInt("PAYMENT_TRUSTED_PROXY_HOPS", 0),
 		SelfServeCredIntake:    getenvBool("PAYMENT_SELFSERVE_CRED_INTAKE", false),
+		PixRecurrence:          getenvBool("PAYMENT_PIX_RECURRENCE", false),
 		WebhookLogPayload:      getenvBool("PAYMENT_WEBHOOK_LOG_PAYLOAD", false),
 		AccountKeySelector:     getenvBool("PAYMENT_ACCOUNT_KEY_SELECTOR", false),
 		AccountOutboundWebhook: getenvBool("PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK", false),

@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/ia-dev-sindireceita/payment/internal/domain/recurrence"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 )
 
@@ -48,6 +49,20 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // ninguém previu.
 func writeDomainError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	// PIX Automático mandate gate (recurrence.RequireApprovedMandate /
+	// RequireWithinAuthorizedValue). These are STATE conflicts, not malformed requests:
+	// the caller sent a well-formed charge that the mandate does not authorise right now.
+	// A 400 would tell an integrator to fix its payload, which is precisely the wrong
+	// thing to do — the fix is to wait for the payer's authorization, or to charge less.
+	//
+	// A mandate that is missing or belongs to another tenant collapses into the SAME 404
+	// as any other cross-tenant miss, so the mandate id space is not an existence oracle.
+	case errors.Is(err, recurrence.ErrMandateNotFound), errors.Is(err, recurrence.ErrMandateMismatch):
+		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, recurrence.ErrMandateNotApproved):
+		writeError(w, http.StatusConflict, "mandate is not approved")
+	case errors.Is(err, recurrence.ErrChargeExceedsMandate):
+		writeError(w, http.StatusConflict, "charge exceeds the authorized mandate value")
 	case errors.Is(err, shared.ErrValidation):
 		writeError(w, http.StatusBadRequest, "invalid request")
 	case errors.Is(err, shared.ErrNotFound):

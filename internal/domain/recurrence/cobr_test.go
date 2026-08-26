@@ -71,14 +71,21 @@ func TestCobRTransitions(t *testing.T) {
 		wantNoOp  bool
 		wantState recurrence.CobRStatus
 	}{
-		{name: "criada→atrasada", from: recurrence.CobRCriada, to: recurrence.CobRAtrasada, wantState: recurrence.CobRAtrasada},
-		{name: "criada→liquidada", from: recurrence.CobRCriada, to: recurrence.CobRLiquidada, wantState: recurrence.CobRLiquidada},
-		{name: "criada→removida", from: recurrence.CobRCriada, to: recurrence.CobRRemovida, wantState: recurrence.CobRRemovida},
-		{name: "atrasada→liquidada", from: recurrence.CobRAtrasada, to: recurrence.CobRLiquidada, wantState: recurrence.CobRLiquidada},
-		{name: "atrasada→removida", from: recurrence.CobRAtrasada, to: recurrence.CobRRemovida, wantState: recurrence.CobRRemovida},
-		{name: "liquidada terminal", from: recurrence.CobRLiquidada, to: recurrence.CobRRemovida, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRLiquidada},
-		{name: "removida terminal", from: recurrence.CobRRemovida, to: recurrence.CobRLiquidada, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRRemovida},
-		{name: "atrasada→criada illegal", from: recurrence.CobRAtrasada, to: recurrence.CobRCriada, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRAtrasada},
+		{name: "criada→ativa", from: recurrence.CobRCriada, to: recurrence.CobRAtiva, wantState: recurrence.CobRAtiva},
+		{name: "criada→concluida", from: recurrence.CobRCriada, to: recurrence.CobRConcluida, wantState: recurrence.CobRConcluida},
+		{name: "criada→cancelada", from: recurrence.CobRCriada, to: recurrence.CobRCancelada, wantState: recurrence.CobRCancelada},
+		{name: "ativa→concluida", from: recurrence.CobRAtiva, to: recurrence.CobRConcluida, wantState: recurrence.CobRConcluida},
+		{name: "ativa→cancelada", from: recurrence.CobRAtiva, to: recurrence.CobRCancelada, wantState: recurrence.CobRCancelada},
+		{name: "ativa→expirada", from: recurrence.CobRAtiva, to: recurrence.CobRExpirada, wantState: recurrence.CobRExpirada},
+		{name: "ativa→rejeitada", from: recurrence.CobRAtiva, to: recurrence.CobRRejeitada, wantState: recurrence.CobRRejeitada},
+		// A settled charge can never be un-settled, and a refused one can never be
+		// quietly reclassified as cancelled — a replayed webhook must not rewrite either
+		// (threat W3).
+		{name: "concluida terminal", from: recurrence.CobRConcluida, to: recurrence.CobRCancelada, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRConcluida},
+		{name: "cancelada terminal", from: recurrence.CobRCancelada, to: recurrence.CobRConcluida, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRCancelada},
+		{name: "rejeitada terminal", from: recurrence.CobRRejeitada, to: recurrence.CobRCancelada, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRRejeitada},
+		{name: "expirada terminal", from: recurrence.CobRExpirada, to: recurrence.CobRConcluida, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRExpirada},
+		{name: "ativa→criada illegal", from: recurrence.CobRAtiva, to: recurrence.CobRCriada, wantErr: shared.ErrInvalidTransition, wantState: recurrence.CobRAtiva},
 		{name: "same-status no-op", from: recurrence.CobRCriada, to: recurrence.CobRCriada, wantNoOp: true, wantState: recurrence.CobRCriada},
 		{name: "unknown status", from: recurrence.CobRCriada, to: recurrence.CobRStatus("BOGUS"), wantErr: errSentinelValidation, wantState: recurrence.CobRCriada},
 	}

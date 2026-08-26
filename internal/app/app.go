@@ -65,8 +65,17 @@ type Deps struct {
 	// ports (ISP): WebhookService depends only on the narrow readers. When nil, the
 	// recurrence webhook dispatch is not wired. In production both are the C6
 	// provider; in stub mode the in-memory StubProvider.
-	RecReader   ports.RecProvider
-	CobRReader  ports.CobRProvider
+	RecReader  ports.RecProvider
+	CobRReader ports.CobRProvider
+	// SolicRecs / LocRecs are the remaining PIX Automático write ports, used by the
+	// tenant-facing RecurrenceService (not by the webhook path): the activation request
+	// that asks a payer's participant to confirm a mandate (Jornada 1), and the payload
+	// locations the composite-QR journeys are built on (Jornadas 2/3/4). Kept separate
+	// from RecReader for the same ISP reason the readers are separate — a deployment can
+	// speak the mandate surface without the QR journeys. Nil leaves those operations
+	// unavailable rather than panicking.
+	SolicRecs   ports.SolicRecProvider
+	LocRecs     ports.LocRecProvider
 	Credentials ports.CredentialStore
 	// CredWriter is the admin-plane write path for per-tenant bank credentials.
 	// Kept separate from Credentials (the reader) so each service depends only on

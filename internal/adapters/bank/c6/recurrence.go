@@ -24,6 +24,7 @@ const (
 	recPath      = "/v2/pix/rec"
 	solicRecPath = "/v2/pix/solicrec"
 	cobrPath     = "/v2/pix/cobr"
+	locRecPath   = "/v2/pix/locrec"
 )
 
 // compile-time assertions that Provider satisfies the Recorrência ports.
@@ -31,6 +32,7 @@ var (
 	_ ports.RecProvider      = (*Provider)(nil)
 	_ ports.SolicRecProvider = (*Provider)(nil)
 	_ ports.CobRProvider     = (*Provider)(nil)
+	_ ports.LocRecProvider   = (*Provider)(nil)
 )
 
 // RecurrenceVerifier verifies a JWS-signed Recorrência read document and returns
@@ -71,10 +73,42 @@ type recebedorBody struct {
 	Nome             string `json:"nome,omitempty"`
 }
 
+// recDadosJornadaBody carries ativacao.dadosJornada.txid — the txid of the immediate
+// charge a Jornada 3 composite QR settles alongside the authorization. BACEN requires
+// it for Jornada 3 and forbids it for 1/2/4, so the whole ativacao object is a pointer
+// and is omitted unless a journey txid was supplied.
+type recDadosJornadaBody struct {
+	TxID string `json:"txid"`
+}
+
+type recAtivacaoBody struct {
+	DadosJornada recDadosJornadaBody `json:"dadosJornada"`
+}
+
+// recValorBody is the mandate's fixed amount.
+//
+// valorRec is a QUOTED decimal string on this wire ("99.00"), not a bare number: the
+// contract types it `string` with pattern \d{1,10}\.\d{2}, and every money example in
+// the captured spec is quoted. That is why it uses formatAmount (the same string
+// renderer as cobr's valor.original) rather than brlDecimal, which marshals to a bare
+// JSON number for the boleto surface. Both render from integer centavos — no float ever
+// touches an amount (SIN-65953).
+//
+// Omitted entirely for a variable-value mandate, since C6 rejects an empty valorRec.
+type recValorBody struct {
+	ValorRec string `json:"valorRec"`
+}
+
 type recRequestBody struct {
 	Vinculo             recVinculoBody    `json:"vinculo"`
 	Calendario          recCalendarioBody `json:"calendario"`
 	PoliticaRetentativa string            `json:"politicaRetentativa"`
+	// Loc binds the mandate to a payload location (locrec) so the bank can compose the
+	// QR. A pointer because 0 is not "no location" on the wire — the field must be
+	// absent, not zero.
+	Loc      *int64           `json:"loc,omitempty"`
+	Ativacao *recAtivacaoBody `json:"ativacao,omitempty"`
+	Valor    *recValorBody    `json:"valor,omitempty"`
 }
 
 type recResponseBody struct {
@@ -87,6 +121,46 @@ type recResponseBody struct {
 	Ativacao            struct {
 		TipoJornada string `json:"tipoJornada"`
 	} `json:"ativacao"`
+	// Loc is the location bound to the mandate. C6 returns it as the bare integer id
+	// on a create and as the expanded object on a read, so it is decoded leniently
+	// (locRef) rather than as one shape that a contract drift would break.
+	Loc   locRef `json:"loc"`
+	Valor struct {
+		ValorRec brlDecimal `json:"valorRec"`
+	} `json:"valor"`
+	// DadosQR is present only when the read asked the bank to compose a QR and every
+	// parameter it needs was filled in (GET /rec/{idRec}?txid=...).
+	DadosQR struct {
+		Jornada       string `json:"jornada"`
+		PixCopiaECola string `json:"pixCopiaECola"`
+	} `json:"dadosQR"`
+}
+
+// locRef decodes the mandate's loc field in either shape C6 uses: the bare integer id
+// (`"loc": 108`) or the expanded location object (`"loc": {"id": 108, "location":
+// "..."}`). Decoding both here keeps the shape drift out of every call site; an
+// unparseable value degrades to the zero location rather than failing the whole read,
+// because the location is presentation metadata and never a money-bearing field.
+type locRef struct {
+	ID       int64
+	Location string
+}
+
+func (l *locRef) UnmarshalJSON(b []byte) error {
+	var id int64
+	if err := json.Unmarshal(b, &id); err == nil {
+		l.ID = id
+		return nil
+	}
+	var obj struct {
+		ID       int64  `json:"id"`
+		Location string `json:"location"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return nil // absent/null/unknown shape → zero location, never a hard failure
+	}
+	l.ID, l.Location = obj.ID, obj.Location
+	return nil
 }
 
 func (b recResponseBody) toResult() ports.RecResult {
@@ -114,6 +188,13 @@ func (b recResponseBody) toResult() ports.RecResult {
 		},
 		PoliticaRetentativa: ports.RetryPolicy(b.PoliticaRetentativa),
 		TipoJornada:         b.Ativacao.TipoJornada,
+		LocID:               b.Loc.ID,
+		Location:            b.Loc.Location,
+		ValorRecCents:       int64(b.Valor.ValorRec),
+		DadosQR: ports.RecDadosQR{
+			Jornada:       b.DadosQR.Jornada,
+			PixCopiaECola: b.DadosQR.PixCopiaECola,
+		},
 	}
 }
 
@@ -147,6 +228,25 @@ func (p *Provider) CreateRec(ctx context.Context, tenantID string, req ports.Cre
 	if err := validateObjeto(req.Vinculo.Objeto); err != nil {
 		return ports.RecResult{}, err
 	}
+	if req.ValorRecCents < 0 {
+		return ports.RecResult{}, &Error{Op: "create_rec", sentinel: shared.ErrValidation, detail: "valor_rec_cents must not be negative"}
+	}
+	// The three Jornada fields are optional on the wire and must be ABSENT rather than
+	// zero when unused: a `loc: 0`, an empty `ativacao` or a `valorRec: "0.00"` are all
+	// rejected by C6's schema. Build them as pointers so encoding/json omits them.
+	var loc *int64
+	if req.LocID > 0 {
+		v := req.LocID
+		loc = &v
+	}
+	var ativacao *recAtivacaoBody
+	if txid := strings.TrimSpace(req.JornadaTxID); txid != "" {
+		ativacao = &recAtivacaoBody{DadosJornada: recDadosJornadaBody{TxID: txid}}
+	}
+	var valor *recValorBody
+	if req.ValorRecCents > 0 {
+		valor = &recValorBody{ValorRec: formatAmount(req.ValorRecCents)}
+	}
 	payload, err := json.Marshal(recRequestBody{
 		Vinculo: recVinculoBody{
 			Contrato: req.Vinculo.Contrato,
@@ -162,6 +262,9 @@ func (p *Provider) CreateRec(ctx context.Context, tenantID string, req ports.Cre
 			Periodicidade: string(req.Calendario.Periodicidade),
 		},
 		PoliticaRetentativa: string(req.PoliticaRetentativa),
+		Loc:                 loc,
+		Ativacao:            ativacao,
+		Valor:               valor,
 	})
 	if err != nil {
 		return ports.RecResult{}, &Error{Op: "create_rec", sentinel: shared.ErrValidation}
@@ -193,6 +296,37 @@ func (p *Provider) GetRec(ctx context.Context, tenantID, idRec string) (ports.Re
 	var b recResponseBody
 	if err := decodeData(payload, &b); err != nil {
 		return ports.RecResult{}, &Error{Op: "get_rec", sentinel: shared.ErrUnavailable, detail: "malformed signed body"}
+	}
+	return b.toResult(), nil
+}
+
+// GetRecForQR reads the mandate asking C6 to compose the QR for a journey
+// (GET /v2/pix/rec/{idRec}?txid={txid}). The txid selects which QR is composed: the
+// txid of an immediate charge yields JORNADA_3 (the composite QR that settles the
+// first charge AND authorizes the recurrence), the txid of a cobrança com vencimento
+// yields JORNADA_4, and an empty txid yields JORNADA_2 (mandate parameters only).
+//
+// It is the same JWS-verified read as GetRec — the mandate document is the BACEN
+// non-repudiation artifact whichever way it is fetched, and degrading THIS read to an
+// unverified one would hand an attacker the QR the payer scans. C6 fills dadosQR only
+// when every parameter the QR needs is present on both the mandate and the referenced
+// charge; a missing dadosQR is therefore not an error here, it is "not composable
+// yet", and the caller decides what to do about it.
+func (p *Provider) GetRecForQR(ctx context.Context, tenantID, idRec, txID string) (ports.RecResult, error) {
+	if strings.TrimSpace(idRec) == "" {
+		return ports.RecResult{}, &Error{Op: "get_rec_qr", sentinel: shared.ErrValidation}
+	}
+	endpoint := p.baseURL + recPath + "/" + url.PathEscape(idRec)
+	if txid := strings.TrimSpace(txID); txid != "" {
+		endpoint += "?txid=" + url.QueryEscape(txid)
+	}
+	payload, err := p.signedRead(ctx, tenantID, "get_rec_qr", endpoint)
+	if err != nil {
+		return ports.RecResult{}, err
+	}
+	var b recResponseBody
+	if err := decodeData(payload, &b); err != nil {
+		return ports.RecResult{}, &Error{Op: "get_rec_qr", sentinel: shared.ErrUnavailable, detail: "malformed signed body"}
 	}
 	return b.toResult(), nil
 }
@@ -324,6 +458,10 @@ func (p *Provider) GetSolicRec(ctx context.Context, tenantID, idSolicRec string)
 
 // ---- cobr (cobrança recorrente) ----
 
+// cobrStatusCancelada is the only value the BACEN cobr revision accepts
+// (CobRStatusRevisada.status enum has exactly this one member).
+const cobrStatusCancelada = "CANCELADA"
+
 type cobrCalendarioBody struct {
 	DataDeVencimento string `json:"dataDeVencimento"`
 }
@@ -418,23 +556,35 @@ func (p *Provider) CreateCobR(ctx context.Context, tenantID string, req ports.Cr
 	return out.Data.toResult(), nil
 }
 
-// ReviseCobR updates a not-yet-settled charge instance (PUT /v2/pix/cobr/{txid}).
-func (p *Provider) ReviseCobR(ctx context.Context, tenantID string, req ports.CreateCobRRequest) (ports.CobRResult, error) {
-	if strings.TrimSpace(req.TxID) == "" || strings.TrimSpace(req.IDRec) == "" || req.ValorCents <= 0 {
-		return ports.CobRResult{}, &Error{Op: "revise_cobr", sentinel: shared.ErrValidation}
+// CancelCobR cancels one scheduled charge instance: PATCH /v2/pix/cobr/{txid} with
+// {"status":"CANCELADA"}.
+//
+// PATCH, not PUT. On this surface PUT /cobr/{txid} is the CREATE (201, full cobr body,
+// txid defined by the client) and PATCH is the revision — whose only revisable field is
+// `status` and whose only allowed value is CANCELADA. An earlier version of this method
+// sent the full create body over PUT under the name "revise", which is the create call
+// wearing another name: it could never amend anything, and against an existing txid it
+// either no-ops or re-registers the instalment. The txid is forwarded as the
+// Idempotency-Key so a retried cancel collapses to one effect.
+func (p *Provider) CancelCobR(ctx context.Context, tenantID, txID string) (ports.CobRResult, error) {
+	txID = strings.TrimSpace(txID)
+	if txID == "" {
+		return ports.CobRResult{}, &Error{Op: "cancel_cobr", sentinel: shared.ErrValidation}
 	}
-	payload, err := json.Marshal(buildCobRBody(req))
+	payload, err := json.Marshal(struct {
+		Status string `json:"status"`
+	}{Status: cobrStatusCancelada})
 	if err != nil {
-		return ports.CobRResult{}, &Error{Op: "revise_cobr", sentinel: shared.ErrValidation}
+		return ports.CobRResult{}, &Error{Op: "cancel_cobr", sentinel: shared.ErrValidation}
 	}
-	httpReq, err := p.authedJSONRequest(ctx, tenantID, "revise_cobr", http.MethodPut, p.baseURL+cobrPath+"/"+url.PathEscape(req.TxID), payload, req.TxID)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, "cancel_cobr", http.MethodPatch, p.baseURL+cobrPath+"/"+url.PathEscape(txID), payload, txID)
 	if err != nil {
 		return ports.CobRResult{}, err
 	}
 	var out struct {
 		Data cobrResponseBody `json:"data"`
 	}
-	if err := p.do(httpReq, "revise_cobr", &out); err != nil {
+	if err := p.do(httpReq, "cancel_cobr", &out); err != nil {
 		return ports.CobRResult{}, err
 	}
 	return out.Data.toResult(), nil

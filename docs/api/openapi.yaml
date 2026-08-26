@@ -57,6 +57,14 @@ security:
 tags:
   - name: PIX
     description: Cobrança PIX imediata e com vencimento (cobv).
+  - name: Recorrência
+    description: >-
+      PIX Automático (recorrência BACEN), flag-gated `PAYMENT_PIX_RECURRENCE`
+      (default-off): mandato de débito recorrente (`rec`), solicitação de
+      confirmação ao pagador (`solicrec`), cobranças de cada ciclo (`cobr`) e as
+      locations de payload (`locrec`) que compõem o QR Code composto.
+      A jornada implementada é a **Jornada 3** — um único QR que liquida a
+      primeira cobrança e autoriza os débitos futuros.
   - name: Checkout
     description: Sessão de checkout hospedado (venda online).
   - name: Boleto
@@ -286,6 +294,310 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
         "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/pix/locrec:
+    post:
+      operationId: createLocRec
+      tags: [Recorrência]
+      summary: Criar location de payload da recorrência
+      description: >-
+        Cria a *location* — a URL de onde o app do pagador lê os parâmetros da
+        recorrência ao ler o QR composto. **Não tem corpo de requisição**: a
+        location é emitida a partir da empresa autenticada, e não há campo que
+        permita direcionar para onde o QR aponta. O `id` devolvido é o que se
+        informa em `loc_id` ao criar o mandato.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "201":
+          description: Location criada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LocRec" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+  /v1/pix/locrec/{id}:
+    get:
+      operationId: getLocRec
+      tags: [Recorrência]
+      summary: Consultar location de payload
+      parameters:
+        - $ref: "#/components/parameters/PathLocRecID"
+      responses:
+        "200":
+          description: Location (com o mandato vinculado, se houver).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LocRec" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+  /v1/pix/locrec/{id}/idrec:
+    delete:
+      operationId: unlinkLocRec
+      tags: [Recorrência]
+      summary: Desvincular o mandato de uma location
+      description: >-
+        Solta a location para que possa ser reaproveitada por outro mandato — o
+        caminho de recuperação depois de um mandato cancelado ou nunca autorizado.
+        Idempotente.
+      parameters:
+        - $ref: "#/components/parameters/PathLocRecID"
+      responses:
+        "200":
+          description: Location liberada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LocRec" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+
+  /v1/pix/rec:
+    post:
+      operationId: createRec
+      tags: [Recorrência]
+      summary: Criar mandato de débito recorrente
+      description: >-
+        Registra o mandato (`rec`). Ele nasce **CRIADA e não é cobrável**: só
+        depois que o pagador autorizar no app do próprio banco — e essa aprovação
+        chegar pelo webhook conciliado — é que uma cobrança recorrente é aceita.
+        Para a Jornada 3, informe `loc_id` (de `createLocRec`) e `journey_txid`
+        (o `txid` de uma cobrança imediata **já criada**): é o `journey_txid` que
+        amarra o primeiro pagamento à autorização no mesmo QR.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRecRequest" }
+      responses:
+        "201":
+          description: Mandato criado (status CRIADA).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rec" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+  /v1/pix/rec/{idRec}:
+    get:
+      operationId: getRec
+      tags: [Recorrência]
+      summary: Consultar mandato (ou obter o QR composto)
+      description: >-
+        Sem parâmetros, concilia o estado do mandato com o PSP. Com `qr=true`,
+        pede ao PSP que **componha o QR** e devolve o Pix Copia e Cola em `qr`.
+        O `txid` é opcional: por padrão usa o `journey_txid` gravado na criação,
+        de modo que a loja não precisa guardar o vínculo mandato→cobrança. Um
+        `txid` explícito compõe a jornada correspondente (cobrança com vencimento
+        ⇒ JORNADA_4). Responde **409** quando o PSP ainda não tem tudo o que
+        precisa para compor o QR — em vez de devolver um QR vazio, que apareceria
+        quebrado para o pagador.
+      parameters:
+        - $ref: "#/components/parameters/PathIDRec"
+        - name: qr
+          in: query
+          required: false
+          description: "`true` pede a composição do QR."
+          schema: { type: boolean, default: false }
+        - name: txid
+          in: query
+          required: false
+          description: Sobrepõe a cobrança que o QR composto liquida.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Mandato (com `qr` quando solicitado e disponível).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rec" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: QR composto ainda não disponível para este mandato.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "composite QR not available for this mandate yet" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+    delete:
+      operationId: cancelRec
+      tags: [Recorrência]
+      summary: Cancelar mandato
+      description: >-
+        Revoga o mandato no PSP para que nenhum débito futuro possa ser
+        originado, e registra a transição CANCELADA. Idempotente.
+      parameters:
+        - $ref: "#/components/parameters/PathIDRec"
+      responses:
+        "200":
+          description: Mandato cancelado.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rec" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+
+  /v1/pix/solicrec:
+    post:
+      operationId: createSolicRec
+      tags: [Recorrência]
+      summary: Solicitar confirmação da recorrência ao pagador
+      description: >-
+        Jornada 1 (sem QR): envia o mandato para a instituição do pagador, que o
+        apresenta para aceite no próprio app. `expires_at` é validado nesta API —
+        deve estar no futuro e a menos de 30 dias (BACEN CMT-APR-SOLI-016).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSolicRecRequest" }
+      responses:
+        "201":
+          description: Solicitação enviada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SolicRec" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+  /v1/pix/solicrec/{idSolicRec}:
+    get:
+      operationId: getSolicRec
+      tags: [Recorrência]
+      summary: Consultar solicitação de confirmação
+      parameters:
+        - name: idSolicRec
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Situação da solicitação.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SolicRec" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+
+  /v1/pix/cobr:
+    post:
+      operationId: createCobR
+      tags: [Recorrência]
+      summary: Originar cobrança recorrente do ciclo
+      description: >-
+        Cria uma cobrança contra um mandato **APROVADA**. Responde **409** se o
+        mandato ainda não foi autorizado pelo pagador, ou se o valor excede o teto
+        que ele autorizou — são conflitos de estado, não erros de payload.
+        Idempotente pelo `txid`: reenviar o mesmo `txid` devolve a cobrança
+        existente, sem segundo débito e sem segunda tarifação.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CobRRequest" }
+      responses:
+        "201":
+          description: Cobrança recorrente criada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobR" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/MandateConflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+  /v1/pix/cobr/{txid}:
+    get:
+      operationId: getCobR
+      tags: [Recorrência]
+      summary: Consultar cobrança recorrente
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+      responses:
+        "200":
+          description: Cobrança (conciliada com o PSP).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobR" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+    delete:
+      operationId: cancelCobR
+      tags: [Recorrência]
+      summary: Cancelar uma cobrança do ciclo
+      description: >-
+        Cancela **uma** parcela sem tocar no mandato: a autorização do pagador
+        continua de pé e os ciclos seguintes seguem cobrando. É a única alteração
+        que o contrato BACEN admite numa cobrança recorrente — não há como mudar
+        valor ou vencimento de uma parcela já criada. Para cobrar outro valor,
+        cancele esta e crie uma nova; assim cada débito continua rastreável à
+        cobrança que o autorizou, em vez de um mesmo `txid` significar dois
+        valores diferentes. Idempotente. Não estorna um pagamento já liquidado.
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+      responses:
+        "200":
+          description: Cobrança cancelada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobR" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
+  /v1/pix/cobr/{txid}/retentativa/{data}:
+    post:
+      operationId: retryCobR
+      tags: [Recorrência]
+      summary: Solicitar retentativa de uma cobrança falhada
+      description: >-
+        Agenda a retentativa conforme a política de retentativa do mandato. O
+        portão do mandato continua valendo: um mandato cancelado ou expirado não
+        pode voltar a debitar um pagador que já revogou a autorização.
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+        - name: data
+          in: path
+          required: true
+          description: Data da retentativa (yyyy-MM-dd).
+          schema: { type: string, format: date }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_rec]
+              properties:
+                id_rec: { type: string, description: Mandato da cobrança. }
+                bank: { type: string, description: "Banco (multi-banco, opcional)." }
+      responses:
+        "200":
+          description: Retentativa agendada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobR" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/MandateConflict" }
+        "503": { $ref: "#/components/responses/RecurrenceUnavailable" }
 
   /v1/checkout:
     post:
@@ -1154,6 +1466,18 @@ components:
       in: path
       required: true
       schema: { type: string }
+    PathIDRec:
+      name: idRec
+      in: path
+      required: true
+      description: Identificador BACEN do mandato de recorrência (29 caracteres).
+      schema: { type: string }
+    PathLocRecID:
+      name: id
+      in: path
+      required: true
+      description: Identificador da location de payload (inteiro atribuído pelo PSP).
+      schema: { type: integer, format: int64 }
     PathTenantID:
       name: tenantID
       in: path
@@ -1211,6 +1535,27 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: "conflict" }
+    MandateConflict:
+      description: >-
+        Conflito de estado do mandato: ainda não autorizado pelo pagador
+        (`APROVADA` pendente) ou valor acima do teto autorizado. O payload está
+        correto — o que falta é a autorização, ou um valor menor.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            notApproved: { value: { error: "mandate is not approved" } }
+            overCharge: { value: { error: "charge exceeds the authorized mandate value" } }
+    RecurrenceUnavailable:
+      description: >-
+        Superfície de recorrência indisponível — o serviço não está ligado neste
+        ambiente, ou a leitura de mandato está fechada por segurança enquanto o
+        verificador JWS do PSP (`PAYMENT_C6_REC_JWKS_URL`) não estiver
+        configurado. É transitório e vale repetir depois.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "recurrence unavailable" }
     TooManyRequests:
       description: Rate limit excedido (burst 20, 10 req/s por empresa). Faça backoff.
     InternalError:
@@ -1227,6 +1572,150 @@ components:
       required: [error]
       properties:
         error: { type: string, description: Mensagem curta e segura (sem detalhe interno). }
+
+    LocRec:
+      type: object
+      description: Location de payload da recorrência — a URL que o QR composto aponta.
+      required: [id, location]
+      properties:
+        id: { type: integer, format: int64, description: "Identificador da location, informado em `loc_id` ao criar o mandato." }
+        location: { type: string, description: URL embutida no QR composto. }
+        criacao: { type: string, format: date-time }
+        id_rec: { type: string, description: Mandato vinculado à location (ausente quando livre). }
+
+    RecDevedor:
+      type: object
+      description: Pagador vinculado ao mandato. `tax_id` com 11 dígitos é CPF, 14 é CNPJ.
+      required: [tax_id, name]
+      properties:
+        tax_id: { type: string, description: "CPF (11) ou CNPJ (14), somente dígitos." }
+        name: { type: string }
+
+    CreateRecRequest:
+      type: object
+      description: >-
+        Registro de um mandato de débito recorrente. Para a Jornada 3, `loc_id` e
+        `journey_txid` são o que compõem o QR único (pagar agora + autorizar).
+      required: [contrato, devedor, data_inicial, periodicidade, retry_policy]
+      properties:
+        contrato: { type: string, description: Contrato/pedido que o pagador reconhece. }
+        objeto: { type: string, description: "Texto livre do objeto da recorrência. O PSP recusa espaços em branco." }
+        devedor: { $ref: "#/components/schemas/RecDevedor" }
+        data_inicial: { type: string, format: date, description: Data estimada do primeiro pagamento (yyyy-MM-dd). }
+        periodicidade:
+          type: string
+          enum: [SEMANAL, MENSAL, TRIMESTRAL, SEMESTRAL, ANUAL]
+        retry_policy:
+          type: string
+          description: Política de retentativa pós-vencimento.
+          enum: [NAO_PERMITE, PERMITE_3R_7D]
+        loc_id: { type: integer, format: int64, description: Location de `createLocRec`. Obrigatória para as jornadas com QR. }
+        journey_txid:
+          type: string
+          description: >-
+            `txid` de uma cobrança imediata **já criada**, que o QR composto
+            liquida no mesmo gesto em que autoriza a recorrência (Jornada 3).
+        amount_cents:
+          type: integer
+          format: int64
+          description: >-
+            Valor fixo de cada ciclo, em centavos. Omitido (0) = mandato de valor
+            variável. Quando informado, vira o **teto** de toda cobrança do ciclo.
+        bank: { type: string, description: "Banco (multi-banco, opcional)." }
+
+    RecQR:
+      type: object
+      description: QR composto gerado pelo PSP.
+      required: [jornada, pix_copia_e_cola]
+      properties:
+        jornada:
+          type: string
+          enum: [JORNADA_2, JORNADA_3, JORNADA_4]
+          description: "Qual QR foi composto: mandato apenas, mandato + cobrança imediata, ou mandato + cobrança com vencimento."
+        pix_copia_e_cola: { type: string, description: BR Code que o pagador lê. }
+
+    Rec:
+      type: object
+      description: >-
+        Mandato de débito recorrente. **Não** ecoa os dados do pagador: são a
+        única PII de titular que o serviço guarda (ADR-0008) e nada nesta resposta
+        precisa deles.
+      required: [id_rec, status]
+      properties:
+        id_rec: { type: string }
+        status:
+          type: string
+          enum: [CRIADA, APROVADA, REJEITADA, EXPIRADA, CANCELADA]
+          description: "`CRIADA` **não** é cobrável — o pagador ainda não autorizou."
+        journey_status:
+          type: string
+          description: "Estágio da jornada de ativação (ex.: `AGUARDANDO_DEFINICAO` até o pagador aprovar)."
+        contrato: { type: string }
+        data_inicial: { type: string, format: date }
+        periodicidade: { type: string }
+        retry_policy: { type: string }
+        amount_cents: { type: integer, format: int64, description: Teto autorizado (ausente em mandato de valor variável). }
+        loc_id: { type: integer, format: int64 }
+        location: { type: string }
+        qr: { $ref: "#/components/schemas/RecQR" }
+
+    CreateSolicRecRequest:
+      type: object
+      description: Solicitação de confirmação do mandato à instituição do pagador (Jornada 1).
+      required: [id_rec, tax_id, agencia, conta, ispb_participante, expires_at]
+      properties:
+        id_rec: { type: string }
+        tax_id: { type: string, description: CPF (11) ou CNPJ (14) do pagador. }
+        agencia: { type: string }
+        conta: { type: string }
+        ispb_participante: { type: string, description: ISPB da instituição do pagador. }
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiração da solicitação (RFC 3339). Deve estar no futuro e a menos de 30 dias.
+        bank: { type: string }
+
+    SolicRec:
+      type: object
+      required: [id_solic_rec, id_rec, status]
+      properties:
+        id_solic_rec: { type: string }
+        id_rec: { type: string }
+        status: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    CobRRequest:
+      type: object
+      description: >-
+        Cobrança recorrente de um ciclo. Só é usada na CRIAÇÃO — uma cobrança já
+        criada não pode ter valor nem vencimento alterados (ver `cancelCobR`).
+      required: [id_rec, due_date, amount_cents]
+      properties:
+        id_rec: { type: string, description: Mandato APROVADA contra o qual cobrar. }
+        txid:
+          type: string
+          description: >-
+            Âncora anti-dupla-cobrança. Reenviar o mesmo `txid` devolve a mesma
+            cobrança, sem segundo débito.
+        due_date: { type: string, format: date, description: Data da cobrança (yyyy-MM-dd). }
+        amount_cents: { type: integer, format: int64, description: Valor em centavos. Nunca pode exceder o teto do mandato. }
+        bank: { type: string }
+
+    CobR:
+      type: object
+      required: [txid, id_rec, status, amount_cents]
+      properties:
+        txid: { type: string }
+        id_rec: { type: string }
+        status:
+          type: string
+          description: >-
+            Vocabulário BACEN da cobrança recorrente. `CONCLUIDA` é liquidada;
+            `REJEITADA` é recusa do banco do pagador (cobre de novo / fale com o
+            cliente); `CANCELADA` foi decisão sua.
+          enum: [CRIADA, ATIVA, CONCLUIDA, EXPIRADA, REJEITADA, CANCELADA]
+        due_date: { type: string, format: date }
+        amount_cents: { type: integer, format: int64 }
 
     OutboundNotification:
       type: object

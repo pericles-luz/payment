@@ -56,11 +56,24 @@ type StubProvider struct {
 	recs      map[string]ports.RecResult
 	solicRecs map[string]ports.SolicRecResult
 	cobrs     map[string]ports.CobRResult
+	// recJornadaTxID remembers the immediate-charge txid a mandate was created against
+	// (ativacao.dadosJornada.txid, Jornada 3), keyed like recs. The bank composes the
+	// QR only when the mandate and the referenced charge agree on that txid, so the
+	// stub keeps it to reproduce that rule instead of composing a QR for any txid.
+	recJornadaTxID map[string]string
 	// recWebhooks / cobrWebhooks hold the singleton recurrence callback URLs
 	// registered per tenant (PIX Automático, SIN-66036), keyed by tenantID. Unlike
 	// the immediate-PIX webhook (per chave), these are one-per-recebedor.
 	recWebhooks  map[string]ports.WebhookRegistration
 	cobrWebhooks map[string]ports.WebhookRegistration
+	// locRecs holds the PIX Automático payload locations (locrec) minted per tenant,
+	// keyed by tenantID+"\x00"+id. locRecSeq is the per-provider id counter: the real
+	// C6 ids are int64s assigned by the bank, so the stub hands out 1, 2, 3… under the
+	// same mutex, and locRecByIdem collapses a retried mint onto the location it
+	// already produced (a retry must not leak a fresh location every attempt).
+	locRecs      map[string]ports.LocRecResult
+	locRecByIdem map[string]int64
+	locRecSeq    int64
 }
 
 // stubPixCharge is the in-memory record for an immediate PIX charge: the port
@@ -90,10 +103,13 @@ func NewStubProvider(creds ports.CredentialStore) *StubProvider {
 		ddaGroupByIdem: make(map[string]string),
 		stmtEntries:    make(map[string][]ports.StatementEntry),
 		recs:           make(map[string]ports.RecResult),
+		recJornadaTxID: make(map[string]string),
 		solicRecs:      make(map[string]ports.SolicRecResult),
 		cobrs:          make(map[string]ports.CobRResult),
 		recWebhooks:    make(map[string]ports.WebhookRegistration),
 		cobrWebhooks:   make(map[string]ports.WebhookRegistration),
+		locRecs:        make(map[string]ports.LocRecResult),
+		locRecByIdem:   make(map[string]int64),
 	}
 }
 
