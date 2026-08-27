@@ -2,8 +2,8 @@ name: CD staging
 
 # Durable CD for the payment receptor (SIN-65900, CEO Opção A on SIN-65858).
 #
-# Mirrors the go-mei-das binary-rsync deploy (build → ship → systemd restart →
-# /healthz smoke); it deliberately does NOT copy the crm docker/cosign/SBOM
+# Mirrors the go-mei-das binary-rsync deploy (build → preflight → ship → systemd
+# restart → /healthz smoke); it deliberately does NOT copy the crm docker/cosign/SBOM
 # pipeline — payment has no Dockerfile, it is a single Go binary (cmd/api).
 #
 # Trigger: chained on the `CI` workflow succeeding on `main` (workflow_run), plus
@@ -62,7 +62,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: build, ship, restart, smoke
+    name: build, preflight, ship, restart, smoke
     runs-on: ubuntu-latest
     # Owner gate: upstream-only. On workflow_run we additionally require the
     # upstream CI run to have CONCLUDED SUCCESSFULLY (a failed/cancelled CI must
@@ -125,6 +125,34 @@ jobs:
           key: ${{ secrets.PAYMENT_STG_SSH_KEY }}
           known_hosts: ${{ secrets.PAYMENT_STG_HOST_KEY }}
           if_key_exists: fail
+
+      - name: Preflight (prove the deploy path BEFORE shipping a binary)
+        # The read-only `preflight` verb of the wrapper. It installs nothing and
+        # restarts nothing — it only asserts that the whole deploy path is intact:
+        # host-key pin, publickey auth, the authorized_keys command= landing on the
+        # wrapper, and the unit being known.
+        #
+        # Why this step exists (SIN-70001). After the lmhost cutover the deploy key was
+        # installed under /home/payment while the account's home is /opt/payment, so
+        # sshd never read it and every deploy died on `Permission denied (publickey)`.
+        # That took six days to surface, because only a merge to main runs this workflow
+        # and /healthz kept serving the last shipped binary, looking healthy the whole
+        # time. Failing HERE turns that class of breakage into one obvious red step with
+        # a pointer to the runbook, instead of an opaque ssh error at ship time.
+        #
+        # It runs before the ship step and after the key install, so a broken deploy path
+        # never gets as far as streaming a binary at the host.
+        env:
+          STG_HOST: ${{ secrets.PAYMENT_STG_HOST }}
+          STG_USER: ${{ secrets.PAYMENT_STG_USER }}
+        run: |
+          set -euo pipefail
+          { set +x; } 2>/dev/null
+          if ! ssh -o StrictHostKeyChecking=yes -o BatchMode=yes \
+                 -o ConnectTimeout=15 "${STG_USER}@${STG_HOST}" preflight; then
+            echo "::error::preflight failed — the CD cannot reach or authenticate to the deploy target, so nothing was shipped. Diagnose in the order given by docs/deploy/staging.md section 11: (1) does sshd on the target log the runner's attempt for the deploy user; (2) is authorized_keys under that account's REAL home (getent passwd), not an assumed /home; (3) only then suspect the key material. Do NOT start by rotating the key."
+            exit 1
+          fi
 
       - name: Ship + deploy (pipe binary over the locked deploy verb on stdin)
         # set +x so the host/user never leak into logs. The deploy key is pinned on
