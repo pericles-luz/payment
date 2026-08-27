@@ -6,8 +6,10 @@
 > [`docs/security/adr-0006-payment-staging-deploy.md`](../security/adr-0006-payment-staging-deploy.md).
 
 - **Service:** payment receptor, single Go binary `cmd/api`.
-- **Listens:** `:8080`, `/healthz`, behind HAProxy at `payment.lmhost.com.br`.
-- **VPS:** `143.198.66.140`.
+- **Listens:** `:8080`, `/healthz`, published at `payment.lmhost.com.br`.
+- **Host:** `pre-prod`, SSH on `201.23.79.48:22`, behind the Caddy balancer
+  ([`cutover-lmhost.md`](cutover-lmhost.md), 21/08/2026). Was `143.198.66.140` behind
+  HAProxy before the cutover.
 - **Decision:** durable CD, Opção A ([SIN-65858](/SIN/issues/SIN-65858), [SIN-65900](/SIN/issues/SIN-65900)).
 
 > 🔐 **No secret is ever pasted into a Paperclip thread.** The C6 client cert/key,
@@ -37,7 +39,17 @@ sudo install -d -o payment -g payment -m 0755 /opt/payment
 sudo install -d -o payment -g payment -m 0755 /opt/payment/bin
 sudo install -d -o payment -g payment -m 0755 /opt/payment/incoming
 sudo install -d -o payment -g payment -m 0700 /opt/payment/c6   # holds 0600 cert/key
+
+# Whatever the account's home turned out to be, WRITE IT DOWN — §5b installs the CD
+# key relative to it, and getting it wrong fails silently (§11).
+getent passwd payment | cut -d: -f6
 ```
+
+> `--create-home` on a `--system` account gives `/home/payment` on Ubuntu. A host
+> provisioned differently — created without `-m`, or with `--home-dir /opt/payment` so
+> the account lives inside its own install tree — will have a different home. Both are
+> fine; what is **not** fine is assuming which one you have. `pre-prod` is the second
+> shape (`/opt/payment`).
 
 ---
 
@@ -95,15 +107,35 @@ ssh-keygen -t ed25519 -f payment-cd -C payment-cd -N ''
 
 ### 5b. Authorize the PUBLIC key on the VPS, pinned to the wrapper
 
-Append to `/home/payment/.ssh/authorized_keys` (create dir as `payment`, mode 0700;
-file mode 0600). The `command=` forces every connection through the wrapper:
+> **Derive the home directory — never assume `/home/payment`.** `sshd` resolves
+> `AuthorizedKeysFile .ssh/authorized_keys` **relative to the account's home**, and
+> `payment` is a *system* account whose home depends on how it was created:
+> `/home/payment` when added with `useradd -m`, but `/opt/payment` on a host where it
+> was created alongside the install tree. Writing the key to the wrong path fails
+> **silently** — `sshd` simply finds no `authorized_keys`, the client exhausts its
+> identities, and the only trace is `Connection closed … [preauth]` with **no**
+> `Failed publickey` line naming a fingerprint. See §11.
+
+The `command=` forces every connection through the wrapper:
 
 ```bash
-sudo install -d -o payment -g payment -m 0700 /home/payment/.ssh
+HOME_DIR="$(getent passwd payment | cut -d: -f6)"   # do NOT hardcode this
+[ -n "$HOME_DIR" ] || { echo "user 'payment' does not exist"; exit 1; }
+
+sudo install -d -o payment -g payment -m 0700 "$HOME_DIR/.ssh"
 PUB="$(cat payment-cd.pub)"   # the public key you just generated
 printf 'command="/opt/payment/bin/payment-deploy.sh",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding %s\n' \
-  "$PUB" | sudo -u payment tee -a /home/payment/.ssh/authorized_keys
-sudo -u payment chmod 0600 /home/payment/.ssh/authorized_keys
+  "$PUB" | sudo -u payment tee -a "$HOME_DIR/.ssh/authorized_keys"
+sudo -u payment chmod 0600 "$HOME_DIR/.ssh/authorized_keys"
+```
+
+Confirm the file is where `sshd` will actually look for it, and that `$HOME_DIR`
+itself is not group/world-writable (`StrictModes yes` refuses the key otherwise):
+
+```bash
+sudo sshd -T | grep -i '^authorizedkeysfile'        # → .ssh/authorized_keys …
+sudo ssh-keygen -lf "$HOME_DIR/.ssh/authorized_keys"
+stat -c '%A %U:%G %n' "$HOME_DIR"                   # → drwxr-xr-x or drwx------
 ```
 
 > A forced `command=` intercepts **every** connection on this key — there is **no
@@ -126,11 +158,14 @@ GitHub Actions secrets in step 7. Delete your local copies once the secrets are 
 The workflow pins `known_hosts`, so capture it now:
 
 ```bash
-ssh-keyscan -t ed25519 143.198.66.140
-# → 143.198.66.140 ssh-ed25519 AAAA...   (one line)
+ssh-keyscan -t ed25519 "$STG_HOST"
+# → <host> ssh-ed25519 AAAA...   (one line)
 ```
 
-That exact line is the `PAYMENT_STG_HOST_KEY` secret.
+That exact line is the `PAYMENT_STG_HOST_KEY` secret. It must be captured against the
+**same** address that goes into `PAYMENT_STG_HOST` — the workflow runs with
+`StrictHostKeyChecking=yes`, so a pin taken from a different address fails the
+handshake before authentication is even attempted.
 
 ---
 
@@ -142,19 +177,31 @@ repo (the fork has none and the job is a no-op there). Names used by `cd-stg.yml
 | Secret | Value |
 |--------|-------|
 | `PAYMENT_STG_SSH_KEY` | the **private** `payment-cd` key (full PEM, including header/footer) |
-| `PAYMENT_STG_HOST` | `143.198.66.140` |
+| `PAYMENT_STG_HOST` | SSH address of the deploy target — **`201.23.79.48` (`pre-prod`) since the lmhost cutover of 21/08/2026**; was `143.198.66.140` before it |
 | `PAYMENT_STG_USER` | `payment` |
-| `PAYMENT_STG_HOST_KEY` | the `ssh-keyscan` line from step 6 (no TOFU) |
+| `PAYMENT_STG_HOST_KEY` | the `ssh-keyscan` line from step 6, captured against that same address (no TOFU) |
 | `PAYMENT_STG_SMOKE_URL` | `https://payment.lmhost.com.br` (the workflow appends `/healthz`) |
+
+> `PAYMENT_STG_HOST` is the **SSH** address and is not the address that serves the
+> site: `pre-prod` has no public IP on an interface, it is per-port NAT with only 22
+> forwarded, and HTTPS arrives through the Caddy balancer. So `PAYMENT_STG_HOST` and
+> `PAYMENT_STG_SMOKE_URL` legitimately point at different places — see
+> [`cutover-lmhost.md`](cutover-lmhost.md).
 
 ```bash
 # example with gh CLI (run where the private key file lives):
+STG_HOST='201.23.79.48'    # the CURRENT deploy target; confirm before running
 gh secret set PAYMENT_STG_SSH_KEY   --repo pericles-luz/payment < payment-cd
-gh secret set PAYMENT_STG_HOST      --repo pericles-luz/payment --body '143.198.66.140'
+gh secret set PAYMENT_STG_HOST      --repo pericles-luz/payment --body "$STG_HOST"
 gh secret set PAYMENT_STG_USER      --repo pericles-luz/payment --body 'payment'
-gh secret set PAYMENT_STG_HOST_KEY  --repo pericles-luz/payment --body '143.198.66.140 ssh-ed25519 AAAA...'
+gh secret set PAYMENT_STG_HOST_KEY  --repo pericles-luz/payment --body "$(ssh-keyscan -t ed25519 "$STG_HOST" 2>/dev/null)"
 gh secret set PAYMENT_STG_SMOKE_URL --repo pericles-luz/payment --body 'https://payment.lmhost.com.br'
 ```
+
+> Moving the deploy target means updating **four** things together: the
+> `authorized_keys` on the new host (§5b — mind the home directory), `PAYMENT_STG_HOST`,
+> `PAYMENT_STG_HOST_KEY` and, if the account differs, `PAYMENT_STG_USER`. Updating only
+> some of them is what broke the CD for six days after the lmhost cutover (§11).
 
 After setting the secrets, securely delete your local `payment-cd` / `payment-cd.pub`.
 
@@ -313,3 +360,65 @@ binary is still running because the new one crash-loops):
    `workflow_dispatch` from that commit (or re-run the last green deploy).
 2. Or, on the VPS, reinstall a retained good binary and `sudo systemctl restart payment-api`.
 3. Confirm with `curl -fsS http://127.0.0.1:8080/healthz` and check the `commit` field.
+
+---
+
+## 11. Troubleshooting: CD fails with `Permission denied (publickey)`
+
+Happened for real after the lmhost cutover (26/08/2026, run `33024654384`). Worth
+reading before touching keys, because the obvious suspects were all innocent.
+
+**Diagnose in this order — cheapest and most decisive first.**
+
+1. **Did the runner reach the right host and user?** On the target:
+
+   ```bash
+   sudo journalctl -u ssh --since '-1h' | grep payment
+   ```
+
+   A line like `Connection closed by authenticating user payment <IP> [preauth]`
+   timestamped at the failure proves host, port and **user** are all correct — the
+   runner arrived and only the key was refused. `<IP>` is an Azure address (the
+   GitHub runner). No such line means the connection never landed: suspect
+   `PAYMENT_STG_HOST`, NAT/port-forwarding or the firewall instead.
+
+2. **Is the key in the path `sshd` actually reads?** This is the one that bit us:
+
+   ```bash
+   sudo sshd -T | grep -i '^authorizedkeysfile'      # .ssh/authorized_keys — RELATIVE TO HOME
+   HOME_DIR="$(getent passwd payment | cut -d: -f6)"
+   sudo ssh-keygen -lf "$HOME_DIR/.ssh/authorized_keys"
+   ```
+
+   The cutover installed the key at `/home/payment/.ssh/authorized_keys` by following
+   §5b when that path was hardcoded, but on `pre-prod` the account's home is
+   `/opt/payment`. `sshd` looked in `/opt/payment/.ssh/`, which did not exist, so the
+   key was never consulted. Fix: recreate it under the real home
+   (`install -d -o payment -g payment -m 0700 "$HOME_DIR/.ssh"`, file 0600).
+
+   **The failure mode is silent by design.** With no `authorized_keys` at all there is
+   no `Failed publickey … SHA256:…` line to grep — `sshd` has nothing to reject, so the
+   client just exhausts its identities and closes. Absence of that line is itself the
+   signal.
+
+3. **Does the key authenticate?** The wrapper exposes a read-only verb, so this is
+   safe to run against a live host — it installs nothing and restarts nothing:
+
+   ```bash
+   ssh -i payment-cd payment@"$STG_HOST" preflight     # → "[payment-deploy] preflight ok"
+   ```
+
+4. **Only then suspect the key material itself.** Compare the fingerprint authorized on
+   the host with the one in the secret. Do **not** start by rotating: an unnecessary
+   rotation adds a credential to explain later, and if the real cause is the path, the
+   new key is refused exactly like the old one — which is, in fact, the test that
+   pointed at the path.
+
+**Blast radius while it is broken.** `main` keeps merging and CI keeps passing; only
+the deploy fails, so `/healthz` silently keeps serving the last successfully shipped
+commit. Ours sat six days behind, and it only surfaced because a merge finally ran the
+CD. Check the deployed commit whenever a merge matters:
+
+```bash
+curl -fsS https://payment.lmhost.com.br/healthz    # compare `commit` with main HEAD
+```
