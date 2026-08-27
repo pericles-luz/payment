@@ -1,7 +1,8 @@
 # Payment receptor — staging deploy runbook (one-time VPS bootstrap)
 
 > **Audience:** the CEO/operator, run **once** on the VPS. After this, every deploy
-> is automated by `.github/workflows/cd-stg.yml` (build → ship → restart → smoke).
+> is automated by `.github/workflows/cd-stg.yml` (build → preflight → ship → restart
+> → smoke).
 > No agent ever runs a command on the VPS. See ADR
 > [`docs/security/adr-0006-payment-staging-deploy.md`](../security/adr-0006-payment-staging-deploy.md).
 
@@ -367,6 +368,13 @@ binary is still running because the new one crash-loops):
 
 Happened for real after the lmhost cutover (26/08/2026, run `33024654384`). Worth
 reading before touching keys, because the obvious suspects were all innocent.
+
+> **The pipeline now catches this by itself.** `cd-stg.yml` runs the read-only
+> `preflight` verb between installing the deploy key and shipping the binary, so a
+> broken deploy path fails on its own step — named, red, and pointing here — instead
+> of surfacing as an opaque `ssh` error at ship time. If you are reading this because
+> that step went red, start at item 2: preflight failing already proves items 1 and 3
+> are worth checking in that order, and that **nothing was shipped**.
 
 **Diagnose in this order — cheapest and most decisive first.**
 
