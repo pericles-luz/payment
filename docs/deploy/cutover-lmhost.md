@@ -142,8 +142,19 @@ verdade pelo tempo da janela.
 2. Tirar `payment.*` do certbot do host antigo — depois da virada ele não
    consegue mais responder ao HTTP-01 e as renovações passam a falhar.
 3. Fechar as regras de ufw de `143.198.66.140` no servidor antigo.
-4. Apontar `PAYMENT_STG_HOST` / `PAYMENT_STG_HOST_KEY` no GitHub para o
-   `pre-prod`. `PAYMENT_STG_SMOKE_URL` continua `https://payment.lmhost.com.br`.
+4. ~~Apontar `PAYMENT_STG_HOST` / `PAYMENT_STG_HOST_KEY` no GitHub para o
+   `pre-prod`.~~ **Já feito na própria janela do corte, em 21/08 00:07Z** — não é
+   limpeza pendente. `PAYMENT_STG_SMOKE_URL` continua `https://payment.lmhost.com.br`.
+
+   > **O CD ficou quebrado seis dias por causa deste passo.** Os secrets foram
+   > repontados, mas a chave de deploy foi instalada em `/home/payment/.ssh/` seguindo
+   > o `staging.md` §5b, que então trazia esse caminho fixo — e no `pre-prod` o home do
+   > usuário `payment` é `/opt/payment`. O `sshd` procurava em `/opt/payment/.ssh/`,
+   > que não existia, e toda tentativa do CD morria em `Permission denied (publickey)`.
+   > Nada disso apareceu até 26/08, porque só um merge na `main` dispara o CD e não
+   > houve nenhum no intervalo — o `/healthz` seguiu servindo o binário pré-corte.
+   > Corrigido movendo o `authorized_keys` para o home real; diagnóstico em
+   > [`staging.md` §11](staging.md).
 5. Manter o host antigo intocado por ~2 semanas como rollback frio.
 
 `PAYMENT_WEBHOOK_BASE_URL` continua `https://payment.lmhost.com.br` em todas as

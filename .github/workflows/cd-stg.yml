@@ -14,9 +14,18 @@ name: CD staging
 #
 # Secrets (the CTO wires these on the UPSTREAM repo; the fork has none, so the
 # guarded job is skipped there):
-#   PAYMENT_STG_SSH_KEY    — private deploy key, constrained on the VPS to the
+#   PAYMENT_STG_SSH_KEY    — private deploy key, constrained on the host to the
 #                            payment-deploy.sh wrapper via authorized_keys command=.
-#   PAYMENT_STG_HOST       — VPS host (143.198.66.140).
+#                            NOTE: authorized_keys lives under the deploy user's REAL
+#                            home (`getent passwd payment`), which is /opt/payment on
+#                            pre-prod — not /home/payment. Installing it elsewhere
+#                            fails closed and silently; see docs/deploy/staging.md §11.
+#   PAYMENT_STG_HOST       — SSH address of the deploy target: 201.23.79.48 (`pre-prod`)
+#                            since the lmhost cutover of 21/08/2026 (was 143.198.66.140).
+#                            This is the SSH address, NOT the address serving the site —
+#                            pre-prod is per-port NAT with only 22 forwarded and HTTPS
+#                            arrives via the Caddy balancer, so this and
+#                            PAYMENT_STG_SMOKE_URL legitimately differ.
 #   PAYMENT_STG_USER       — non-root deploy user (`payment`).
 #   PAYMENT_STG_HOST_KEY   — pinned known_hosts line (NO TOFU; ssh-keyscan output).
 #   PAYMENT_STG_SMOKE_URL  — base URL the smoke probe hits (…/healthz appended).
