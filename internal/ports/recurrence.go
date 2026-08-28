@@ -18,9 +18,20 @@ import (
 // create targets the same charge.
 //
 // Reads (GetRec/GetSolicRec/GetCobR) reconcile authoritative state from the bank —
-// never trust a raw webhook (threat W3). C6 returns those reads as JWS-signed
-// documents (Accept: application/jose; non-repúdio do mandato BACEN); verifying
-// that signature before the body is trusted is the adapter's responsibility.
+// never trust a raw webhook (threat W3). They are plain application/json, and their
+// authenticity comes from the CHANNEL: OAuth2 client_credentials over the per-tenant
+// mTLS, exactly as for cob/cobv/boleto/checkout.
+//
+// There is deliberately NO signature check on this path, and that is a correction, not
+// an omission. An earlier design had the adapter demand `Accept: application/jose` and
+// verify a JWS against a C6 JWKS; probed against the sandbox on 28/08/2026 C6 answers
+// that header with 400 — it serves only application/json — so every recurrence read was
+// failing and no JWKS value could have helped. The Pix Automático JWS is real but it is
+// someone else's document: it lives on GET /rec/{recUrlAccessToken}, a public endpoint
+// on another host, fetched and validated by the PAYER's PSP when it reads the QR. We are
+// the recebedor and never request it. Residual, stated plainly: there is no cryptographic
+// non-repudiation of the mandate document on our side. See SIN-66034 and
+// docs/ops/c6-recurrence-jws-obsoleto.md.
 //
 // The bank dimension is fixed in the adapter's identity ("c6"), never carried on a
 // business request: resolution stays on the (tenantID, bankID) credential seam
@@ -146,7 +157,7 @@ type RecProvider interface {
 	// must be APROVADA (out-of-band, via the payer's bank) before any CobR is
 	// chargeable.
 	CreateRec(ctx context.Context, tenantID string, req CreateRecRequest) (RecResult, error)
-	// GetRec reconciles the authoritative mandate state from the bank (JWS-verified).
+	// GetRec reconciles the authoritative mandate state from the bank.
 	GetRec(ctx context.Context, tenantID, idRec string) (RecResult, error)
 	// GetRecForQR reads the mandate asking the bank to compose the QR for a journey.
 	// It is a separate method rather than a parameter on GetRec because the two have
@@ -225,7 +236,7 @@ type SolicRecResult struct {
 // SolicRecProvider is the output port for recurrence-activation requests (solicrec).
 type SolicRecProvider interface {
 	CreateSolicRec(ctx context.Context, tenantID string, req CreateSolicRecRequest) (SolicRecResult, error)
-	// GetSolicRec reconciles the authoritative activation-request state (JWS-verified).
+	// GetSolicRec reconciles the authoritative activation-request state.
 	GetSolicRec(ctx context.Context, tenantID, idSolicRec string) (SolicRecResult, error)
 }
 
@@ -272,7 +283,7 @@ type CobRResult struct {
 // CobRProvider is the output port for recurring charge instances (cobr).
 type CobRProvider interface {
 	CreateCobR(ctx context.Context, tenantID string, req CreateCobRRequest) (CobRResult, error)
-	// GetCobR reconciles the authoritative charge state from the bank (JWS-verified).
+	// GetCobR reconciles the authoritative charge state from the bank.
 	GetCobR(ctx context.Context, tenantID, txID string) (CobRResult, error)
 	// CancelCobR cancels ONE scheduled charge instance (PATCH /cobr/{txid} with
 	// status=CANCELADA) without touching the mandate: the payer's authorization stays

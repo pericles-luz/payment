@@ -270,9 +270,12 @@ func (p *Provider) CreateRec(ctx context.Context, tenantID string, req ports.Cre
 	return out.Data.toResult(), nil
 }
 
-// GetRec reconciles the authoritative mandate state from C6 (GET /v2/pix/rec/{idRec}),
-// verifying the JWS signature before the body is trusted (never trust a webhook —
-// threat W3).
+// GetRec reconciles the authoritative mandate state from C6 (GET /v2/pix/rec/{idRec}).
+// It is the read that makes "never trust a raw webhook" (threat W3) real: the
+// notification is only a trigger, and this answer — not the notification body — is what
+// the caller acts on. Authenticity comes from the channel (OAuth2 client_credentials
+// over the per-tenant mTLS), exactly as for cob/cobv/boleto/checkout; see
+// recurrenceRead for why there is no signature to verify here.
 func (p *Provider) GetRec(ctx context.Context, tenantID, idRec string) (ports.RecResult, error) {
 	if strings.TrimSpace(idRec) == "" {
 		return ports.RecResult{}, &Error{Op: "get_rec", sentinel: shared.ErrValidation}
@@ -294,9 +297,8 @@ func (p *Provider) GetRec(ctx context.Context, tenantID, idRec string) (ports.Re
 // first charge AND authorizes the recurrence), the txid of a cobrança com vencimento
 // yields JORNADA_4, and an empty txid yields JORNADA_2 (mandate parameters only).
 //
-// It is the same JWS-verified read as GetRec — the mandate document is the BACEN
-// non-repudiation artifact whichever way it is fetched, and degrading THIS read to an
-// unverified one would hand an attacker the QR the payer scans. C6 fills dadosQR only
+// It is the same read as GetRec, over the same authenticated channel — this one just
+// asks C6 to compose the QR as well. C6 fills dadosQR only
 // when every parameter the QR needs is present on both the mandate and the referenced
 // charge; a missing dadosQR is therefore not an error here, it is "not composable
 // yet", and the caller decides what to do about it.
@@ -428,7 +430,7 @@ func (p *Provider) CreateSolicRec(ctx context.Context, tenantID string, req port
 }
 
 // GetSolicRec reconciles the authoritative activation-request state from C6
-// (GET /v2/pix/solicrec/{idSolicRec}), JWS-verified.
+// (GET /v2/pix/solicrec/{idSolicRec}).
 func (p *Provider) GetSolicRec(ctx context.Context, tenantID, idSolicRec string) (ports.SolicRecResult, error) {
 	if strings.TrimSpace(idSolicRec) == "" {
 		return ports.SolicRecResult{}, &Error{Op: "get_solicrec", sentinel: shared.ErrValidation}
@@ -598,8 +600,8 @@ func (p *Provider) RetryCobR(ctx context.Context, tenantID, txID, dataRetentativ
 	return out.Data.toResult(), nil
 }
 
-// GetCobR reconciles the authoritative charge state from C6 (GET /v2/pix/cobr/{txid}),
-// JWS-verified.
+// GetCobR reconciles the authoritative charge state from C6 (GET /v2/pix/cobr/{txid}).
+// Settlement is decided on THIS answer, never on the notification body (threat W3).
 func (p *Provider) GetCobR(ctx context.Context, tenantID, txID string) (ports.CobRResult, error) {
 	if strings.TrimSpace(txID) == "" {
 		return ports.CobRResult{}, &Error{Op: "get_cobr", sentinel: shared.ErrValidation}
@@ -666,9 +668,9 @@ func (p *Provider) recurrenceRead(ctx context.Context, tenantID, op, endpoint st
 }
 
 // decodeData unmarshals a Recorrência body that may be wrapped in the C6
-// {"data":{...}} envelope or delivered bare (the verified JWS payload shape is not
-// guaranteed to carry the envelope). It tries the envelope first, falling back to
-// the raw payload.
+// {"data":{...}} envelope or delivered bare — writes answer with the envelope, and the
+// reads are not guaranteed to. It tries the envelope first, falling back to the raw
+// payload.
 func decodeData(payload []byte, dst any) error {
 	var env struct {
 		Data json.RawMessage `json:"data"`

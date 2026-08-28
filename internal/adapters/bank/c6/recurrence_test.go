@@ -983,8 +983,7 @@ func TestCreateRecRejectsNegativeValue(t *testing.T) {
 }
 
 // TestGetRecForQRComposesJornada3 proves the composite-QR read carries the ?txid= that
-// selects the journey, is JWS-verified like every other mandate read, and surfaces the
-// Pix Copia e Cola the shop displays.
+// selects the journey and surfaces the Pix Copia e Cola the shop displays.
 func TestGetRecForQRComposesJornada3(t *testing.T) {
 	rs := newRecServer(t)
 	const qrJSON = `{"idRec":"RR318724952026062600000000abc","status":"CRIADA",` +
