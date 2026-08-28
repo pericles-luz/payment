@@ -1549,9 +1549,8 @@ components:
     RecurrenceUnavailable:
       description: >-
         Superfície de recorrência indisponível — o serviço não está ligado neste
-        ambiente, ou a leitura de mandato está fechada por segurança enquanto o
-        verificador JWS do PSP (`PAYMENT_C6_REC_JWKS_URL`) não estiver
-        configurado. É transitório e vale repetir depois.
+        ambiente, ou a dependência bancária está fora do ar. É transitório e vale
+        repetir depois.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

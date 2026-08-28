@@ -122,7 +122,7 @@ Variáveis de ambiente (todas opcionais, com defaults seguros):
 | `PAYMENT_BANK_CREDS` | — | `tenant:clientID:secret,...` (em produção: vault). |
 | `PAYMENT_BANK_CREDITOR_KEYS` | — | `tenant:creditorKey,...` — chave PIX do recebedor por tenant, injetada na cob/cobv (ADR-0004). Não-segredo, mas sensível a roteamento; nunca logada. |
 | `PAYMENT_RABBIT_URL` | — | URL do RabbitMQ (vazio = bus em memória). |
-| `PAYMENT_PIX_RECURRENCE` | `false` | Liga a superfície HTTP do PIX Automático (`/v1/pix/{rec,solicrec,cobr,locrec}`). Dark-ship: desligada, as rotas não existem. Não basta sozinha — o QR composto vem de uma leitura de mandato, que segue fechada enquanto `PAYMENT_C6_REC_JWKS_URL` estiver vazia. |
+| `PAYMENT_PIX_RECURRENCE` | `false` | Liga a superfície HTTP do PIX Automático (`/v1/pix/{rec,solicrec,cobr,locrec}`). Dark-ship: desligada, as rotas não existem. |
 
 > Os tokens/segredos acima são de **desenvolvimento**. Em produção use um IdP /
 > secret manager / mTLS — a forma das interfaces não muda.

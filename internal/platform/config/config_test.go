@@ -107,15 +107,3 @@ func TestFromEnvParsing(t *testing.T) {
 		t.Fatalf("expected 1 bank cred (malformed skipped), got %d", len(cfg.BankCreds))
 	}
 }
-
-// TestFromEnvRecJWKSMTLSTenant: the designated JWKS mTLS tenant (SIN-69375) is read
-// from PAYMENT_C6_REC_JWKS_MTLS_TENANT and defaults to empty (tenantless fetch).
-func TestFromEnvRecJWKSMTLSTenant(t *testing.T) {
-	if cfg := config.FromEnv(); cfg.C6.RecJWKSMTLSTenant != "" {
-		t.Fatalf("default RecJWKSMTLSTenant = %q, want empty", cfg.C6.RecJWKSMTLSTenant)
-	}
-	t.Setenv("PAYMENT_C6_REC_JWKS_MTLS_TENANT", "tenant-verz")
-	if cfg := config.FromEnv(); cfg.C6.RecJWKSMTLSTenant != "tenant-verz" {
-		t.Fatalf("RecJWKSMTLSTenant = %q, want %q", cfg.C6.RecJWKSMTLSTenant, "tenant-verz")
-	}
-}

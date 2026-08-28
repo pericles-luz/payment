@@ -449,7 +449,7 @@ func run() error {
 	// first is non-destructive WHEN the endpoint rejects it: C6 refuses at content
 	// negotiation before mutating, which is why the failing PIX-webhook PUT left
 	// nothing registered. If it is instead accepted, a registration IS created on a
-	// currently dormant surface (recurrence is off: PAYMENT_C6_REC_JWKS_URL empty), and
+	// surface that is dormant unless PAYMENT_PIX_RECURRENCE is on, and
 	// a later PUT replaces it.
 	for _, path := range []string{"/v2/pix/webhookrec", "/v2/pix/webhookcobr"} {
 		section("4. PUT " + path + " com Accept: application/json")

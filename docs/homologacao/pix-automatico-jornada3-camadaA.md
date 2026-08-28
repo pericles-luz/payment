@@ -76,9 +76,11 @@ HTTP**. Esta entrega acrescenta:
 - **PII minimizada**: a resposta do mandato **não** ecoa documento nem nome do pagador
   — são a única PII de titular persistida (ADR-0008) e nada na resposta precisa deles
   (`TestMandateResponseDoesNotEchoPayerPII`).
-- **Fail-secure na leitura**: sem `PAYMENT_C6_REC_JWKS_URL` a leitura do mandato —
-  inclusive a que compõe o QR — recusa em vez de confiar em documento não-verificado
-  (`c6.TestGetRecForQRFailsSecureWithoutVerifier`), e a API responde **503**, não 500.
+- **Leituras autenticadas pelo canal**: OAuth2 `client_credentials` sobre o mTLS por
+  tenant, igual a cob/cobv/boleto/checkout. As quatro leituras de recorrência pedem
+  `application/json` e há regressão que impede reintroduzir o `application/jose` que o
+  C6 recusa (`c6.TestRecurrenceReadsNeverRequestJOSE`). Indisponibilidade do banco
+  responde **503**, não 500.
 - **Dark-ship**: com `PAYMENT_PIX_RECURRENCE` desligada as rotas não existem
   (`TestRecurrenceRoutesAbsentWhenFlagOff`); com a flag ligada e o serviço não wired,
   degrada em 503 sem panic (`TestRecurrenceServiceUnwiredIs503`).
@@ -96,9 +98,13 @@ O round-trip é testado nos dois engines —
 
 ## Ressalvas conhecidas
 
-1. **Content-type das leituras.** O OAS público do C6 declara `application/json` em
-   todas as leituras de recorrência; o adapter exige JWS (`application/jose`), postura
-   capturada ao vivo em SIN-66034. Confirmar no sandbox antes do go-live.
+1. ~~**Content-type das leituras.**~~ **Resolvido por medição contra o sandbox em
+   28/08/2026** (`cmd/c6-rec-probe`): `application/json` devolve 200, e
+   `application/jose` devolve **400** — o C6 recusa o header. O adapter mandava
+   `jose`, então nenhuma leitura de recorrência jamais teria funcionado, e o
+   `PAYMENT_C6_REC_JWKS_URL` não tinha valor correto possível. Hoje as quatro leituras
+   pedem JSON, com regressão em `c6.TestRecurrenceReadsNeverRequestJOSE`. Registro em
+   [`../ops/c6-recurrence-jws-obsoleto.md`](../ops/c6-recurrence-jws-obsoleto.md).
 2. ~~**Verbo de revisão da cobrança.**~~ **Corrigido nesta entrega.** O adapter mandava
    o corpo de criação via `PUT` sob o nome `ReviseCobR` — que é a chamada de *criar*, não
    revisa nada. O contrato define `PATCH /cobr/{txid}` com corpo

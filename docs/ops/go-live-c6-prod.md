@@ -64,7 +64,6 @@ Todos os knobs estão em `.env.prod.sample`. Overrides prod-críticos:
 | `PAYMENT_C6_BASE_URL` / `PAYMENT_C6_TOKEN_URL` | URLs reais C6 prod | vazio = stub in-memory (zero tráfego real) — é também o ponto de rollback |
 | `PAYMENT_C6_SCOPE` | conforme contrato prod | escopo OAuth insuficiente → 403 no C6 |
 | `PAYMENT_C6_CLIENT_CERT` / `PAYMENT_C6_CLIENT_KEY` | PEM mTLS prod, 0600 + owner | handshake mTLS falha |
-| `PAYMENT_C6_REC_JWKS_URL` | JWKS prod C6 | verificação JWS das leituras de recorrência falha |
 | `PAYMENT_TRUSTED_PROXY_HOPS` | **1** (atrás de 1 proxy) | 0 = client-IP **spoofável** (atribuição/rate-limit furáveis, SIN-68747) |
 | `PAYMENT_SECURE_COOKIES` | **true** | cookies fora de TLS |
 | `PAYMENT_C6_RATE_LIMIT_RPS` / `_BURST` / `_MAX_RETRIES` | conforme quota prod | estourar quota C6 / retries indevidos |

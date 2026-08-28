@@ -73,11 +73,11 @@ func newRecServer(t *testing.T) *recServer {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(body))
 	}
-	// A signed read returns an opaque JWS compact serialization; the body content
-	// is irrelevant because the (fake) verifier supplies the decoded payload.
-	jose := func(w http.ResponseWriter) {
-		w.Header().Set("Content-Type", "application/jose")
-		_, _ = w.Write([]byte("eyJ.signed.jws"))
+	// Recorrência reads answer plain JSON, exactly as the C6 contract declares and as
+	// the live sandbox confirmed (cmd/c6-rec-probe, 28/08/2026).
+	readJSON := func(w http.ResponseWriter, body string) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
 	}
 
 	mux := http.NewServeMux()
@@ -100,7 +100,7 @@ func newRecServer(t *testing.T) *recServer {
 			rs.recGet(w, r)
 			return
 		}
-		jose(w)
+		readJSON(w, recRespJSON)
 	})
 	mux.HandleFunc("PATCH /v2/pix/rec/{idRec}", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
@@ -125,7 +125,7 @@ func newRecServer(t *testing.T) *recServer {
 			rs.solicGet(w, r)
 			return
 		}
-		jose(w)
+		readJSON(w, solicRespJSON)
 	})
 	mux.HandleFunc("POST /v2/pix/cobr", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
@@ -141,7 +141,7 @@ func newRecServer(t *testing.T) *recServer {
 			rs.cobrGet(w, r)
 			return
 		}
-		jose(w)
+		readJSON(w, cobrRespJSON)
 	})
 	mux.HandleFunc("PATCH /v2/pix/cobr/{txid}", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
@@ -203,34 +203,17 @@ func newRecServer(t *testing.T) *recServer {
 	return rs
 }
 
-func (rs *recServer) provider(t *testing.T, creds ports.CredentialStore, v RecurrenceVerifier) *Provider {
+func (rs *recServer) provider(t *testing.T, creds ports.CredentialStore) *Provider {
 	t.Helper()
 	p, err := New(Config{
-		BaseURL:            rs.URL,
-		TokenURL:           rs.URL + "/oauth/token",
-		HTTPClient:         rs.Client(),
-		RecurrenceVerifier: v,
+		BaseURL:    rs.URL,
+		TokenURL:   rs.URL + "/oauth/token",
+		HTTPClient: rs.Client(),
 	}, creds)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return p
-}
-
-// fakeVerifier is a test double for RecurrenceVerifier: it returns a fixed decoded
-// payload (or error) and records the compact bytes it was handed.
-type fakeVerifier struct {
-	payload    []byte
-	err        error
-	gotCompact []byte
-}
-
-func (f *fakeVerifier) VerifyJWS(_ context.Context, compact []byte) ([]byte, error) {
-	f.gotCompact = compact
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.payload, nil
 }
 
 func recReq() ports.CreateRecRequest {
@@ -263,7 +246,7 @@ func cobrReq() ports.CreateCobRRequest {
 func TestCreateRecSuccess(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.CreateRec(context.Background(), "t1", recReq())
 	if err != nil {
@@ -321,7 +304,7 @@ func TestCreateRecSuccess(t *testing.T) {
 func TestCreateRecValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	cases := map[string]func(r *ports.CreateRecRequest){
 		"empty contrato":      func(r *ports.CreateRecRequest) { r.Vinculo.Contrato = "" },
@@ -344,7 +327,7 @@ func TestCreateRecValidation(t *testing.T) {
 func TestCreateRecObjetoValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	// C6 rejects an objeto with whitespace; the adapter must fail fast at the
 	// boundary (SIN-66072) without ever hitting the upstream.
@@ -371,7 +354,7 @@ func TestCreateRecObjetoValidation(t *testing.T) {
 func TestCreateRecObjetoAccepted(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	// A single-token objeto (and an empty one) are accepted and forwarded verbatim.
 	for name, objeto := range map[string]string{"single token": "Mensalidade", "empty": ""} {
@@ -405,7 +388,7 @@ func TestCreateCobRPutsTxidInPath(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(cobrRespJSON))
 	}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	if _, err := p.CreateCobR(context.Background(), "t1", cobrReq()); err != nil {
 		t.Fatalf("CreateCobR: %v", err)
@@ -425,7 +408,7 @@ func TestCreateRecUpstreamError(t *testing.T) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"type":"https://x/api/v2/error/RequisicaoInvalida"}`))
 	}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	_, err := p.CreateRec(context.Background(), "t1", recReq())
 	if !errors.Is(err, shared.ErrValidation) {
@@ -437,11 +420,15 @@ func TestCreateRecUpstreamError(t *testing.T) {
 	}
 }
 
-func TestGetRecSignedSuccess(t *testing.T) {
+// TestGetRecReadsJSON is the regression test for SIN-66034. The adapter used to send
+// `Accept: application/jose` here; C6 answers that header with a 400 naming the only
+// types it serves, so every recurrence read failed and no JWKS value could have helped.
+// Asserting the header — not just the parsed result — is the point: a result assertion
+// alone would pass against a double that ignores Accept.
+func TestGetRecReadsJSON(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	v := &fakeVerifier{payload: []byte(recRespJSON)}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), v)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.GetRec(context.Background(), "t1", "RR318724952026062600000000abc")
 	if err != nil {
@@ -450,20 +437,44 @@ func TestGetRecSignedSuccess(t *testing.T) {
 	if res.IDRec != "RR318724952026062600000000abc" || res.Status != ports.RecCriada {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if rs.lastAccept != "application/jose" {
-		t.Fatalf("read must request JOSE, got Accept %q", rs.lastAccept)
+	if rs.lastAccept != "application/json" {
+		t.Fatalf("read must request JSON, got Accept %q", rs.lastAccept)
 	}
-	if string(v.gotCompact) != "eyJ.signed.jws" {
-		t.Fatalf("verifier not handed the signed body: %q", v.gotCompact)
+}
+
+// TestRecurrenceReadsNeverRequestJOSE pins the header across ALL FOUR read paths, so a
+// future refactor cannot quietly reintroduce the one that C6 rejects.
+func TestRecurrenceReadsNeverRequestJOSE(t *testing.T) {
+	t.Parallel()
+	reads := map[string]func(*Provider) error{
+		"GetRec":      func(p *Provider) error { _, e := p.GetRec(context.Background(), "t1", "RR1"); return e },
+		"GetRecForQR": func(p *Provider) error { _, e := p.GetRecForQR(context.Background(), "t1", "RR1", "tx"); return e },
+		"GetSolicRec": func(p *Provider) error { _, e := p.GetSolicRec(context.Background(), "t1", "SC1"); return e },
+		"GetCobR":     func(p *Provider) error { _, e := p.GetCobR(context.Background(), "t1", "tx-1"); return e },
+	}
+	for name, call := range reads {
+		t.Run(name, func(t *testing.T) {
+			rs := newRecServer(t)
+			p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
+			if err := call(p); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if rs.lastAccept != "application/json" {
+				t.Fatalf("%s sent Accept %q; C6 rejects anything but application/json", name, rs.lastAccept)
+			}
+		})
 	}
 }
 
 func TestGetRecBarePayload(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	// A verified payload delivered WITHOUT the {"data":...} envelope is still parsed.
-	v := &fakeVerifier{payload: []byte(`{"idRec":"RRbare","status":"APROVADA","calendario":{"periodicidade":"ANUAL"}}`)}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), v)
+	// A body delivered WITHOUT the {"data":...} envelope is still parsed.
+	rs.recGet = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"idRec":"RRbare","status":"APROVADA","calendario":{"periodicidade":"ANUAL"}}`))
+	}
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.GetRec(context.Background(), "t1", "RRbare")
 	if err != nil {
@@ -477,32 +488,9 @@ func TestGetRecBarePayload(t *testing.T) {
 func TestGetRecValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), &fakeVerifier{payload: []byte(recRespJSON)})
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.GetRec(context.Background(), "t1", "  "); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
-	}
-}
-
-func TestGetRecNoVerifierFailsSecure(t *testing.T) {
-	t.Parallel()
-	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil) // no verifier
-
-	_, err := p.GetRec(context.Background(), "t1", "RR1")
-	if !errors.Is(err, shared.ErrUnavailable) {
-		t.Fatalf("want ErrUnavailable (fail secure), got %v", err)
-	}
-}
-
-func TestGetRecVerifierError(t *testing.T) {
-	t.Parallel()
-	rs := newRecServer(t)
-	v := &fakeVerifier{err: errors.New("bad signature")}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), v)
-
-	_, err := p.GetRec(context.Background(), "t1", "RR1")
-	if !errors.Is(err, shared.ErrUnavailable) {
-		t.Fatalf("want ErrUnavailable on verify failure, got %v", err)
 	}
 }
 
@@ -513,7 +501,7 @@ func TestGetRecNotFound(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"type":"https://x/api/v2/error/NaoEncontrado"}`))
 	}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), &fakeVerifier{payload: []byte(recRespJSON)})
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	_, err := p.GetRec(context.Background(), "t1", "RRmissing")
 	if !errors.Is(err, shared.ErrNotFound) {
@@ -521,11 +509,14 @@ func TestGetRecNotFound(t *testing.T) {
 	}
 }
 
-func TestGetRecMalformedSignedBody(t *testing.T) {
+func TestGetRecMalformedBody(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	v := &fakeVerifier{payload: []byte(`}not json{`)}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), v)
+	rs.recGet = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`}not json{`))
+	}
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	_, err := p.GetRec(context.Background(), "t1", "RR1")
 	if !errors.Is(err, shared.ErrUnavailable) {
@@ -536,7 +527,7 @@ func TestGetRecMalformedSignedBody(t *testing.T) {
 func TestCancelRecSuccess(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.CancelRec(context.Background(), "t1", "RR318724952026062600000000abc")
 	if err != nil {
@@ -562,7 +553,7 @@ func TestCancelRecSuccess(t *testing.T) {
 func TestCancelRecValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.CancelRec(context.Background(), "t1", ""); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
 	}
@@ -573,7 +564,7 @@ func TestCancelRecValidation(t *testing.T) {
 func TestCreateSolicRecSuccess(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	exp := time.Date(2026, 7, 10, 23, 59, 59, 0, time.UTC)
 	res, err := p.CreateSolicRec(context.Background(), "t1", ports.CreateSolicRecRequest{
@@ -616,7 +607,7 @@ func TestCreateSolicRecSuccess(t *testing.T) {
 func TestCreateSolicRecValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	cases := map[string]ports.CreateSolicRecRequest{
 		"empty idRec": {ExpiraEm: time.Now().Add(time.Hour)},
@@ -634,8 +625,7 @@ func TestCreateSolicRecValidation(t *testing.T) {
 func TestGetSolicRecSignedSuccess(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	v := &fakeVerifier{payload: []byte(solicRespJSON)}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), v)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.GetSolicRec(context.Background(), "t1", "SC318724952026062600000000xyz")
 	if err != nil {
@@ -644,15 +634,15 @@ func TestGetSolicRecSignedSuccess(t *testing.T) {
 	if res.IDSolicRec != "SC318724952026062600000000xyz" || res.Status != "CRIADA" {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if rs.lastAccept != "application/jose" {
-		t.Fatalf("read must request JOSE, got %q", rs.lastAccept)
+	if rs.lastAccept != "application/json" {
+		t.Fatalf("read must request JSON, got %q", rs.lastAccept)
 	}
 }
 
 func TestGetSolicRecValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), &fakeVerifier{payload: []byte(solicRespJSON)})
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.GetSolicRec(context.Background(), "t1", ""); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
 	}
@@ -663,7 +653,7 @@ func TestGetSolicRecValidation(t *testing.T) {
 func TestCreateCobRSuccess(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.CreateCobR(context.Background(), "t1", cobrReq())
 	if err != nil {
@@ -716,7 +706,7 @@ func TestCreateCobRSuccess(t *testing.T) {
 func TestCreateCobRValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	cases := map[string]func(r *ports.CreateCobRRequest){
 		"empty txid":      func(r *ports.CreateCobRRequest) { r.TxID = "" },
@@ -738,7 +728,7 @@ func TestCreateCobRValidation(t *testing.T) {
 func TestCreateCobRIdempotencyFallback(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	req := cobrReq()
 	req.IdempotencyKey = "" // fall back to txid as the anti-double-bill anchor
@@ -757,7 +747,7 @@ func TestCreateCobRIdempotencyFallback(t *testing.T) {
 func TestCancelCobRPatchesStatusOnly(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.CancelCobR(context.Background(), "t1", "tx-cobr-1")
 	if err != nil {
@@ -784,7 +774,7 @@ func TestCancelCobRPatchesStatusOnly(t *testing.T) {
 func TestCancelCobRValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.CancelCobR(context.Background(), "t1", "  "); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
 	}
@@ -793,7 +783,7 @@ func TestCancelCobRValidation(t *testing.T) {
 func TestRetryCobRSuccess(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.RetryCobR(context.Background(), "t1", "tx-cobr-1", "2026-09-08")
 	if err != nil {
@@ -810,7 +800,7 @@ func TestRetryCobRSuccess(t *testing.T) {
 func TestRetryCobRValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.RetryCobR(context.Background(), "t1", "tx-1", ""); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("want ErrValidation on empty date, got %v", err)
 	}
@@ -822,8 +812,7 @@ func TestRetryCobRValidation(t *testing.T) {
 func TestGetCobRSignedSuccess(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	v := &fakeVerifier{payload: []byte(cobrRespJSON)}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), v)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.GetCobR(context.Background(), "t1", "tx-cobr-1")
 	if err != nil {
@@ -832,15 +821,15 @@ func TestGetCobRSignedSuccess(t *testing.T) {
 	if res.TxID != "tx-cobr-1" || res.ValorCents != 1050 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if rs.lastAccept != "application/jose" {
-		t.Fatalf("read must request JOSE, got %q", rs.lastAccept)
+	if rs.lastAccept != "application/json" {
+		t.Fatalf("read must request JSON, got %q", rs.lastAccept)
 	}
 }
 
 func TestGetCobRValidation(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), &fakeVerifier{payload: []byte(cobrRespJSON)})
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.GetCobR(context.Background(), "t1", ""); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
 	}
@@ -850,7 +839,7 @@ func TestGetCobRValidation(t *testing.T) {
 func TestRecUnknownTenant(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.CreateRec(context.Background(), "other", recReq()); err == nil {
 		t.Fatalf("want error for unknown tenant")
 	}
@@ -863,7 +852,7 @@ func TestRecUnknownTenant(t *testing.T) {
 // there is no field a caller could use to steer where the QR points.
 func TestCreateLocRecSendsNoBody(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.CreateLocRec(context.Background(), "t1", "loc-key-1")
 	if err != nil {
@@ -885,7 +874,7 @@ func TestCreateLocRecSendsNoBody(t *testing.T) {
 
 func TestGetLocRecCarriesBoundMandate(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.GetLocRec(context.Background(), "t1", 108)
 	if err != nil {
@@ -898,7 +887,7 @@ func TestGetLocRecCarriesBoundMandate(t *testing.T) {
 
 func TestUnlinkLocRecIsIdempotentOnID(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	if _, err := p.UnlinkLocRec(context.Background(), "t1", 108); err != nil {
 		t.Fatalf("UnlinkLocRec: %v", err)
@@ -916,7 +905,7 @@ func TestUnlinkLocRecIsIdempotentOnID(t *testing.T) {
 // otherwise render as "/locrec/0" or "/locrec/-1" and produce an opaque upstream 4xx.
 func TestLocRecRejectsNonPositiveID(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	for _, id := range []int64{0, -1} {
 		if _, err := p.GetLocRec(context.Background(), "t1", id); !errors.Is(err, shared.ErrValidation) {
 			t.Fatalf("GetLocRec(%d): want validation, got %v", id, err)
@@ -935,7 +924,7 @@ func TestLocRecRejectsNonPositiveID(t *testing.T) {
 // not interchangeable here.
 func TestCreateRecSendsJornada3Fields(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	req := recReq()
 	req.LocID = 108
@@ -985,7 +974,7 @@ func TestCreateRecSendsJornada3Fields(t *testing.T) {
 // the wire — it would render as a nonsense decimal and, worse, a negative ceiling.
 func TestCreateRecRejectsNegativeValue(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	req := recReq()
 	req.ValorRecCents = -1
 	if _, err := p.CreateRec(context.Background(), "t1", req); !errors.Is(err, shared.ErrValidation) {
@@ -1005,8 +994,11 @@ func TestGetRecForQRComposesJornada3(t *testing.T) {
 		`"loc":{"id":108,"location":"pix.example.com/qr/v2/rec/abc"},` +
 		`"valor":{"valorRec":"99.00"},` +
 		`"dadosQR":{"jornada":"JORNADA_3","pixCopiaECola":"00020101021226..."}}`
-	v := &fakeVerifier{payload: []byte(qrJSON)}
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), v)
+	rs.recGet = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(qrJSON))
+	}
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 
 	res, err := p.GetRecForQR(context.Background(), "t1", "RR318724952026062600000000abc", "tx-imediata")
 	if err != nil {
@@ -1015,8 +1007,8 @@ func TestGetRecForQRComposesJornada3(t *testing.T) {
 	if rs.lastQuery != "txid=tx-imediata" {
 		t.Fatalf("query: want txid=tx-imediata, got %q", rs.lastQuery)
 	}
-	if rs.lastAccept != "application/jose" {
-		t.Fatalf("the QR read must stay JWS-verified, Accept=%q", rs.lastAccept)
+	if rs.lastAccept != "application/json" {
+		t.Fatalf("the QR read must request JSON like every other recurrence read, Accept=%q", rs.lastAccept)
 	}
 	if res.DadosQR.Jornada != "JORNADA_3" || res.DadosQR.PixCopiaECola == "" {
 		t.Fatalf("dadosQR: %+v", res.DadosQR)
@@ -1033,7 +1025,7 @@ func TestGetRecForQRComposesJornada3(t *testing.T) {
 // no query at all rather than an empty txid= C6 would have to interpret.
 func TestGetRecForQRWithoutTxIDOmitsQuery(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), &fakeVerifier{payload: []byte(`{"idRec":"RR1","status":"CRIADA"}`)})
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.GetRecForQR(context.Background(), "t1", "RR1", "  "); err != nil {
 		t.Fatalf("GetRecForQR: %v", err)
 	}
@@ -1042,21 +1034,9 @@ func TestGetRecForQRWithoutTxIDOmitsQuery(t *testing.T) {
 	}
 }
 
-// TestGetRecForQRFailsSecureWithoutVerifier is the invariant the JWS go-live runbook
-// rests on: with no verifier configured the QR read refuses rather than trusting an
-// unverified mandate document. The QR the payer scans is exactly the wrong thing to
-// take on faith.
-func TestGetRecForQRFailsSecureWithoutVerifier(t *testing.T) {
-	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), nil)
-	if _, err := p.GetRecForQR(context.Background(), "t1", "RR1", "tx"); !errors.Is(err, shared.ErrUnavailable) {
-		t.Fatalf("want fail-secure ErrUnavailable, got %v", err)
-	}
-}
-
 func TestGetRecForQRRejectsEmptyIDRec(t *testing.T) {
 	rs := newRecServer(t)
-	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"), &fakeVerifier{payload: []byte(`{}`)})
+	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
 	if _, err := p.GetRecForQR(context.Background(), "t1", "  ", "tx"); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("want validation, got %v", err)
 	}
