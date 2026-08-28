@@ -8,6 +8,13 @@ consumidores assíncronos.
 Este repositório é a **fundação de engenharia** (workstream #1). O adapter real
 do banco C6, PIX Automático, BolePix e checkout são workstreams seguintes.
 
+> **PIX Automático (recorrência).** A jornada de pagamento recorrente exposta é a
+> **Jornada 3** do C6 — um QR Code composto que liquida a primeira cobrança e
+> autoriza os débitos futuros no mesmo gesto. Contrato vendorizado em
+> [`docs/compliance/c6-pix-automatico-oas.yaml`](docs/compliance/c6-pix-automatico-oas.yaml),
+> integração em [`docs/api/manual.md` §4.1](docs/api/manual.md), rastreabilidade em
+> [`docs/homologacao/pix-automatico-jornada3-camadaA.md`](docs/homologacao/pix-automatico-jornada3-camadaA.md).
+
 ## Arquitetura — Hexagonal (Ports & Adapters)
 
 O núcleo de domínio é **puro**: não importa `database/sql`, `net/http` nem SDKs
@@ -115,6 +122,7 @@ Variáveis de ambiente (todas opcionais, com defaults seguros):
 | `PAYMENT_BANK_CREDS` | — | `tenant:clientID:secret,...` (em produção: vault). |
 | `PAYMENT_BANK_CREDITOR_KEYS` | — | `tenant:creditorKey,...` — chave PIX do recebedor por tenant, injetada na cob/cobv (ADR-0004). Não-segredo, mas sensível a roteamento; nunca logada. |
 | `PAYMENT_RABBIT_URL` | — | URL do RabbitMQ (vazio = bus em memória). |
+| `PAYMENT_PIX_RECURRENCE` | `false` | Liga a superfície HTTP do PIX Automático (`/v1/pix/{rec,solicrec,cobr,locrec}`). Dark-ship: desligada, as rotas não existem. Não basta sozinha — o QR composto vem de uma leitura de mandato, que segue fechada enquanto `PAYMENT_C6_REC_JWKS_URL` estiver vazia. |
 
 > Os tokens/segredos acima são de **desenvolvimento**. Em produção use um IdP /
 > secret manager / mTLS — a forma das interfaces não muda.

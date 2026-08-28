@@ -88,6 +88,15 @@ const (
 	// tenant/when.
 	ActionCobRCreated Action = "recurrence.cobr.created"
 
+	// ActionCobRCancelled records the cancellation of ONE scheduled recurring charge
+	// (PATCH /cobr/{txid} status=CANCELADA). It is deliberately distinct from
+	// ActionRecCancelled: revoking the MANDATE stops every future debit, while this
+	// stops a single instalment and leaves the authorization standing. Reading a trail
+	// that conflated the two would make it impossible to answer "was this payer's
+	// authorization revoked, or did we just skip one month?" — the exact question a
+	// disputed debit turns on. The entry's TxID() carries the charge txid.
+	ActionCobRCancelled Action = "recurrence.cobr.cancelled"
+
 	// ActionSetBankCertificate records a write of a tenant's per-bank mTLS client
 	// certificate (SIN-66087). Like ActionSetBankCredential it names the tenant, the
 	// operator and the non-secret bankID; additionally it carries the certificate's
@@ -163,6 +172,7 @@ func (a Action) valid() bool {
 		ActionActivateAccount, ActionRemoveBankConfig,
 		ActionSettlementAmountMismatch, ActionRecCreated, ActionRecApproved,
 		ActionRecRejected, ActionRecExpired, ActionRecCancelled, ActionCobRCreated,
+		ActionCobRCancelled,
 		ActionSetBankCertificate, ActionInvoiceGenerated, ActionMintAccountKey,
 		ActionSetOutboundWebhook, ActionRotateOutboundWebhookSecret, ActionRemoveOutboundWebhook,
 		ActionOutboundWebhookDelivered, ActionOutboundWebhookDeadLettered:
@@ -676,6 +686,36 @@ func NewCobROriginationEntry(id, operatorID, tenantID, txID string, at time.Time
 		id:         id,
 		operatorID: strings.TrimSpace(operatorID),
 		action:     ActionCobRCreated,
+		tenantID:   tenantID,
+		at:         at,
+		txID:       txID,
+	}, nil
+}
+
+// NewCobRCancellationEntry builds the audit record for cancelling ONE scheduled
+// recurring charge (PIX Automático, PATCH /cobr/{txid} status=CANCELADA). It mirrors
+// NewCobROriginationEntry — same durable mechanism, same tx_id column carrying the
+// charge txid — so origination and cancellation of the same instalment read as one
+// ordered story in the trail. Invariants: a non-empty id, tenant and txID. Emitted
+// inside the unit of work that persisted the transition, so the charge's new state and
+// its forensic record commit atomically.
+func NewCobRCancellationEntry(id, operatorID, tenantID, txID string, at time.Time) (Entry, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Entry{}, shared.NewValidationError("id", "audit entry id is required")
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return Entry{}, shared.NewValidationError("tenant_id", "tenant id is required")
+	}
+	txID = strings.TrimSpace(txID)
+	if txID == "" {
+		return Entry{}, shared.NewValidationError("tx_id", "tx id is required")
+	}
+	return Entry{
+		id:         id,
+		operatorID: strings.TrimSpace(operatorID),
+		action:     ActionCobRCancelled,
 		tenantID:   tenantID,
 		at:         at,
 		txID:       txID,

@@ -8,25 +8,43 @@ import (
 )
 
 // CobRStatus is the lifecycle state of one scheduled charge instance (CobR) in a
-// mandate's cycle. The closed vocabulary mirrors the PIX cobrança statuses already
-// modelled for cob/cobv so the cycle reads consistently across products.
+// mandate's cycle.
+//
+// The vocabulary is the BACEN/C6 cobr one, VERBATIM, and that is deliberate. An
+// earlier version of this file mirrored the cob/cobv statuses instead
+// (CRIADA/ATRASADA/LIQUIDADA/REMOVIDA) "so the cycle reads consistently across
+// products" — a guess made before the cobr contract was captured, and one the captured
+// contract contradicts: the real enum is CRIADA/ATIVA/CONCLUIDA/EXPIRADA/REJEITADA/
+// CANCELADA (docs/compliance/c6-pix-automatico-oas.yaml, schema CobRStatus). Keeping
+// the invented vocabulary meant every reconciled status had to be squeezed through a
+// mapping, and two of the six had no honest target at all: a debit REJEITADA by the
+// payer's bank and one we CANCELADA ourselves are different facts about a customer —
+// one says chase them, the other says we chose to skip — and both would have collapsed
+// into "REMOVIDA". Matching the wire keeps the translation lossless (a plain cast) and
+// keeps the distinction the billing operator actually needs.
 type CobRStatus string
 
 const (
-	// CobRCriada is a scheduled charge awaiting its due date / settlement.
+	// CobRCriada is a charge registered and not yet live at the PSP.
 	CobRCriada CobRStatus = "CRIADA"
-	// CobRAtrasada is a charge past its due date and not yet settled.
-	CobRAtrasada CobRStatus = "ATRASADA"
-	// CobRLiquidada is a settled (paid) charge. Terminal.
-	CobRLiquidada CobRStatus = "LIQUIDADA"
-	// CobRRemovida is a charge removed before settlement (by the recebedor or the
-	// PSP). Terminal.
-	CobRRemovida CobRStatus = "REMOVIDA"
+	// CobRAtiva is a live charge awaiting settlement on its due date.
+	CobRAtiva CobRStatus = "ATIVA"
+	// CobRConcluida is a settled (paid) charge. Terminal.
+	CobRConcluida CobRStatus = "CONCLUIDA"
+	// CobRExpirada is a charge whose window lapsed without settlement. Terminal.
+	CobRExpirada CobRStatus = "EXPIRADA"
+	// CobRRejeitada is a charge the payer's PSP refused (no funds, blocked debit,
+	// authorization no longer honoured). Terminal — and distinct from CobRCancelada:
+	// this one was refused, it was not our decision.
+	CobRRejeitada CobRStatus = "REJEITADA"
+	// CobRCancelada is a charge the recebedor cancelled before settlement, without
+	// revoking the mandate. Terminal.
+	CobRCancelada CobRStatus = "CANCELADA"
 )
 
 func (s CobRStatus) valid() bool {
 	switch s {
-	case CobRCriada, CobRAtrasada, CobRLiquidada, CobRRemovida:
+	case CobRCriada, CobRAtiva, CobRConcluida, CobRExpirada, CobRRejeitada, CobRCancelada:
 		return true
 	default:
 		return false
@@ -35,7 +53,7 @@ func (s CobRStatus) valid() bool {
 
 func (s CobRStatus) terminal() bool {
 	switch s {
-	case CobRLiquidada, CobRRemovida:
+	case CobRConcluida, CobRExpirada, CobRRejeitada, CobRCancelada:
 		return true
 	default:
 		return false
@@ -47,13 +65,17 @@ func (s CobRStatus) terminal() bool {
 // charge (threat W3).
 var cobrTransitions = map[CobRStatus]map[CobRStatus]bool{
 	CobRCriada: {
-		CobRAtrasada:  true,
-		CobRLiquidada: true,
-		CobRRemovida:  true,
+		CobRAtiva:     true,
+		CobRConcluida: true,
+		CobRExpirada:  true,
+		CobRRejeitada: true,
+		CobRCancelada: true,
 	},
-	CobRAtrasada: {
-		CobRLiquidada: true,
-		CobRRemovida:  true,
+	CobRAtiva: {
+		CobRConcluida: true,
+		CobRExpirada:  true,
+		CobRRejeitada: true,
+		CobRCancelada: true,
 	},
 }
 

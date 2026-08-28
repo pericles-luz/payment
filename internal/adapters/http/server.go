@@ -25,8 +25,14 @@ type Server struct {
 	boleto    *app.BoletoService
 	dda       *app.DDAService
 	statement *app.StatementService
-	admin     *app.AdminService
-	console   *app.ConsoleService
+	// recurrence backs the PIX Automático tenant routes (/v1/pix/rec, /solicrec, /cobr,
+	// /locrec). Nil leaves them registered-but-unavailable (503), never a panic.
+	recurrence *app.RecurrenceService
+	// pixRecurrence dark-ships the whole PIX Automático surface: when false the routes
+	// are NOT registered at all, so rollback is a config flip and not a deploy.
+	pixRecurrence bool
+	admin         *app.AdminService
+	console       *app.ConsoleService
 	// consoleAuth backs the self-contained console login (username + password +
 	// TOTP, ADR-0001 Opção B / SIN-69265): first-access bootstrap, the login/logout
 	// handlers, and the session validation the console auth middleware calls. When
@@ -136,8 +142,20 @@ type Config struct {
 	// grupo 13). It may be nil for deployments/tests that do not serve the extrato
 	// surface — the route is then registered but never exercised.
 	Statement *app.StatementService
-	Admin     *app.AdminService
-	Console   *app.ConsoleService
+	// Recurrence backs the PIX Automático tenant routes (mandate, activation request,
+	// recurring charge and payload location). It may be nil for deployments/tests that
+	// do not serve recurrence — the handlers then answer 503 rather than panicking.
+	Recurrence *app.RecurrenceService
+	// PixRecurrence gates the whole PIX Automático surface (PAYMENT_PIX_RECURRENCE,
+	// default off). With it off the routes do not exist: an integrator cannot reach a
+	// half-wired journey, and turning the feature off again is a config flip.
+	//
+	// It is deliberately SEPARATE from Recurrence being non-nil: the service can be
+	// wired (so the webhook path records mandates) while the tenant-facing surface
+	// stays dark.
+	PixRecurrence bool
+	Admin         *app.AdminService
+	Console       *app.ConsoleService
 	// ConsoleAuth wires the self-contained console login (SIN-69265). Optional: when
 	// nil the console stays Bearer-only (the login form renders but always fails, and
 	// only a valid admin Bearer opens /console) — used by tests and by deployments
@@ -245,6 +263,8 @@ func NewServer(c Config) *Server {
 		boleto:                 c.Boleto,
 		dda:                    c.DDA,
 		statement:              c.Statement,
+		recurrence:             c.Recurrence,
+		pixRecurrence:          c.PixRecurrence,
 		admin:                  c.Admin,
 		console:                c.Console,
 		consoleAuth:            c.ConsoleAuth,
@@ -421,6 +441,33 @@ func (s *Server) Router() http.Handler {
 			r.Post("/pix/cobv", s.handleCreatePixCobV)
 			r.Get("/pix/cobv/{txid}", s.handleGetPixCobV)
 			r.Put("/pix/cobv/{txid}", s.handleUpdatePixCobV)
+			// PIX Automático / recorrência (Jornada 3 — QR composto: cobrança imediata +
+			// autorização da recorrência). Dark-shipped behind PAYMENT_PIX_RECURRENCE: with
+			// the flag off none of these routes exists, so rollback is a config flip.
+			//
+			// Like "cobv", every literal segment here ("rec", "solicrec", "cobr", "locrec")
+			// MUST be registered before the "/pix/{txid}" read below, or chi would swallow
+			// them as a txid.
+			//
+			// The journey, in order: mint a location (locrec) → register the mandate (rec)
+			// bound to that location AND to the txid of an already-created immediate charge
+			// → read the mandate with ?qr=true to get the composite QR the payer scans →
+			// once the payer authorizes it (reconciled through the recurrence webhook, which
+			// is what moves the durable mandate to APROVADA) originate one cobr per cycle.
+			if s.pixRecurrence {
+				r.Post("/pix/locrec", s.handleCreateLocRec)
+				r.Get("/pix/locrec/{id}", s.handleGetLocRec)
+				r.Delete("/pix/locrec/{id}/idrec", s.handleUnlinkLocRec)
+				r.Post("/pix/rec", s.handleCreateRec)
+				r.Get("/pix/rec/{idRec}", s.handleGetRec)
+				r.Delete("/pix/rec/{idRec}", s.handleCancelRec)
+				r.Post("/pix/solicrec", s.handleCreateSolicRec)
+				r.Get("/pix/solicrec/{idSolicRec}", s.handleGetSolicRec)
+				r.Post("/pix/cobr", s.handleCreateCobR)
+				r.Get("/pix/cobr/{txid}", s.handleGetCobR)
+				r.Delete("/pix/cobr/{txid}", s.handleCancelCobR)
+				r.Post("/pix/cobr/{txid}/retentativa/{data}", s.handleRetryCobR)
+			}
 			r.Get("/pix/{txid}", s.handleGetPix)
 			// Unified hosted checkout — open a session (roteiro 9.a–9.c), reconcile it
 			// (grupo 10, GET) and cancel it (grupo 11, DELETE). The status webhook (grupo

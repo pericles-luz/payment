@@ -40,6 +40,10 @@ type harness struct {
 	store *persistence.Store
 	bank  *bank.StubProvider
 	bus   *inmemory.Bus
+	// creds is the concrete credential store behind deps.Credentials, exposed so a
+	// test that seeds its OWN tenant (rather than reusing the pre-seeded "t1") can give
+	// it a bank credential — the stub resolves one on every call.
+	creds *secret.Store
 	deps  app.Deps
 }
 
@@ -70,7 +74,7 @@ func newHarnessFor() *harness {
 		Clock:       fixedClock{t: time.Unix(1000, 0).UTC()},
 		IDs:         &seqIDs{},
 	}
-	return &harness{store: store, bank: stub, bus: bus, deps: deps}
+	return &harness{store: store, bank: stub, bus: bus, creds: creds, deps: deps}
 }
 
 func TestAdminCreateTenant(t *testing.T) {

@@ -1,0 +1,44 @@
+-- 0019_pix_rec_jornada.up.sql — carry the QR-journey binding on a PIX Automático
+-- mandate so the composite QR can be re-composed without the caller keeping state
+-- (extends 0004_pix_recurrence).
+--
+-- WHY: in the Jornada 3 journey the payer scans ONE composite QR that both settles an
+-- immediate charge and authorizes the recurrence. The bank composes that QR only when
+-- asked with BOTH the mandate id and the txid of the charge it was created against
+-- (GET /rec/{idRec}?txid=...). Without these columns that txid lives nowhere on our
+-- side: the shop would have to remember, for every mandate it ever created, which
+-- charge it was bound to — and a mandate whose txid is lost can no longer have its QR
+-- re-rendered at all, because the binding is not recoverable from the mandate.
+--
+-- WHAT:
+--   loc_id       the bank's payload-location id (locrec) the QR renders from. BIGINT,
+--                not INTEGER: the BACEN/C6 contract types it as int64, and Postgres
+--                INTEGER is int32 — a location id past 2^31 would silently fail to
+--                store. SQLite reads BIGINT as INTEGER affinity, so the source schema
+--                stays portable and the pg derivation needs no special rule (the
+--                generator only rewrites *_cents, which this is not).
+--   jornada_txid the immediate-charge txid bound at creation (ativacao.dadosJornada.txid).
+--
+-- The location URL itself is deliberately NOT stored: it is derivable from loc_id on
+-- any read of the mandate, and a second copy would be one more thing that can drift
+-- out of step with the bank.
+--
+-- Both are REGISTRATION facts, decided once at creation and never mutated — the
+-- mutable state of a mandate remains status/updated_at. They are nullable because
+-- mandates created before this migration have no binding, and because the solicrec
+-- journey (Jornada 1) legitimately has none: a NULL here reads as "no QR binding",
+-- which is a real state and not missing data.
+--
+-- NO PII: none of these carry titular personal data. The payer data on this table
+-- remains devedor_doc/devedor_nome (see 0004 and ADR-0008); this migration does not
+-- widen that surface, so the art.13 access-register obligation is unchanged.
+--
+-- Reversibility: 0019_pix_rec_jornada.down.sql rebuilds the table without the two
+-- columns. Backward-compatible while deployed — both columns are nullable, so a binary
+-- from before this migration keeps reading and writing pix_rec unchanged.
+--
+-- Portability (same conventions as 0001_init): TEXT opaque values, INTEGER id. No
+-- SQLite-only types; the Postgres derivation is mechanical (scripts/gen-pg-migrations.py).
+
+ALTER TABLE pix_rec ADD COLUMN loc_id BIGINT;
+ALTER TABLE pix_rec ADD COLUMN jornada_txid TEXT;

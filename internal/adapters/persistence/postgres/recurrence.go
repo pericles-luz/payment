@@ -36,13 +36,14 @@ var (
 func (r repo) SaveRec(ctx context.Context, rec *recurrence.Rec) error {
 	_, err := r.q.ExecContext(ctx,
 		`INSERT INTO pix_rec (id_rec, tenant_id, bank_id, contrato, devedor_doc, devedor_nome,
-		    data_inicial, periodicidade, valor_cents, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		    data_inicial, periodicidade, valor_cents, status, loc_id, jornada_txid, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		 ON CONFLICT(tenant_id, id_rec) DO UPDATE SET
 		    status = excluded.status, updated_at = excluded.updated_at`,
 		rec.IDRec(), rec.TenantID(), rec.BankID(), rec.Contrato(),
 		rec.Devedor().Doc(), rec.Devedor().Nome(), rec.DataInicial(),
 		string(rec.Periodicidade()), rec.ValorCents(), string(rec.Status()),
+		rec.LocID(), rec.JornadaTxID(),
 		rec.CreatedAt().Format(tsLayout), rec.UpdatedAt().Format(tsLayout))
 	if err != nil {
 		return fmt.Errorf("save rec: %w", err)
@@ -54,12 +55,16 @@ func (r repo) SaveRec(ctx context.Context, rec *recurrence.Rec) error {
 func (r repo) FindRecByID(ctx context.Context, tenantID, idRec string) (*recurrence.Rec, error) {
 	row := r.q.QueryRowContext(ctx,
 		`SELECT id_rec, tenant_id, bank_id, contrato, devedor_doc, devedor_nome,
-		    data_inicial, periodicidade, valor_cents, status, created_at, updated_at
+		    data_inicial, periodicidade, valor_cents, status, loc_id, jornada_txid, created_at, updated_at
 		 FROM pix_rec WHERE tenant_id = $1 AND id_rec = $2`, tenantID, idRec)
 	var gotIDRec, gotTenant, bankID, contrato, doc, nome, dataInicial, periodicidade, status, createdAt, updatedAt string
 	var valorCents int64
+	// Nullable QR-journey columns (0019) — see the sqlite sibling: a NULL rehydrates as
+	// the zero binding, which is the real state of a solicrec-activated mandate.
+	var locID sql.NullInt64
+	var jornadaTxID sql.NullString
 	if err := row.Scan(&gotIDRec, &gotTenant, &bankID, &contrato, &doc, &nome,
-		&dataInicial, &periodicidade, &valorCents, &status, &createdAt, &updatedAt); err != nil {
+		&dataInicial, &periodicidade, &valorCents, &status, &locID, &jornadaTxID, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, shared.ErrNotFound
 		}
@@ -71,7 +76,8 @@ func (r repo) FindRecByID(ctx context.Context, tenantID, idRec string) (*recurre
 	}
 	return recurrence.RehydrateRec(gotIDRec, gotTenant, bankID, contrato, devedor,
 		dataInicial, recurrence.RecPeriodicidade(periodicidade), valorCents,
-		recurrence.RecStatus(status), parseTime(createdAt), parseTime(updatedAt)), nil
+		recurrence.RecStatus(status), parseTime(createdAt), parseTime(updatedAt),
+		recurrence.WithRecJourney(locID.Int64, jornadaTxID.String)), nil
 }
 
 // SaveCobR inserts or updates a charge instance, keyed by (tenant_id, tx_id).

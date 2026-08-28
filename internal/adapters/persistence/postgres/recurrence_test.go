@@ -310,3 +310,48 @@ func TestPostgresRecurrenceTransitionAtomicity(t *testing.T) {
 		t.Fatalf("unexpected audit row: %+v", rows[0])
 	}
 }
+
+// TestPostgresRecJourneyBindingRoundTrips is the Postgres sibling of the SQLite test:
+// the Jornada 3 binding (loc_id + jornada_txid, migration 0019) must survive a
+// save/reload on BOTH engines, and loc_id must be BIGINT — a location id past 2^31
+// would silently fail to store in an int4 column.
+func TestPostgresRecJourneyBindingRoundTrips(t *testing.T) {
+	store, _ := newRecStore(t)
+	ctx := context.Background()
+	const bigLocID = int64(1) << 40 // past int32, so an int4 column would reject it
+	r, err := recurrence.NewRec(recurrence.NewRecParams{
+		IDRec: "RR-J3", TenantID: "ten-1", BankID: "c6", Contrato: "c-1",
+		Devedor: mustDevedor(t), DataInicial: "2026-09-01",
+		Periodicidade: recurrence.RecMensal, ValorCents: 9900,
+		LocID: bigLocID, JornadaTxID: "33beb661beda44a8928fef47dbeb2dc5",
+	}, time.Date(2026, 8, 26, 9, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("NewRec: %v", err)
+	}
+	if err := store.SaveRec(ctx, r); err != nil {
+		t.Fatalf("SaveRec: %v", err)
+	}
+	got, err := store.FindRecByID(ctx, "ten-1", "RR-J3")
+	if err != nil {
+		t.Fatalf("FindRecByID: %v", err)
+	}
+	if got.LocID() != bigLocID || got.JornadaTxID() != "33beb661beda44a8928fef47dbeb2dc5" {
+		t.Fatalf("binding lost: loc=%d txid=%q", got.LocID(), got.JornadaTxID())
+	}
+}
+
+// TestPostgresRecWithoutJourneyBindingIsZero proves a NULL binding rehydrates as zero.
+func TestPostgresRecWithoutJourneyBindingIsZero(t *testing.T) {
+	store, _ := newRecStore(t)
+	ctx := context.Background()
+	if err := store.SaveRec(ctx, mustRec(t, "RR-NOJ", "ten-1")); err != nil {
+		t.Fatalf("SaveRec: %v", err)
+	}
+	got, err := store.FindRecByID(ctx, "ten-1", "RR-NOJ")
+	if err != nil {
+		t.Fatalf("FindRecByID: %v", err)
+	}
+	if got.LocID() != 0 || got.JornadaTxID() != "" {
+		t.Fatalf("want zero binding, got loc=%d txid=%q", got.LocID(), got.JornadaTxID())
+	}
+}

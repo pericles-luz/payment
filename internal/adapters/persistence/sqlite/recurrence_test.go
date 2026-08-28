@@ -311,3 +311,48 @@ func TestSQLiteRecurrenceTransitionAtomicity(t *testing.T) {
 		t.Fatalf("unexpected audit row: %+v", rows[0])
 	}
 }
+
+// TestSQLiteRecJourneyBindingRoundTrips proves the Jornada 3 binding (loc_id +
+// jornada_txid, migration 0019) survives a save/reload. Without it the composite QR
+// cannot be re-composed and the binding is unrecoverable from the mandate alone.
+func TestSQLiteRecJourneyBindingRoundTrips(t *testing.T) {
+	store, _ := newRecStore(t)
+	ctx := context.Background()
+	r, err := recurrence.NewRec(recurrence.NewRecParams{
+		IDRec: "RR-J3", TenantID: "ten-1", BankID: "c6", Contrato: "c-1",
+		Devedor: mustDevedor(t), DataInicial: "2026-09-01",
+		Periodicidade: recurrence.RecMensal, ValorCents: 9900,
+		LocID: 108, JornadaTxID: "33beb661beda44a8928fef47dbeb2dc5",
+	}, time.Date(2026, 8, 26, 9, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("NewRec: %v", err)
+	}
+	if err := store.SaveRec(ctx, r); err != nil {
+		t.Fatalf("SaveRec: %v", err)
+	}
+	got, err := store.FindRecByID(ctx, "ten-1", "RR-J3")
+	if err != nil {
+		t.Fatalf("FindRecByID: %v", err)
+	}
+	if got.LocID() != 108 || got.JornadaTxID() != "33beb661beda44a8928fef47dbeb2dc5" {
+		t.Fatalf("binding lost: loc=%d txid=%q", got.LocID(), got.JornadaTxID())
+	}
+}
+
+// TestSQLiteRecWithoutJourneyBindingIsZero proves a mandate with NO QR binding (the
+// solicrec journey) rehydrates as the zero binding rather than failing the read — the
+// columns are nullable on purpose.
+func TestSQLiteRecWithoutJourneyBindingIsZero(t *testing.T) {
+	store, _ := newRecStore(t)
+	ctx := context.Background()
+	if err := store.SaveRec(ctx, mustRec(t, "RR-NOJ", "ten-1")); err != nil {
+		t.Fatalf("SaveRec: %v", err)
+	}
+	got, err := store.FindRecByID(ctx, "ten-1", "RR-NOJ")
+	if err != nil {
+		t.Fatalf("FindRecByID: %v", err)
+	}
+	if got.LocID() != 0 || got.JornadaTxID() != "" {
+		t.Fatalf("want zero binding, got loc=%d txid=%q", got.LocID(), got.JornadaTxID())
+	}
+}

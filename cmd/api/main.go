@@ -130,6 +130,7 @@ func run() error {
 	// per-bank routing surface — that moves into the registry routers when a second
 	// bank gains PIX Automático (SIN-66022).
 	recReader, cobrReader := recurrenceReaders(registry)
+	solicRecWriter, locRecWriter := recurrenceWriters(registry)
 
 	// Outbound webhook attribution (SIN-69491, F1 of SIN-69486): on a settled inbound
 	// event, resolve the owning Conta SERVER-SIDE and materialise the event onto that
@@ -167,6 +168,8 @@ func run() error {
 		Statement:          routers.Statement,
 		RecReader:          recReader,
 		CobRReader:         cobrReader,
+		SolicRecs:          solicRecWriter,
+		LocRecs:            locRecWriter,
 		OutboundAttributor: outboundAttributor,
 		Credentials:        creds,
 		CredWriter:         creds,
@@ -363,13 +366,17 @@ func run() error {
 		WithServiceRegistrar(svcWebhookRegistrar, c6.ServiceCheckout)
 
 	srv := httpadapter.NewServer(httpadapter.Config{
-		Charges:     app.NewChargeService(deps),
-		Pix:         app.NewPixService(deps),
-		PixCobV:     app.NewPixDueChargeService(deps),
-		Checkout:    app.NewCheckoutService(deps),
-		Boleto:      app.NewBoletoService(deps),
-		DDA:         app.NewDDAService(deps),
-		Statement:   app.NewStatementService(deps),
+		Charges:   app.NewChargeService(deps),
+		Pix:       app.NewPixService(deps),
+		PixCobV:   app.NewPixDueChargeService(deps),
+		Checkout:  app.NewCheckoutService(deps),
+		Boleto:    app.NewBoletoService(deps),
+		DDA:       app.NewDDAService(deps),
+		Statement: app.NewStatementService(deps),
+		// PIX Automático (recorrência). The service is wired unconditionally so the
+		// recurrence WEBHOOK path can keep recording reconciled mandates; the flag below
+		// decides only whether the tenant-facing routes exist.
+		Recurrence:  app.NewRecurrenceService(deps),
 		Admin:       app.NewAdminService(deps),
 		Console:     console,
 		ConsoleAuth: consoleAuth,
@@ -393,7 +400,11 @@ func run() error {
 		TrustedProxyHops: cfg.TrustedProxyHops,
 		// Self-serve credential intake (SIN-69196), default-off dark-ship.
 		SelfServeCredIntake: cfg.SelfServeCredIntake,
-		WebhookLogPayload:   cfg.WebhookLogPayload,
+		// PIX Automático tenant surface (Jornada 3 — QR composto), default-off
+		// dark-ship. Note this does NOT open the mandate read path: that stays
+		// fail-secure until PAYMENT_C6_REC_JWKS_URL is configured.
+		PixRecurrence:     cfg.PixRecurrence,
+		WebhookLogPayload: cfg.WebhookLogPayload,
 		// Model (b) account-key + per-request client selector (ADR-0011 §2 /
 		// SIN-69279), default-off dark-ship: consulted only when AccountKeySelector
 		// is on and the bearer has the ak_ shape; otherwise inert (model (a)).
@@ -779,4 +790,21 @@ func recurrenceReaders(reg *bank.Registry) (ports.RecProvider, ports.CobRProvide
 	recReader, _ := set.Pix.(ports.RecProvider)
 	cobrReader, _ := set.Pix.(ports.CobRProvider)
 	return recReader, cobrReader
+}
+
+// recurrenceWriters derives the remaining PIX Automático ports the TENANT-FACING
+// surface needs: the activation request (solicrec, Jornada 1) and the payload locations
+// the composite-QR journeys are built on (locrec, Jornadas 2/3/4). Same derivation and
+// same caveat as recurrenceReaders — read off the C6 ProviderSet's raw provider because
+// recurrence is not yet part of the per-bank routing surface (SIN-66022) — and the same
+// failure mode: a bank that does not implement them yields nil, which leaves those
+// operations answering 503 rather than panicking.
+func recurrenceWriters(reg *bank.Registry) (ports.SolicRecProvider, ports.LocRecProvider) {
+	set, ok := reg.Get(ports.BankIDC6)
+	if !ok || set.Pix == nil {
+		return nil, nil
+	}
+	solicRec, _ := set.Pix.(ports.SolicRecProvider)
+	locRec, _ := set.Pix.(ports.LocRecProvider)
+	return solicRec, locRec
 }

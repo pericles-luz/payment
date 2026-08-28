@@ -22,6 +22,7 @@ Superfícies disponíveis em `/v1`:
 |---|---|---|
 | PIX imediato | `POST/GET /v1/pix`, `GET /v1/pix/{txid}` | Cobrança PIX imediata (cobrança dinâmica) |
 | PIX com vencimento (cobv) | `POST /v1/pix/cobv`, `GET/PUT /v1/pix/cobv/{txid}` | Cobrança PIX com data de vencimento |
+| PIX Automático (recorrência) | `/v1/pix/rec`, `/v1/pix/solicrec`, `/v1/pix/cobr`, `/v1/pix/locrec` | Pagamento recorrente (mensalidade/assinatura) autorizado uma vez pelo pagador. Flag-gated. |
 | Checkout hospedado | `POST/GET/DELETE /v1/checkout/{id}` | Página de pagamento hospedada (venda online) |
 | Boleto (BolePix) | `POST/GET/PUT/DELETE /v1/boletos/{id}` | Boleto registrado com multa/juros/desconto |
 | DDA / agendamento | `/v1/dda/*` | Consulta e pagamento de boletos no DDA |

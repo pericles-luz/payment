@@ -397,6 +397,131 @@ Uma limitação do contrato: só as superfícies BACEN expõem remoção (PIX, m
 recorrente). A superfície própria do C6 — a do **checkout** — tem apenas cadastro e
 consulta, então esse canal permanece registrado até ser sobrescrito.
 
+## 4.1 Pagamento recorrente — PIX Automático (Jornada 3)
+
+**Quando:** mensalidade ou assinatura, com liberação imediata do serviço no
+primeiro pagamento. O pagador lê **um** QR Code composto que ao mesmo tempo
+liquida a primeira cobrança e autoriza os débitos futuros.
+
+> Superfície flag-gated: `PAYMENT_PIX_RECURRENCE`. Com a flag desligada as rotas
+> não existem (404). A leitura do mandato — que é o que compõe o QR — depende
+> também de `PAYMENT_C6_REC_JWKS_URL`; enquanto ela estiver vazia o passo 4
+> responde `503` por segurança (ver `docs/ops/c6-recurrence-jws-go-live-runbook.md`).
+
+O fluxo tem duas metades, e a fronteira entre elas é o que mais confunde na
+primeira integração:
+
+- **Você controla** os passos 1–4 e 7 (criar cobrança, location, mandato, obter o
+  QR, cobrar cada ciclo).
+- **Você não controla** os passos 5–6: o pagador autoriza dentro do app do
+  **próprio banco dele**, e essa aprovação só chega até você pelo webhook. Até ela
+  chegar, toda cobrança recorrente responde `409` — de propósito.
+
+```bash
+# 1. Cobrança imediata — é ela que o QR composto liquida. Guarde o txid.
+curl -X POST "$BASE/v1/pix" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: assinatura-4712-primeira" \
+  -d '{"amount_cents": 9900, "currency": "BRL", "expires_in_seconds": 1800}'
+# → {"txid": "TX123...", "qr_code": "..."}
+
+# 2. Location do payload da recorrência (createLocRec). Sem corpo.
+curl -X POST "$BASE/v1/pix/locrec" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: assinatura-4712-loc"
+# → {"id": 108, "location": "pix.example.com/qr/v2/rec/..."}
+
+# 3. Mandato, amarrado à location E ao txid da cobrança imediata (createRec).
+curl -X POST "$BASE/v1/pix/rec" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: assinatura-4712-mandato" \
+  -d '{
+        "contrato": "ASSIN-4712",
+        "objeto": "Mensalidade",
+        "devedor": {"tax_id": "02989131415", "name": "Beltrano da Silva"},
+        "data_inicial": "2026-10-01",
+        "periodicidade": "MENSAL",
+        "retry_policy": "PERMITE_3R_7D",
+        "loc_id": 108,
+        "journey_txid": "TX123...",
+        "amount_cents": 9900
+      }'
+# → {"id_rec": "RR...", "status": "CRIADA", "journey_status": "AGUARDANDO_DEFINICAO"}
+
+# 4. O QR composto que a loja exibe (getRec com qr=true).
+#    Sem informar txid: usamos o journey_txid que ficou gravado no passo 3.
+curl "$BASE/v1/pix/rec/RR.../?qr=true" \
+  -H "Authorization: Bearer <TENANT_TOKEN>"
+# → {"status":"CRIADA","qr":{"jornada":"JORNADA_3","pix_copia_e_cola":"00020101..."}}
+
+# 5. O pagador lê o QR: paga a primeira mensalidade E autoriza a recorrência.
+# 6. O C6 notifica /webhooks/c6/{tenantRef}; nós conciliamos e o mandato vira APROVADA.
+#    Confirme quando quiser:
+curl "$BASE/v1/pix/rec/RR..." -H "Authorization: Bearer <TENANT_TOKEN>"
+# → {"status": "APROVADA", ...}
+
+# 7. A partir daí, uma cobrança por ciclo (createCobR).
+curl -X POST "$BASE/v1/pix/cobr" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: assinatura-4712-ciclo-2026-11" \
+  -d '{"id_rec": "RR...", "txid": "ASSIN4712-2026-11",
+       "due_date": "2026-11-01", "amount_cents": 9900}'
+```
+
+**Amarrar o valor.** `amount_cents` no mandato é o **teto** que o pagador
+autorizou. Uma cobrança acima dele é recusada com `409` antes de chegar ao banco.
+Se a mensalidade for variável, omita o campo — mas então nada limita o valor de
+cada ciclo além do seu próprio código.
+
+**Os dois 409.** `mandate is not approved` = o pagador ainda não autorizou (espere,
+ou reenvie a solicitação). `charge exceeds the authorized mandate value` = cobre
+menos, ou crie um novo mandato. Nenhum dos dois se resolve mexendo no payload —
+por isso não são `400`.
+
+**Sem QR? (Jornada 1).** Se você já combinou o Pix Automático com o cliente por
+fora, pule os passos 1–4 e mande a solicitação direto para o banco dele
+(`createSolicRec`); ele aprova no app e o passo 6 acontece igual. `expires_at`
+precisa estar no futuro e a menos de 30 dias.
+
+```bash
+curl -X POST "$BASE/v1/pix/solicrec" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: assinatura-4712-solic" \
+  -d '{"id_rec": "RR...", "tax_id": "02989131415", "agencia": "0001",
+       "conta": "123456", "ispb_participante": "12345678",
+       "expires_at": "2026-09-10T23:59:59Z"}'
+```
+
+**Encerrar.** `DELETE /v1/pix/rec/{idRec}` revoga o mandato no banco: nenhum débito
+futuro pode ser originado. É idempotente, e a location pode ser reaproveitada com
+`DELETE /v1/pix/locrec/{id}/idrec`.
+
+**Cobrança falhou.** `POST /v1/pix/cobr/{txid}/retentativa/{data}` agenda a
+retentativa conforme a política do mandato — desde que o mandato ainda esteja
+aprovado.
+
+**Pular ou corrigir uma parcela.** `DELETE /v1/pix/cobr/{txid}` cancela **uma**
+cobrança do ciclo sem mexer no mandato: a autorização continua de pé e o mês
+seguinte cobra normalmente. É a única alteração que o BACEN admite numa cobrança
+recorrente — **não existe** como mudar valor ou vencimento de uma parcela já
+criada. Para cobrar outro valor, cancele e crie uma nova:
+
+```bash
+curl -X DELETE "$BASE/v1/pix/cobr/ASSIN4712-2026-11" -H "Authorization: Bearer <TENANT_TOKEN>"
+curl -X POST "$BASE/v1/pix/cobr" -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: assinatura-4712-ciclo-2026-11-v2" \
+  -d '{"id_rec":"RR...","txid":"ASSIN4712-2026-11-v2",
+       "due_date":"2026-11-05","amount_cents":12900}'
+```
+
+Note o `txid` novo: cada débito fica rastreável à cobrança que o autorizou, em vez
+de um mesmo identificador significar dois valores diferentes em momentos distintos.
+
+**Status da cobrança.** O vocabulário é o do BACEN e a distinção importa na
+operação: `CONCLUIDA` = paga; `REJEITADA` = o banco do pagador recusou (sem saldo,
+débito bloqueado) — vale falar com o cliente; `EXPIRADA` = a janela passou sem
+pagamento; `CANCELADA` = você cancelou.
+
 ## 5. Consulta e pagamento DDA
 
 **Quando:** pagar boletos que caíram no DDA da empresa-cliente. Fluxo: listar →
@@ -688,6 +813,7 @@ comportamento passam por flags (`PAYMENT_ACCOUNT_KEY_SELECTOR`,
 | §2 Empresa-cliente + seletor | `provisionClient`, parâmetro `ClientSelector` |
 | §3 Intake self-serve | `setSelfServeBankCredential`, `setSelfServeBankCertificate` |
 | §4 Cobrança | `createCheckout`, `getCheckout`, `cancelCheckout`, `createPix`, `getPix`, `listPix`, `createCobV`, `getCobV`, `updateCobV`, `createBoleto`, `getBoleto`, `updateBoleto`, `deleteBoleto` |
+| §4.1 PIX Automático | `createLocRec`, `getLocRec`, `unlinkLocRec`, `createRec`, `getRec`, `cancelRec`, `createSolicRec`, `getSolicRec`, `createCobR`, `getCobR`, `cancelCobR`, `retryCobR` |
 | §5 DDA | `listDDABoletos`, `createDDAGroup`, `getDDAGroupItems`, `removeDDAGroupItem`, `removeDDAGroupItems`, `submitDDAGroup` |
 | §6 Reconciliação | `getStatement`, `c6Webhook`, `outboundPaymentPaid` (webhook de saída — você implementa o receptor) |
 | §7 Admin / bilhetagem | `adminCreateTenant`, `adminSetPrice`, `adminSetBankCredential`, `adminSetBankCertificate` |

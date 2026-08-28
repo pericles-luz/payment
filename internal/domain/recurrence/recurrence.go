@@ -150,8 +150,18 @@ type Rec struct {
 	periodicidade RecPeriodicidade
 	valorCents    int64 // mandate amount in centavos; 0 = unspecified/variable
 	status        RecStatus
-	createdAt     time.Time
-	updatedAt     time.Time
+	// locID is the bank-side payload location the composite QR renders this mandate
+	// from (0 = none). jornadaTxID is the txid of the immediate charge the Jornada 3
+	// QR settles alongside the authorization ("" = not a Jornada 3 mandate).
+	//
+	// Both are registration facts, not lifecycle state: they are decided once, when the
+	// mandate is created, and never move. They are kept here so re-composing the QR does
+	// not force every caller to remember which charge a mandate was bound to — a fact
+	// that, if lost, cannot be recovered from the mandate alone.
+	locID       int64
+	jornadaTxID string
+	createdAt   time.Time
+	updatedAt   time.Time
 }
 
 // NewRecParams is the validated input to register a mandate durably.
@@ -164,6 +174,10 @@ type NewRecParams struct {
 	DataInicial   string
 	Periodicidade RecPeriodicidade
 	ValorCents    int64
+	// LocID / JornadaTxID are the QR-journey binding (see the Rec fields). Both are
+	// optional: a mandate activated through solicrec (Jornada 1) has neither.
+	LocID       int64
+	JornadaTxID string
 }
 
 // dateLayout is the BACEN calendar date format (no time component).
@@ -216,6 +230,8 @@ func NewRec(p NewRecParams, at time.Time) (*Rec, error) {
 		periodicidade: p.Periodicidade,
 		valorCents:    p.ValorCents,
 		status:        RecCriada,
+		locID:         p.LocID,
+		jornadaTxID:   strings.TrimSpace(p.JornadaTxID),
 		createdAt:     at,
 		updatedAt:     at,
 	}, nil
@@ -244,8 +260,8 @@ func (r *Rec) Transition(to RecStatus, at time.Time) error {
 // RehydrateRec reconstructs a mandate from persisted columns without re-running
 // construction validation (the row was valid when written). It is the storage
 // adapter's inverse of the accessors.
-func RehydrateRec(idRec, tenantID, bankID, contrato string, devedor Devedor, dataInicial string, periodicidade RecPeriodicidade, valorCents int64, status RecStatus, createdAt, updatedAt time.Time) *Rec {
-	return &Rec{
+func RehydrateRec(idRec, tenantID, bankID, contrato string, devedor Devedor, dataInicial string, periodicidade RecPeriodicidade, valorCents int64, status RecStatus, createdAt, updatedAt time.Time, opts ...RehydrateRecOption) *Rec {
+	rec := &Rec{
 		idRec:         idRec,
 		tenantID:      tenantID,
 		bankID:        bankID,
@@ -257,6 +273,24 @@ func RehydrateRec(idRec, tenantID, bankID, contrato string, devedor Devedor, dat
 		status:        status,
 		createdAt:     createdAt,
 		updatedAt:     updatedAt,
+	}
+	for _, o := range opts {
+		o(rec)
+	}
+	return rec
+}
+
+// RehydrateRecOption restores a column that a row written before the QR-journey
+// columns existed simply does not have. Optional rather than positional so the
+// adapters keep compiling — and so a NULL column rehydrates as the zero value, which
+// is exactly "this mandate has no QR binding".
+type RehydrateRecOption func(*Rec)
+
+// WithRecJourney restores the QR-journey binding (payload location + Jornada 3 txid).
+func WithRecJourney(locID int64, jornadaTxID string) RehydrateRecOption {
+	return func(r *Rec) {
+		r.locID = locID
+		r.jornadaTxID = jornadaTxID
 	}
 }
 
@@ -283,6 +317,13 @@ func (r *Rec) Periodicidade() RecPeriodicidade { return r.periodicidade }
 
 // ValorCents returns the mandate amount in centavos (0 = unspecified/variable).
 func (r *Rec) ValorCents() int64 { return r.valorCents }
+
+// LocID returns the payload location bound to the mandate (0 = none).
+func (r *Rec) LocID() int64 { return r.locID }
+
+// JornadaTxID returns the immediate-charge txid the Jornada 3 composite QR settles
+// ("" when the mandate was not created for that journey).
+func (r *Rec) JornadaTxID() string { return r.jornadaTxID }
 
 // Status returns the current lifecycle state.
 func (r *Rec) Status() RecStatus { return r.status }
