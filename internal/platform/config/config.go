@@ -95,12 +95,9 @@ type Config struct {
 	// registered at all, so rollback is a config flip and no integrator can reach a
 	// half-wired journey. Set PAYMENT_PIX_RECURRENCE truthy to enable.
 	//
-	// Turning it on is NOT sufficient for the journey to work end to end. The mandate
-	// READ path (which is what composes the QR the payer scans) is fail-secure and stays
-	// closed until PAYMENT_C6_REC_JWKS_URL is set — see
-	// docs/ops/c6-recurrence-jws-go-live-runbook.md. The two flags are deliberately
-	// separate: this one exposes the surface, that one decides whether an unverified
-	// mandate document could ever be trusted.
+	// There is no second flag to turn on: the mandate reads used to be gated behind a
+	// JWS verifier and PAYMENT_C6_REC_JWKS_URL, which C6 turned out not to serve at all
+	// (docs/ops/c6-recurrence-jws-obsoleto.md). This flag alone exposes the surface.
 	PixRecurrence bool
 	// WebhookLogPayload logs the RAW body of SUCCESSFULLY processed inbound webhooks.
 	// Rejected webhooks always log their body, regardless of this flag (SIN-69580):
@@ -184,23 +181,6 @@ type C6Config struct {
 	// (threat C1); only the path comes from the environment.
 	ClientCertPath string
 	ClientKeyPath  string
-	// RecJWKSURL is the absolute https URL of C6's JWKS used to verify the JWS-signed
-	// PIX Automático (Recorrência) reads (rec/solicrec/cobr GETs, Accept:
-	// application/jose). When empty those reads fail secure (ErrUnavailable) — the
-	// recurrence read path stays disabled rather than trusting an unverified mandate
-	// document, the correct interim until F4 go-live (SIN-66061). It is a URL, never
-	// a secret: only public keys are served from it.
-	RecJWKSURL string
-	// RecJWKSMTLSTenant designates which tenant's vault mTLS certificate is presented
-	// on the (process-wide) JWKS fetch. The JWKS endpoint has no natural tenant, so a
-	// request to it stamps no tenant and the mTLS transport would fall back to the §8
-	// bootstrap certificate — which is absent in a vault-only deployment, making the
-	// handshake (and thus every recurrence signature verification) fail closed
-	// (SIN-69375, follow-up of SIN-69368). Setting this to a tenant that owns a vault
-	// certificate makes the JWKS fetch present that certificate. Empty (the default)
-	// keeps the prior behaviour: the fetch uses the §8 bootstrap cert when configured,
-	// else presents no client cert. It is not a secret — only the tenant identifier.
-	RecJWKSMTLSTenant string
 	// BillingScheme is the C6 "carteira de cobrança" sent on every BolePix registration.
 	// It is ENVIRONMENT-dependent — C6 documents carteira 15 in production and 21 in
 	// sandbox — so it must be configurable per deployment: a hardcoded value silently
@@ -244,18 +224,16 @@ func FromEnv() Config {
 		ConsoleUsername:        getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
 		ConsoleBootstrapToken:  os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
 		C6: C6Config{
-			BaseURL:           os.Getenv("PAYMENT_C6_BASE_URL"),
-			TokenURL:          os.Getenv("PAYMENT_C6_TOKEN_URL"),
-			Scope:             os.Getenv("PAYMENT_C6_SCOPE"),
-			Timeout:           getenvDuration("PAYMENT_C6_TIMEOUT", 15*time.Second),
-			ClientCertPath:    os.Getenv("PAYMENT_C6_CLIENT_CERT"),
-			ClientKeyPath:     os.Getenv("PAYMENT_C6_CLIENT_KEY"),
-			RecJWKSURL:        os.Getenv("PAYMENT_C6_REC_JWKS_URL"),
-			RecJWKSMTLSTenant: os.Getenv("PAYMENT_C6_REC_JWKS_MTLS_TENANT"),
-			BillingScheme:     strings.TrimSpace(os.Getenv("PAYMENT_C6_BILLING_SCHEME")),
-			RateLimitRPS:      getenvFloat("PAYMENT_C6_RATE_LIMIT_RPS", 0),
-			RateLimitBurst:    getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
-			MaxRetries:        getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
+			BaseURL:        os.Getenv("PAYMENT_C6_BASE_URL"),
+			TokenURL:       os.Getenv("PAYMENT_C6_TOKEN_URL"),
+			Scope:          os.Getenv("PAYMENT_C6_SCOPE"),
+			Timeout:        getenvDuration("PAYMENT_C6_TIMEOUT", 15*time.Second),
+			ClientCertPath: os.Getenv("PAYMENT_C6_CLIENT_CERT"),
+			ClientKeyPath:  os.Getenv("PAYMENT_C6_CLIENT_KEY"),
+			BillingScheme:  strings.TrimSpace(os.Getenv("PAYMENT_C6_BILLING_SCHEME")),
+			RateLimitRPS:   getenvFloat("PAYMENT_C6_RATE_LIMIT_RPS", 0),
+			RateLimitBurst: getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
+			MaxRetries:     getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
 		},
 		WebhookReconcile:         getenvBool("PAYMENT_WEBHOOK_RECONCILE", false),
 		WebhookReconcileInterval: getenvDuration("PAYMENT_WEBHOOK_RECONCILE_INTERVAL", 5*time.Minute),

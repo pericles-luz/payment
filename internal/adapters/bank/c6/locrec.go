@@ -23,10 +23,8 @@ import (
 //     strconv, never string-concatenated from caller input, so no path-injection seam
 //     is opened by a location read.
 //
-// Writes are plain JSON ({"data":{...}} envelope). Unlike rec/solicrec/cobr, the
-// location reads are NOT JWS-signed: a location carries no mandate, no payer and no
-// amount — nothing to repudiate — so it goes through the ordinary authed path and is
-// not gated on PAYMENT_C6_REC_JWKS_URL.
+// Writes are plain JSON ({"data":{...}} envelope), and so are the reads — like every
+// other Recorrência surface (see recurrenceRead).
 
 type locRecResponseBody struct {
 	ID       int64  `json:"id"`

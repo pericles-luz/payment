@@ -99,31 +99,3 @@ func TestNewBankRegistryRejectsInsecureC6(t *testing.T) {
 		t.Fatal("expected an error for a non-HTTPS C6 base URL")
 	}
 }
-
-// TestNewBankRegistryWiresRecJWKSVerifier asserts a configured (https) recurrence
-// JWKS URL is accepted and the registry boots — the concrete RecurrenceVerifier is
-// injected so the JWS-signed Recorrência reads can be verified (SIN-66061).
-func TestNewBankRegistryWiresRecJWKSVerifier(t *testing.T) {
-	cfg := config.Config{}
-	cfg.C6.BaseURL = "https://api.c6bank.example"
-	cfg.C6.TokenURL = "https://api.c6bank.example/oauth/token"
-	cfg.C6.RecJWKSURL = "https://api.c6bank.example/.well-known/jwks.json"
-
-	if _, err := newBankRegistry(cfg, noopCreds{}, newCertProvider()); err != nil {
-		t.Fatalf("newBankRegistry with a valid recurrence JWKS URL: %v", err)
-	}
-}
-
-// TestNewBankRegistryRejectsInsecureRecJWKS asserts a non-HTTPS recurrence JWKS URL
-// fails the boot closed (the verifier is TLS-only; public keys must come over an
-// authenticated channel) rather than silently leaving reads unverifiable (SIN-66061).
-func TestNewBankRegistryRejectsInsecureRecJWKS(t *testing.T) {
-	cfg := config.Config{}
-	cfg.C6.BaseURL = "https://api.c6bank.example"
-	cfg.C6.TokenURL = "https://api.c6bank.example/oauth/token"
-	cfg.C6.RecJWKSURL = "http://api.c6bank.example/jwks.json"
-
-	if _, err := newBankRegistry(cfg, noopCreds{}, newCertProvider()); err == nil {
-		t.Fatal("expected an error for a non-HTTPS recurrence JWKS URL")
-	}
-}

@@ -18,8 +18,8 @@ import (
 // SIN-66034 (F0). C6 follows the BACEN surface under the same /v2/pix prefix as
 // cob/cobv: rec (mandato), solicrec (solicitação de confirmação) and cobr
 // (cobrança recorrente). Writes are application/json with a {"data":{...}} envelope
-// (201); reads are JWS-signed (Accept: application/jose) and go through
-// signedRead/RecurrenceVerifier. This file replaces the chutado consent scaffold.
+// (201); reads are plain application/json and go through recurrenceRead. This file
+// replaces the chutado consent scaffold.
 const (
 	recPath      = "/v2/pix/rec"
 	solicRecPath = "/v2/pix/solicrec"
@@ -34,18 +34,6 @@ var (
 	_ ports.CobRProvider     = (*Provider)(nil)
 	_ ports.LocRecProvider   = (*Provider)(nil)
 )
-
-// RecurrenceVerifier verifies a JWS-signed Recorrência read document and returns
-// its decoded JSON payload. C6 returns rec/solicrec/cobr reads as a JWS (Accept:
-// application/jose) so the BACEN mandate is non-reputable; the adapter MUST verify
-// the signature against C6's published JWKS before trusting the body. F1 defines
-// this seam so the read path is hexagonal and table-testable; the concrete
-// implementation is *JWSVerifier (go-jose v4, explicit asymmetric allowlist + JWKS
-// by kid with rotation), wired in cmd/api/main.go when PAYMENT_C6_REC_JWKS_URL is
-// set (SIN-66061). When no verifier is injected the reads fail secure.
-type RecurrenceVerifier interface {
-	VerifyJWS(ctx context.Context, compact []byte) (payload []byte, err error)
-}
 
 // ---- rec (mandato) ----
 
@@ -289,13 +277,13 @@ func (p *Provider) GetRec(ctx context.Context, tenantID, idRec string) (ports.Re
 	if strings.TrimSpace(idRec) == "" {
 		return ports.RecResult{}, &Error{Op: "get_rec", sentinel: shared.ErrValidation}
 	}
-	payload, err := p.signedRead(ctx, tenantID, "get_rec", p.baseURL+recPath+"/"+url.PathEscape(idRec))
+	payload, err := p.recurrenceRead(ctx, tenantID, "get_rec", p.baseURL+recPath+"/"+url.PathEscape(idRec))
 	if err != nil {
 		return ports.RecResult{}, err
 	}
 	var b recResponseBody
 	if err := decodeData(payload, &b); err != nil {
-		return ports.RecResult{}, &Error{Op: "get_rec", sentinel: shared.ErrUnavailable, detail: "malformed signed body"}
+		return ports.RecResult{}, &Error{Op: "get_rec", sentinel: shared.ErrUnavailable, detail: "malformed body"}
 	}
 	return b.toResult(), nil
 }
@@ -320,13 +308,13 @@ func (p *Provider) GetRecForQR(ctx context.Context, tenantID, idRec, txID string
 	if txid := strings.TrimSpace(txID); txid != "" {
 		endpoint += "?txid=" + url.QueryEscape(txid)
 	}
-	payload, err := p.signedRead(ctx, tenantID, "get_rec_qr", endpoint)
+	payload, err := p.recurrenceRead(ctx, tenantID, "get_rec_qr", endpoint)
 	if err != nil {
 		return ports.RecResult{}, err
 	}
 	var b recResponseBody
 	if err := decodeData(payload, &b); err != nil {
-		return ports.RecResult{}, &Error{Op: "get_rec_qr", sentinel: shared.ErrUnavailable, detail: "malformed signed body"}
+		return ports.RecResult{}, &Error{Op: "get_rec_qr", sentinel: shared.ErrUnavailable, detail: "malformed body"}
 	}
 	return b.toResult(), nil
 }
@@ -445,13 +433,13 @@ func (p *Provider) GetSolicRec(ctx context.Context, tenantID, idSolicRec string)
 	if strings.TrimSpace(idSolicRec) == "" {
 		return ports.SolicRecResult{}, &Error{Op: "get_solicrec", sentinel: shared.ErrValidation}
 	}
-	payload, err := p.signedRead(ctx, tenantID, "get_solicrec", p.baseURL+solicRecPath+"/"+url.PathEscape(idSolicRec))
+	payload, err := p.recurrenceRead(ctx, tenantID, "get_solicrec", p.baseURL+solicRecPath+"/"+url.PathEscape(idSolicRec))
 	if err != nil {
 		return ports.SolicRecResult{}, err
 	}
 	var b solicRecResponseBody
 	if err := decodeData(payload, &b); err != nil {
-		return ports.SolicRecResult{}, &Error{Op: "get_solicrec", sentinel: shared.ErrUnavailable, detail: "malformed signed body"}
+		return ports.SolicRecResult{}, &Error{Op: "get_solicrec", sentinel: shared.ErrUnavailable, detail: "malformed body"}
 	}
 	return b.toResult(), nil
 }
@@ -616,27 +604,43 @@ func (p *Provider) GetCobR(ctx context.Context, tenantID, txID string) (ports.Co
 	if strings.TrimSpace(txID) == "" {
 		return ports.CobRResult{}, &Error{Op: "get_cobr", sentinel: shared.ErrValidation}
 	}
-	payload, err := p.signedRead(ctx, tenantID, "get_cobr", p.baseURL+cobrPath+"/"+url.PathEscape(txID))
+	payload, err := p.recurrenceRead(ctx, tenantID, "get_cobr", p.baseURL+cobrPath+"/"+url.PathEscape(txID))
 	if err != nil {
 		return ports.CobRResult{}, err
 	}
 	var b cobrResponseBody
 	if err := decodeData(payload, &b); err != nil {
-		return ports.CobRResult{}, &Error{Op: "get_cobr", sentinel: shared.ErrUnavailable, detail: "malformed signed body"}
+		return ports.CobRResult{}, &Error{Op: "get_cobr", sentinel: shared.ErrUnavailable, detail: "malformed body"}
 	}
 	return b.toResult(), nil
 }
 
 // ---- shared helpers ----
 
-// signedRead performs a Recorrência read: GET with Accept: application/jose, maps a
-// non-2xx into a domain error, then verifies the JWS and returns the decoded JSON
-// payload. Without a configured RecurrenceVerifier it fails secure (ErrUnavailable)
-// rather than trusting an unverified mandate document.
-func (p *Provider) signedRead(ctx context.Context, tenantID, op, endpoint string) ([]byte, error) {
-	if p.recVerifier == nil {
-		return nil, &Error{Op: op, sentinel: shared.ErrUnavailable, detail: "recurrence read verifier not configured"}
-	}
+// recurrenceRead performs a Recorrência read: GET with Accept: application/json, maps
+// a non-2xx into a domain error, and returns the body.
+//
+// It used to send `Accept: application/jose` and refuse to trust the body unless a JWS
+// verified against a C6 JWKS. That was wrong, and provably so — C6 rejects the header
+// outright (probed against the sandbox on 28/08/2026, cmd/c6-rec-probe):
+//
+//	Accept: application/json  → 200, Content-Type: application/json
+//	Accept: application/jose  → 400 "Request Accept header '[application/jose]' does
+//	                            not match any defined response types. Must be one of:
+//	                            [application/json, application/problem+json]"
+//
+// So every recurrence read was failing, and no JWKS value could have fixed it: the
+// request was refused before any signature could exist to verify. The contract agrees
+// — these reads are declared application/json, and the single JWS in the whole C6 Pix
+// Automático spec belongs to GET /rec/{recUrlAccessToken}: a PUBLIC endpoint on another
+// host (qrcode-h.c6pix.com), signed under a BACEN `jku`, fetched and validated by the
+// PAYER's PSP when it scans the QR. We are the recebedor; that document is not ours to
+// verify, and we never request it.
+//
+// What authenticates these reads is therefore the channel, not the payload: OAuth2
+// client_credentials over the per-tenant mTLS transport — exactly what already
+// authenticates cob, cobv, boleto and checkout.
+func (p *Provider) recurrenceRead(ctx context.Context, tenantID, op, endpoint string) ([]byte, error) {
 	token, err := p.tokens.token(ctx, tenantID)
 	if err != nil {
 		return nil, err
@@ -646,7 +650,7 @@ func (p *Provider) signedRead(ctx context.Context, tenantID, op, endpoint string
 		return nil, transportError(op)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/jose")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := p.httpc.Do(req)
 	if err != nil {
@@ -658,11 +662,7 @@ func (p *Provider) signedRead(ctx context.Context, tenantID, op, endpoint string
 	if resp.StatusCode/100 != 2 {
 		return nil, mapError(op, resp.StatusCode, body)
 	}
-	payload, err := p.recVerifier.VerifyJWS(ctx, body)
-	if err != nil {
-		return nil, &Error{Op: op, StatusCode: resp.StatusCode, sentinel: shared.ErrUnavailable, detail: "jws verification failed"}
-	}
-	return payload, nil
+	return body, nil
 }
 
 // decodeData unmarshals a Recorrência body that may be wrapped in the C6

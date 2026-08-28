@@ -58,14 +58,22 @@ quem informa qual foi composta.
 
 ## Divergências conhecidas contra o adapter
 
-1. **Content-type das leituras.** Este OAS declara `application/json` em todas as
-   leituras de recorrência — a string `jose` não aparece uma única vez no documento.
-   O adapter exige JWS (`signedRead`, `Accept: application/jose`), postura capturada
-   ao vivo em SIN-66034 e defendida em
-   [`../ops/c6-recurrence-jws-go-live-runbook.md`](../ops/c6-recurrence-jws-go-live-runbook.md).
-   Enquanto `PAYMENT_C6_REC_JWKS_URL` estiver vazia, **toda** leitura falha fechada —
-   inclusive o `GET /rec?txid=` que produz o QR composto. Confirmar o comportamento
-   real no sandbox antes do go-live.
+1. ~~**Content-type das leituras.**~~ **Resolvido por medição em 28/08/2026.** O OAS
+   declara `application/json`, e o sandbox confirmou de forma direta
+   (`cmd/c6-rec-probe`):
+
+   ```
+   Accept: application/json  → 200, Content-Type: application/json
+   Accept: application/jose  → 400 "does not match any defined response types"
+   ```
+
+   O adapter mandava `application/jose`, então **toda** leitura de recorrência
+   falhava — e nenhum valor de `PAYMENT_C6_REC_JWKS_URL` teria consertado, porque a
+   requisição era recusada antes de existir assinatura a verificar. As leituras hoje
+   são JSON, autenticadas pelo canal (OAuth2 sobre mTLS por tenant). O único JWS do
+   contrato está em `GET /rec/{recUrlAccessToken}` — endpoint público noutro host,
+   sob `jku` do BACEN, validado pelo PSP do pagador. Registro em
+   [`../ops/c6-recurrence-jws-obsoleto.md`](../ops/c6-recurrence-jws-obsoleto.md).
 2. ~~**Verbo de revisão da cobrança recorrente.**~~ **Resolvido.** O contrato define
    `PUT /cobr/{txid}` = *criar* (201, corpo completo, txid do cliente),
    `POST /cobr` = *criar* (txid do PSP) e `PATCH /cobr/{txid}` = *revisar*, cujo único

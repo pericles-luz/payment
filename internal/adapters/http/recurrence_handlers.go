@@ -57,13 +57,12 @@ func requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool
 // writeDomainError for everything the whole API already agrees on, and adds ONE case:
 // shared.ErrUnavailable answers 503, not 500.
 //
-// That case is not hypothetical here. The recurrence READ path is fail-secure by design
-// — with PAYMENT_C6_REC_JWKS_URL unset the adapter refuses to trust an unverified
-// mandate document and returns ErrUnavailable (see the JWS go-live runbook). Every
-// deployment is in exactly that state until the JWKS source is confirmed. Reporting it
-// as 500 would tell an integrator we have a bug, and would page whoever watches 5xx
-// rates, for a feature that is behaving precisely as specified; 503 says "this
-// dependency is not available right now", which is true and retryable.
+// That case is not hypothetical: shared.ErrUnavailable is what the adapter returns when
+// the bank dependency is unreachable, times out, rate-limits or 5xxs, and when a
+// recurrence port is not wired in this deployment. Reporting any of those as 500 would
+// tell an integrator we have a bug, and would page whoever watches 5xx rates, for a
+// condition that is upstream and retryable; 503 says "this dependency is not available
+// right now", which is true.
 //
 // It is scoped to this file on purpose: widening the mapping would silently change the
 // documented status of every other endpoint in the API.

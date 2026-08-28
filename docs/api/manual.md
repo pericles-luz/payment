@@ -404,9 +404,7 @@ primeiro pagamento. O pagador lê **um** QR Code composto que ao mesmo tempo
 liquida a primeira cobrança e autoriza os débitos futuros.
 
 > Superfície flag-gated: `PAYMENT_PIX_RECURRENCE`. Com a flag desligada as rotas
-> não existem (404). A leitura do mandato — que é o que compõe o QR — depende
-> também de `PAYMENT_C6_REC_JWKS_URL`; enquanto ela estiver vazia o passo 4
-> responde `503` por segurança (ver `docs/ops/c6-recurrence-jws-go-live-runbook.md`).
+> não existem (404).
 
 O fluxo tem duas metades, e a fronteira entre elas é o que mais confunde na
 primeira integração:

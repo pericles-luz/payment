@@ -55,13 +55,6 @@ type Config struct {
 	// (production: 15, sandbox: 21 — per the C6 Bolepix contract). Empty selects
 	// defaultBillingScheme.
 	BillingScheme string
-	// RecurrenceVerifier verifies the JWS-signed Recorrência reads (rec/solicrec/
-	// cobr GETs return Accept: application/jose). When nil, those reads fail secure
-	// (ErrUnavailable) rather than trusting an unverified mandate document. The
-	// concrete verifier (JOSE lib + JWKS) is a dependency decision pending CTO
-	// sign-off (SIN-66034 F0); the create/cancel paths do not need it.
-	RecurrenceVerifier RecurrenceVerifier
-
 	// RateLimitPerSecond is the steady-state outbound request rate (tokens/sec) to
 	// C6, capping the load this adapter can generate (Termo A5, no DoS-shaped
 	// traffic). Zero or negative ⇒ defaultRatePerSecond.
@@ -100,9 +93,6 @@ type Provider struct {
 	// now is the clock used for PIX QR-expiry computation when the PSP omits the
 	// charge creation timestamp. Defaults to time.Now (overridable for tests).
 	now func() time.Time
-	// recVerifier verifies JWS-signed Recorrência reads. Optional (nil ⇒ reads fail
-	// secure); see Config.RecurrenceVerifier.
-	recVerifier RecurrenceVerifier
 	// limiter paces outbound requests to C6 (proactive token bucket, Termo A5). Non-nil.
 	limiter *tokenBucket
 	// maxRetries bounds retries on a retryable status (429/503); see Config.MaxRetries.
@@ -197,7 +187,6 @@ func New(cfg Config, creds ports.CredentialStore) (*Provider, error) {
 		creds:         creds,
 		bankID:        ports.BankIDC6,
 		now:           now,
-		recVerifier:   cfg.RecurrenceVerifier,
 		limiter: &tokenBucket{
 			tokens:       float64(burst),
 			capacity:     float64(burst),
