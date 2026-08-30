@@ -23,8 +23,8 @@ import (
 //   - anti-replay dedup by EventKey, inside the unit of work (first delivery wins,
 //     redeliveries are acked as no-ops), exactly as the PIX/charge path;
 //   - reconcile-before-settle: the authoritative state is read back from C6
-//     (GetRec / GetCobR, both JWS-verified in the adapter) — the raw body's status
-//     is NEVER trusted (threat W3). A notification for a mandate/charge that does
+//     (GetRec / GetCobR, over the adapter's authenticated channel) — the raw body's
+//     status is NEVER trusted (threat W3). A notification for a mandate/charge that does
 //     not authoritatively exist is acked and dropped (no settle, no infinite
 //     redelivery); a transient read failure rolls the mark back so the redelivery
 //     is reprocessed.
@@ -199,9 +199,8 @@ func (s *WebhookService) HandleCobREvent(ctx context.Context, ev CobREvent) erro
 // charge is created on first sight or transitioned, an illegal transition is acked and
 // dropped, and only a real status change is recorded.
 //
-// A settlement is NOT taken from the notification body — res is the authoritative read
-// the bank answered (JWS-verified in the C6 adapter), which is what
-// reconcile-before-settle means here.
+// A settlement is NOT taken from the notification body — res is what the bank answered
+// when asked directly, which is what reconcile-before-settle means here.
 func (s *WebhookService) recordCobR(ctx context.Context, r ports.Repository, ev CobREvent, res ports.CobRResult) error {
 	// The domain vocabulary is the cobr wire vocabulary verbatim, so this is a lossless
 	// cast rather than a mapping. A status outside it means the PSP extended the

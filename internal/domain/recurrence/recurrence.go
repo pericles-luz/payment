@@ -8,7 +8,7 @@
 // are the events the audit trail records.
 //
 // Why a separate domain type from the ports DTOs: a ports.RecResult is the bank's
-// view at one instant (reconciled, JWS-verified). A recurrence.Rec is OUR durable
+// view at one instant (as reconciled from it). A recurrence.Rec is OUR durable
 // aggregate — it owns the legal state machine (a mandate cannot go APROVADA →
 // CRIADA, a terminal mandate cannot move at all) so an out-of-order or replayed
 // webhook can never corrupt the lifecycle (threat W3). The string values of the
