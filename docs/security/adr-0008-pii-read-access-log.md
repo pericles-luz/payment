@@ -1,5 +1,12 @@
 # ADR-0008 — Inventário de acesso a dados pessoais no plano de dados (registro art.13 / B10-v)
 
+> 📌 **Emenda de 2026-08-30 ([SIN-66030](/SIN/issues/SIN-66030), [SIN-66034](/SIN/issues/SIN-66034)).**
+> A **decisão deste ADR não muda** — mecanismo, minimização, choke-point e retenção
+> seguem valendo. Duas **premissas de fato** envelheceram e estão corrigidas no texto:
+> (a) `FindRecByID` deixou de ser código sem chamador de produção; (b) as leituras de
+> recorrência no C6 não são verificadas por JWS. O ponto (a) abre uma questão de
+> política que **não está decidida** — ver "Questão em aberto" no §6.
+
 - **Status:** Proposto — aguardando ratificação do CTO.
 - **Fonte da obrigação:** Termo de Uso de APIs C6, cláusula 7.12 (regra **B10**) replicando a **LGPD** e o **Decreto 8.771/2016, art.13** (registro de acesso a dados pessoais: momento, duração, identidade do responsável, dado/titular acessado). Ver `docs/compliance/c6-termo-apis-regras.md` ([SIN-68740](/SIN/issues/SIN-68740)).
 - **Design:** SecurityEngineer ([SIN-68744](/SIN/issues/SIN-68744)). **Implementação:** Coder ([SIN-68748](/SIN/issues/SIN-68748)). **Aprovação:** CTO.
@@ -29,7 +36,7 @@ O Termo C6 (B10) obriga o parceiro a manter dois registros distintos:
 | **`pix_rec` (PIX Automático)** | **SIM — PII em repouso**: `devedor_doc` (CPF/CNPJ) + `devedor_nome` | `migrations/0004` |
 | Leitura de `pix_rec` → `FindRecByID` | Reidrata devedor da store | `internal/adapters/persistence/sqlite/recurrence.go:54` |
 
-**Fato-chave:** a **única** PII de titular **persistida em repouso** neste serviço é o **devedor da recorrência** (`pix_rec.devedor_doc`/`devedor_nome`, SIN-66037). O comentário da migration 0004 afirma *"No secret/credential/PII is stored"* — isso está **incorreto** e deve ser corrigido: a tabela armazena PII. O único caminho de leitura dessa PII é `FindRecByID`, que hoje **não tem chamador de produção** (só testes/plumbing). As leituras do plano de dados hoje em produção (boleto/pix/cobv/checkout) **passam** a PII no *write* (inbound → C6, que é o repositório autoritativo) e devolvem **projeções sem PID de titular**.
+**Fato-chave:** a **única** PII de titular **persistida em repouso** neste serviço é o **devedor da recorrência** (`pix_rec.devedor_doc`/`devedor_nome`, SIN-66037). O comentário da migration 0004 afirma *"No secret/credential/PII is stored"* — isso está **incorreto** e deve ser corrigido: a tabela armazena PII. O único caminho de leitura dessa PII é `FindRecByID`. **Isso mudou em 2026-08-30** ([SIN-66030](/SIN/issues/SIN-66030)): quando este ADR foi escrito ele não tinha chamador de produção (só testes/plumbing); hoje tem **seis**, todos no fluxo de PIX Automático — `OriginateCobR`, `CreateMandate`, `GetMandateQR`, `CancelMandate` e `RetryCobR` (`internal/app/recurrence.go`) e `recordRec` (`internal/app/webhook_recurrence.go`). **Nenhum deles expõe o devedor**: carregam o mandato para o *portão* (mandato APROVADA, teto de valor autorizado, escopo de tenant) ou para idempotência, e a resposta HTTP do mandato não ecoa documento nem nome — há regressão que falha se ecoar (`http.TestMandateResponseDoesNotEchoPayerPII`). As leituras do plano de dados hoje em produção (boleto/pix/cobv/checkout) **passam** a PII no *write* (inbound → C6, que é o repositório autoritativo) e devolvem **projeções sem PID de titular**.
 
 **Conclusão:** a obrigação art.13 de *registro de leitura* torna-se **efetiva no momento** em que um endpoint do plano de dados **retornar PII de titular** — p.ex. um futuro `GET /recurrence/{idRec}` que ecoe o devedor, uma tela de console que exiba o devedor, ou o wiring de settle/reconcile que carregue `FindRecByID` para uma superfície observável. Portanto o desenho precisa (a) fixar o mecanismo e a política **agora**, e (b) tornar o caminho **seguro-por-padrão**, de modo que uma nova leitura de PII **não consiga** ser adicionada sem passar pelo registro.
 
@@ -78,7 +85,18 @@ Introduz-se um **único ponto de mediação**: a porta `PIIAccessRecorder` injet
 ### 6. Disponibilidade (fail-open vs fail-closed)
 
 - **PII em repouso local (`pix_rec`, mesma store):** o append do acesso ocorre **na mesma transação** da leitura (atômico, como as transições de recorrência já fazem via `ports.Repository` bundled). Se o append falhar, a leitura falha — não há leitura não-registrada de PII local (Complete Mediation).
-- **Leituras pass-through do banco (GetRec JWS-verificado):** não há transação cross-boundary com o C6; o append é **best-effort com alerta** em falha (não bloquear a leitura por falha de logging seria DoS auto-infligido; mas monitorar a taxa de falha). Risco residual explicitado abaixo.
+- **Leituras pass-through do banco (`GetRec` e as demais leituras de recorrência):** não há transação cross-boundary com o C6; o append é **best-effort com alerta** em falha (não bloquear a leitura por falha de logging seria DoS auto-infligido; mas monitorar a taxa de falha). Risco residual explicitado abaixo. *(Este bullet dizia "GetRec JWS-verificado". Corrigido em 2026-08-30: sondado contra o sandbox, o C6 recusa `Accept: application/jose` nessas leituras — são `application/json`, autenticadas pelo canal, [SIN-66034](/SIN/issues/SIN-66034). A escolha best-effort não dependia da assinatura e permanece.)*
+
+### Questão em aberto — leituras de PORTÃO contam como leitura tier-1?
+
+Aberta em 2026-08-30 por [SIN-66030](/SIN/issues/SIN-66030); **decisão do SecurityEngineer/CTO, não tomada aqui.**
+
+Os seis chamadores novos de `FindRecByID` **resolvem a linha** — logo reidratam `Devedor` em memória — mas existem para *negar ou permitir uma cobrança*, e não expõem o titular a ninguém. Duas leituras possíveis de §5:
+
+1. **Mediação exigida.** "Toda leitura tier-1 de PII deve passar pelo choke-point" é literal: resolver a linha é ler a PII, independentemente do que se faz com ela. Então esses seis devem migrar para `PIIAccessService.ReadRec` — e o custo é um append por cobrança recorrente originada, num caminho de dinheiro.
+2. **Mediação no ponto de exposição.** A obrigação do art.13 é registrar *acesso a dados do titular*; um portão que compara status e valor não expõe titular a ninguém. Então o gatilho continua sendo "endpoint que retorna devedor", e os seis estão fora do escopo.
+
+O texto original deste ADR aponta para (2) — a "Conclusão" acima define o gatilho como *"um endpoint do plano de dados retornar PII de titular"*. Mas ele foi escrito quando `FindRecByID` não tinha chamador algum, então a distinção nunca precisou ser feita. Ela precisa agora, e por escrito: hoje a prática segue (2) **por omissão**, não por decisão.
 
 ## Consequências
 
@@ -98,7 +116,7 @@ Implementado por Coder em SIN-68748 (revisão SecurityEngineer; aprovação CTO)
 1. Migration `0006_pii_access_log` (`id`, `at`, `duration_ms`, `tenant_id`, `client_id`, `operator_id`, `subject_ref`, `object`, `action`), append-only, portável, com índices `(tenant_id, at)`, `(subject_ref, at)` e `(at)`.
 2. Domínio `internal/domain/access` — `Entry` imutável (sem campo de PII em claro por construção), vocabulário fechado `Action` (deny-by-default), `Pseudonymizer` HMAC-SHA256 com chave ≥16 bytes (`LogValue` redige a chave), `RetentionPolicy` configurável (`DefaultRetention` = 6 meses).
 3. Portas `ports.PIIAccessRecorder` (bundled no `Repository` — mesma tx da leitura) + `ports.PIIAccessPurger`; adapters SQLite e in-memory.
-4. Choke-point `app.PIIAccessService.ReadRec` — carrega o mandato e grava o acesso na **mesma** transação (Complete Mediation: append falho → leitura revertida). Duração medida no choke-point. Responsável derivado server-side. **Wiring HTTP fica com o primeiro endpoint que retornar devedor** (nenhum existe hoje).
+4. Choke-point `app.PIIAccessService.ReadRec` — carrega o mandato e grava o acesso na **mesma** transação (Complete Mediation: append falho → leitura revertida). Duração medida no choke-point. Responsável derivado server-side. **Wiring HTTP fica com o primeiro endpoint que retornar devedor** — em 2026-08-30 ainda **nenhum existe**, apesar das rotas de recorrência (`/v1/pix/rec` e vizinhas) terem entrado em [SIN-66030](/SIN/issues/SIN-66030): elas deliberadamente não ecoam o devedor. `ReadRec` segue, portanto, sem chamador — ver a questão em aberto no §6.
 5. Comentário incorreto da migration 0004 corrigido (declara `devedor_doc`/`devedor_nome` como PII do titular; aponta este ADR).
 6. Retenção configurável + rotina de expurgo append-safe (`app.PIIAccessRetentionService.Purge`, único DELETE permitido).
 7. `pr-review-policy.md`: nova leitura que retorne `Devedor*`/`Payer` DEVE passar pelo recorder (gate de revisão + gate de CI por grep). ADR indexado em `docs/security/README.md`.
