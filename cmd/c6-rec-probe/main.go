@@ -27,7 +27,14 @@
 //
 // Usage:
 //
-//	c6-rec-probe <tenantID>
+//	c6-rec-probe <tenantID>            # só leituras (GET /rec), read-only
+//	c6-rec-probe <tenantID> locrec     # + POST /v2/pix/locrec (cria uma location)
+//
+// O modo `locrec` é a ÚNICA parte que ESCREVE, e é a escrita mais benigna do
+// contrato: mintar uma location é reservar uma URL de payload — sem pagador, sem
+// valor, sem mandato, sem cobrança. Serve para ver, com a resposta crua do banco, por
+// que POST /v2/pix/locrec devolveu 404 pela API (SIN-66030). O corpo de erro do C6 é
+// um Problema RFC7807 sem PII, então é impresso; num 2xx só metadados saem.
 package main
 
 import (
@@ -60,6 +67,34 @@ func run() error {
 	if len(os.Args) < 2 {
 		return fmt.Errorf("uso: c6-rec-probe <tenantID>")
 	}
+	// Modo utilitário: listar os tenants que têm credencial C6 no cofre, para achar um
+	// alvo sandbox. Só imprime ids (não é segredo), nunca o material da credencial.
+	if strings.TrimSpace(os.Args[1]) == "--list-c6" {
+		cfg := config.FromEnv()
+		db, err := persistence.Open(context.Background(), cfg.DBDSN, cfg.DBPath)
+		if err != nil {
+			return fmt.Errorf("abrir banco: %w", err)
+		}
+		defer func() { _ = db.Close() }()
+		rows, err := db.SQL.QueryContext(context.Background(),
+			`SELECT tenant_id FROM bank_credentials WHERE bank_id = $1 ORDER BY tenant_id`, ports.BankIDC6)
+		if err != nil {
+			return fmt.Errorf("consulta: %w", err)
+		}
+		defer func() { _ = rows.Close() }()
+		n := 0
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			fmt.Printf("  tenant com credencial C6: %s\n", id)
+			n++
+		}
+		fmt.Printf("  total: %d\n", n)
+		return nil
+	}
+
 	tenantID := strings.TrimSpace(os.Args[1])
 	cfg := config.FromEnv()
 	if cfg.C6.BaseURL == "" || cfg.C6.TokenURL == "" {
@@ -104,7 +139,39 @@ func run() error {
 	for _, accept := range []string{"application/json", "application/jose"} {
 		probe(ctx, httpc, endpoint, token, accept)
 	}
+
+	if len(os.Args) >= 3 && strings.TrimSpace(os.Args[2]) == "locrec" {
+		fmt.Printf("\n")
+		probeLocRec(ctx, httpc, strings.TrimRight(cfg.C6.BaseURL, "/")+"/v2/pix/locrec", token)
+	}
 	return nil
+}
+
+// probeLocRec POSTs the payload-location mint the recurrence journey starts with —
+// the exact call the API maps to 404. The BACEN contract takes NO request body, so
+// none is sent. Only metadata + the RFC7807 error detail (no PII) are printed.
+func probeLocRec(ctx context.Context, httpc *http.Client, endpoint, token string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		fmt.Printf("POST locrec        → erro montando request: %v\n", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Idempotency-Key", "probe-locrec-"+time.Now().UTC().Format("20060102T150405Z"))
+
+	resp, err := httpc.Do(req)
+	if err != nil {
+		fmt.Printf("POST locrec        → transporte falhou: %v\n", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	buf := make([]byte, 4096)
+	n, _ := resp.Body.Read(buf)
+	head := strings.TrimSpace(string(buf[:n]))
+	fmt.Printf("POST %-14s → HTTP %d  Content-Type: %-34s (%d bytes)\n",
+		"locrec", resp.StatusCode, resp.Header.Get("Content-Type"), n)
+	fmt.Printf("                     corpo: %s\n", head)
 }
 
 // probe issues one GET and prints only response metadata — never the body, which

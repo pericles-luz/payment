@@ -223,6 +223,28 @@ func run() error {
 			base+"/v1/webhooks?service="+url.QueryEscape(svc), token, nil, "application/json")
 	}
 
+	// --extrato [inicio] [fim]: READ the account statement straight from C6, printing the
+	// RAW body. Read-only, e para ANTES do passo 3 — o padrao desta sonda faz um PUT de
+	// webhook com ref descartavel, e com a varredura de renovacao desligada isso nao se
+	// cura sozinho: sobrescreveria a inscricao viva do tenant.
+	//
+	// Existe porque GET /v1/statement pela nossa API devolve 400 em producao para um
+	// tenant cujas outras rotas respondem 200. O adaptador descarta de proposito o
+	// problem+json do PSP, entao o motivo fica invisivel — e o motivo e exatamente o que
+	// precisamos para saber se da para identificar credito em conta pelo extrato.
+	if len(os.Args) > 2 && os.Args[2] == "--extrato" {
+		hoje := time.Now().UTC()
+		inicio := hoje.AddDate(0, 0, -7).Format("2006-01-02")
+		fim := hoje.Format("2006-01-02")
+		if len(os.Args) > 4 {
+			inicio, fim = os.Args[3], os.Args[4]
+		}
+		section("GET /v1/statement?start_date=" + inicio + "&end_date=" + fim)
+		return call(ctx, httpc, http.MethodGet,
+			fmt.Sprintf("%s/v1/statement?start_date=%s&end_date=%s", base, inicio, fim),
+			token, nil, "application/json")
+	}
+
 	// --parcelas <n>: open ONE hosted checkout with a ceiling of n parcelas and a
 	// LONG expiry, so a human has time to open the page and answer the one question
 	// the wire cannot: does the page offer a CHOICE of parcelas up to n, or does it
