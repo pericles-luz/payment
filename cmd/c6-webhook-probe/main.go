@@ -245,6 +245,35 @@ func run() error {
 			token, nil, "application/json")
 	}
 
+	// --recebiveis [inicio] [fim]: READ a API de Recebiveis do C6 Pay
+	// (GET /v1/c6pay/statement/receivables), somente leitura.
+	//
+	// Existe porque o extrato traz UMA linha agregada por credito ("CRED LOJ C CREDITO
+	// 37,29") e conciliar precisa do detalhe: qual venda, qual parcela, quanta tarifa.
+	// Um credito real de 02/09/2026 juntou cinco recebiveis de tres vendas, com tarifas
+	// diferentes por parcela — casar isso por valor e data e impossivel quando duas
+	// vendas tem o mesmo valor no mesmo dia, e foi exatamente o que aconteceu (duas
+	// vendas de R$ 5,01).
+	//
+	// Manda os cabecalhos de parceiro que o portal marca como esperados: sem eles, um
+	// erro nao distingue "falta cabecalho" de "conta nao autorizada".
+	if len(os.Args) > 2 && os.Args[2] == "--recebiveis" {
+		hoje := time.Now().UTC()
+		inicio := hoje.Format("2006-01-02")
+		fim := inicio
+		if len(os.Args) > 4 {
+			inicio, fim = os.Args[3], os.Args[4]
+		}
+		endpoint := fmt.Sprintf(
+			"%s/v1/c6pay/statement/receivables?page=1&size=200&start_date=%s&end_date=%s",
+			base, url.QueryEscape(inicio), url.QueryEscape(fim))
+		section("GET /v1/c6pay/statement/receivables " + inicio + " a " + fim)
+		return callComCabecalhos(ctx, httpc, http.MethodGet, endpoint, token, map[string]string{
+			"partner-software-name":    "payment-gateway",
+			"partner-software-version": "1.0.0",
+		})
+	}
+
 	// --parcelas <n>: open ONE hosted checkout with a ceiling of n parcelas and a
 	// LONG expiry, so a human has time to open the page and answer the one question
 	// the wire cannot: does the page offer a CHOICE of parcelas up to n, or does it
@@ -657,9 +686,31 @@ func call(ctx context.Context, httpc *http.Client, method, endpoint, token strin
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	return fazer(httpc, req)
+}
+
+// callComCabecalhos e call() com cabecalhos extras, para superficies que exigem
+// identificacao de parceiro — a API de Recebiveis do C6 Pay e uma delas.
+func callComCabecalhos(ctx context.Context, httpc *http.Client, method, endpoint, token string, extras map[string]string) error {
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	for k, v := range extras {
+		req.Header.Set(k, v)
+	}
+	return fazer(httpc, req)
+}
+
+// fazer executa a requisicao e imprime status, content-type e o corpo cru (limitado).
+// Imprimir o corpo e o proposito desta ferramenta: ela roda a mao, no terminal do
+// operador, nunca dentro de um servico.
+func fazer(httpc *http.Client, req *http.Request) error {
 	resp, err := httpc.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s transport: %w", method, err)
+		return fmt.Errorf("%s transport: %w", req.Method, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxPrintBytes))
