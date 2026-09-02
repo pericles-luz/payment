@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,32 +60,110 @@ func (ts *stmtTestServer) provider(t *testing.T, creds ports.CredentialStore) *P
 	return p
 }
 
-func TestGetStatementSuccess(t *testing.T) {
+// O corpo abaixo é a resposta REAL do C6 em produção, capturada no fio em 02/09/2026 —
+// o crédito das vendas no cartão caindo na conta. A entrada de débito foi acrescentada
+// no mesmo formato para cobrir o outro sentido.
+//
+// Este teste existe porque o adaptador lia uma forma que o banco nunca mandou: `id`,
+// `date`, `amount_cents`, `kind`. Nenhum desses nomes existe no fio, então TODO campo
+// caía zerado, o `kind` vazio reprovava na revalidação de domínio, e a rota devolvia
+// 400 em qualquer janela de datas. Fixar a forma inventada era pior do que não ter
+// teste: dava confiança num caminho que nunca funcionou.
+const extratoRealDoC6 = `{"entries":[
+	{"external_id":"225614624409401844848161597951885097716","created_at":"2026-09-02T06:43:05Z",
+	 "entry_date":"2026-09-02","amount":"37.29","title":"CRED LOJ C CREDITO",
+	 "description":"CART. CREDIT - PAYGO ADMINISTR - Elo Cré","receipt":null,
+	 "reference":"202609010000499095671","operation_type":"INCOMING","transaction_type":"OTHER"},
+	{"external_id":"99","created_at":"2026-09-02T09:00:00Z","entry_date":"2026-09-02",
+	 "amount":"1234.05","title":"TARIFA","description":"PACOTE MENSAL","receipt":null,
+	 "reference":"2026090100004990000","operation_type":"OUTGOING","transaction_type":"OTHER"}
+]}`
+
+func TestGetStatementLeOFioRealDoC6(t *testing.T) {
 	t.Parallel()
 	ts := newStmtTestServer(t)
-	ts.body = `{"entries":[
-		{"id":"e1","date":"2026-06-05T00:00:00Z","amount_cents":1000,"kind":"credit","description":"in"},
-		{"id":"e2","date":"2026-06-10T00:00:00Z","amount_cents":500,"kind":"debit","description":"out"}
-	]}`
+	ts.body = extratoRealDoC6
 	p := ts.provider(t, oneTenant("t1", "client-1", "s"))
 
-	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
 	st, err := p.GetStatement(context.Background(), "t1", ports.StatementFilter{Start: start, End: end})
 	if err != nil {
 		t.Fatalf("GetStatement: %v", err)
 	}
-	if ts.lastQuery.Get("start_date") != "2026-06-01" || ts.lastQuery.Get("end_date") != "2026-06-30" {
-		t.Fatalf("date window not forwarded as start_date/end_date YYYY-MM-DD: %v", ts.lastQuery)
+	if ts.lastQuery.Get("start_date") != "2026-09-01" || ts.lastQuery.Get("end_date") != "2026-09-02" {
+		t.Fatalf("janela não foi enviada como start_date/end_date: %v", ts.lastQuery)
 	}
 	if ts.lastAuthHeader != "Bearer tok-client-1" {
-		t.Fatalf("per-tenant bearer not attached: %q", ts.lastAuthHeader)
+		t.Fatalf("bearer por tenant não foi anexado: %q", ts.lastAuthHeader)
 	}
-	if len(st.Entries) != 2 || st.Entries[0].ID != "e1" || st.Entries[1].Kind != "debit" {
-		t.Fatalf("unexpected entries: %+v", st.Entries)
+	if len(st.Entries) != 2 {
+		t.Fatalf("entradas = %d, want 2: %+v", len(st.Entries), st.Entries)
 	}
-	if st.Entries[0].AmountCents != 1000 {
-		t.Fatalf("amount: %+v", st.Entries[0])
+
+	credito := st.Entries[0]
+	if credito.ID != "225614624409401844848161597951885097716" {
+		t.Errorf("id veio de external_id? got %q", credito.ID)
+	}
+	// 37,29 em texto tem de virar 3729 centavos. Passar por float aqui é como se perde
+	// um centavo que ninguém consegue explicar depois.
+	if credito.AmountCents != 3729 {
+		t.Errorf("amount = %d centavos, want 3729 (de \"37.29\")", credito.AmountCents)
+	}
+	if credito.Kind != "credit" {
+		t.Errorf("INCOMING deveria virar credit, got %q", credito.Kind)
+	}
+	if credito.Date.Format("2006-01-02") != "2026-09-02" {
+		t.Errorf("data veio de entry_date? got %s", credito.Date)
+	}
+	// As duas metades do histórico: quem concilia precisa da natureza E da origem.
+	if !strings.Contains(credito.Description, "CRED LOJ C CREDITO") ||
+		!strings.Contains(credito.Description, "PAYGO") {
+		t.Errorf("histórico perdeu uma das metades: %q", credito.Description)
+	}
+
+	debito := st.Entries[1]
+	if debito.Kind != "debit" {
+		t.Errorf("OUTGOING deveria virar debit, got %q", debito.Kind)
+	}
+	if debito.AmountCents != 123405 {
+		t.Errorf("amount = %d centavos, want 123405 (de \"1234.05\")", debito.AmountCents)
+	}
+}
+
+// Tipo de operação desconhecido NÃO é chutado para crédito. Num extrato, errar o sinal
+// é errar o saldo — melhor a leitura falhar visivelmente na revalidação de domínio do
+// que classificar como entrada algo que talvez seja saída.
+func TestGetStatementTipoDesconhecidoNaoViraCredito(t *testing.T) {
+	t.Parallel()
+	ts := newStmtTestServer(t)
+	ts.body = `{"entries":[{"external_id":"x","entry_date":"2026-09-02","amount":"1.00",
+		"title":"?","description":"?","operation_type":"ALGO_NOVO"}]}`
+	p := ts.provider(t, oneTenant("t1", "c", "s"))
+
+	st, err := p.GetStatement(context.Background(), "t1", ports.StatementFilter{
+		Start: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("GetStatement: %v", err)
+	}
+	if st.Entries[0].Kind != "" {
+		t.Fatalf("tipo desconhecido virou %q em vez de vazio: o domínio precisa poder recusar", st.Entries[0].Kind)
+	}
+}
+
+// Uma das metades do histórico ausente não pode deixar separador órfão.
+func TestGetStatementHistoricoComUmaMetadeSo(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ nome, title, desc, quer string }{
+		{"só título", "TARIFA", "", "TARIFA"},
+		{"só descrição", "", "PACOTE", "PACOTE"},
+		{"as duas", "TARIFA", "PACOTE", "TARIFA — PACOTE"},
+	} {
+		if got := stmtHistory(tc.title, tc.desc); got != tc.quer {
+			t.Errorf("%s: got %q, want %q", tc.nome, got, tc.quer)
+		}
 	}
 }
 
