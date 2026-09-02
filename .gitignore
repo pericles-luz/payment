@@ -41,6 +41,7 @@ go.work.sum
 
 # binario compilado da ferramenta de diagnostico (nao versionar)
 /c6-webhook-probe
+/c6-rec-probe
 build/
 
 # binarios de build local dos entrypoints

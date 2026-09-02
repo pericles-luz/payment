@@ -7,7 +7,10 @@
 > pelo Caddy). CD apontado para o `pre-prod`, com a chave de deploy e o comando
 > forçado replicados.
 >
-> **Pendente: desmontar o host antigo** — ver "Passo 3", deliberadamente adiado.
+> **CONCLUÍDO. Medido em 02/09/2026** — a limpeza do Passo 3 foi feita e o
+> `payment.someu.com.br` saiu do DNS. Detalhe em "Estado final". A consequência
+> que importa: **o rollback descrito neste documento não é mais executável**, e
+> quem precisar reverter tem de tratar como implantação nova.
 
 Sequência de corte (Fase 5 da migração, SIN-70001), com o porquê de cada ordem.
 O que está escrito aqui foi medido nas máquinas, não presumido.
@@ -31,17 +34,29 @@ A troca inverte a ordem e fica melhor que o plano original:
 2. **Aplicação depois, em janela própria.** Troca-se o upstream do Caddy. O
    rollback é voltar uma linha e recarregar: segundos, sem depender de TTL.
 
-## Estado atual (passo 1 já preparado)
+## Estado final (medido em 02/09/2026)
 
 | | |
 |---|---|
-| Certificados | reais, do Let's Encrypt, em `/etc/caddy/certs/` no balanceador, `caddy:caddy` 0600 |
-| Upstream do Caddy | `payment.someu.com.br:8080` e `:8081` — o app **antigo** |
-| ufw do servidor antigo | libera 8080/8081 para `201.23.82.60` (balanceador) **e** `143.198.66.140` (HAProxy), para o rollback |
-| DNS | ainda `143.198.66.140` |
+| DNS `payment.lmhost.com.br` | `201.23.82.60` (balanceador `syndeotech-lb`) |
+| Upstream do Caddy | `172.18.1.82:8080` e `:8081` — o app **novo**, em `pre-prod` |
+| Certificado servido | emissor Let's Encrypt, vence **18/nov/2026** — o ACME do Caddy assumiu a renovação, e as linhas `tls` explícitas saíram do Caddyfile |
+| HAProxy antigo | `bk_payment` e `bk_payment_sbx` comentados, junto com as duas regras de SNI |
+| certbot do host antigo | só `escravo.someu.com.br`; nenhuma renovação de `payment.*` |
+| `payment.someu.com.br` | **não resolve mais**, de lugar nenhum |
 
-Verificado: os dois caminhos devolvem resposta idêntica e a verificação TLS pelo
-balanceador passa **sem `-k`**.
+O aviso de prazo do Passo 1.5 está resolvido: o certificado em produção hoje é
+emitido pelo Let's Encrypt e vence em novembro, não em 25/out.
+
+### O rollback deste documento morreu com o DNS
+
+Todo caminho de volta descrito abaixo depende de `payment.someu.com.br` — o
+`reverse_proxy` de volta, o `systemctl start payment-api` no host antigo, o SQLite
+intocado. Sem o nome no DNS, nada disso é um comando: é uma implantação nova.
+
+Não é defeito, é a consequência natural de a limpeza ter sido feita. Mas quem ler
+daqui em diante precisa saber que as instruções de rollback abaixo são **histórico**,
+não procedimento.
 
 ```sh
 curl -sS --resolve payment.lmhost.com.br:443:201.23.82.60 https://payment.lmhost.com.br/healthz
@@ -125,16 +140,26 @@ Não é indisponibilidade igual para todos: os webhooks do C6 recebem 502 e são
 propósito para provocar reentrega). Chamadas `/v1/*` e o console tomam 502 de
 verdade pelo tempo da janela.
 
-## Passo 3 — limpeza (ADIADA de propósito)
+## Passo 3 — limpeza (FEITA)
 
-> Nada aqui foi feito ainda, e é intencional: no dia do corte o serviço não teve
-> tráfego real, então a stack nova ainda não se provou em uso. Enquanto isso, o
-> host antigo é o rollback — o SQLite está lá, no estado do momento do corte, e o
-> app volta a servir com `systemctl start payment-api` mais um `reverse_proxy` de
-> volta para `payment.someu.com.br` no Caddy.
->
-> Fazer o que está abaixo depois de alguns dias de uso real.
+> **Conferido em 02/09/2026**, item a item, nas máquinas. A stack nova já tinha o
+> uso real que faltava: pagamentos por PIX e o primeiro por cartão liquidaram por
+> ela entre 20 e 27/08.
 
+| | |
+|---|---|
+| 1. HAProxy | feito — as duas linhas de `use_backend` e os dois blocos `backend` estão **comentados**, não apagados |
+| 2. certbot | feito — `/etc/letsencrypt/renewal/` do host antigo só tem `escravo.someu.com.br` |
+| 3. ufw | feito — nenhuma regra para 8080/8081 sobrou (o ufw segue ativo para o resto) |
+| 4. secrets do CD | já era, desde a janela do corte |
+| 5. host antigo como rollback frio | **encerrado antes das ~2 semanas previstas**: `payment.someu.com.br` saiu do DNS |
+
+O item 5 merece registro porque contraria o que este documento planejou. A janela de
+rollback frio ia até ~04/09 e o nome saiu antes. Não houve prejuízo — nada precisou
+voltar —, mas a rede de segurança foi recolhida mais cedo do que o plano dizia, e quem
+consultar este documento depois deve saber que ela não está mais lá.
+
+### O que era para fazer (histórico)
 
 1. Remover `bk_payment` e `bk_payment_sbx` do `/etc/haproxy/haproxy.cfg` antigo.
    **Não desligar aquela máquina:** ela ainda serve `contador.someu.com.br`,
