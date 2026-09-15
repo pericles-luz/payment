@@ -483,7 +483,42 @@ type BankCapabilities struct {
 	PIX bool
 	// Card reports whether it may open the hosted card checkout.
 	Card bool
+	// Boleto and Bolepix are TRI-STATE, unlike PIX and Card, because the C6 scope name
+	// that authorises bank-slip writes has not been observed on a granted token yet — it
+	// is absent from the published OpenAPI, which documents only bearerAuth.
+	//
+	// Reporting false for "we have not checked" would tell an empresa its account cannot
+	// issue boletos, which we do not know and may well be wrong. Unknown is the honest
+	// answer, and it costs nothing: this is a display capability, never an authorization
+	// gate.
+	Boleto Capability
+	// Bolepix is never stronger than Boleto, and carries one extra precondition that is
+	// NOT a token scope: the tenant must have a registered random (EVP) PIX key. Without
+	// it the bank still creates the charge — silently, with no QR — so a tenant can be
+	// perfectly authorised for boleto and still unable to issue a BolePix.
+	Bolepix Capability
 }
+
+// Capability is a three-valued answer to "may this account do X?". The third state exists
+// because "we have not been able to check" is a real, distinct answer from "no", and
+// collapsing the two tells an empresa something false about its own account.
+type Capability uint8
+
+const (
+	// CapabilityUnknown means no verified way to decide exists yet.
+	CapabilityUnknown Capability = iota
+	// CapabilityGranted means the account's credential authorises it.
+	CapabilityGranted
+	// CapabilityDenied means it does not.
+	CapabilityDenied
+)
+
+// Known reports whether the capability was actually determined.
+func (c Capability) Known() bool { return c != CapabilityUnknown }
+
+// Allowed reports whether the capability was determined AND granted. It is deliberately
+// false for Unknown: any caller that treats this as permission must fail closed.
+func (c Capability) Allowed() bool { return c == CapabilityGranted }
 
 // BankCapabilityReader resolves a tenant's BankCapabilities from the bank.
 //
@@ -737,6 +772,18 @@ type ChargeResult struct {
 	// carryable on the non-PII outbound envelope.
 	Installments int
 	Message      string
+	// SettlementKey is the id the LOCAL payment row is stored under, when the reconcile
+	// source knows it differs from the id the webhook carried.
+	//
+	// It exists for the boleto rail, which has THREE identifiers in play: our boleto id,
+	// the external_reference_id we derive from it, and the bank's own charge id. A
+	// notification may carry either of the last two, while the payment row is keyed by
+	// whichever one registration stored — so the reconcile step, which is the only place
+	// that has seen both, says which to look the payment up by.
+	//
+	// Empty means "use the event's tx id", which is what PIX and checkout do; their
+	// behaviour is unchanged.
+	SettlementKey string
 }
 
 // AmountReconciled reports whether the amount received on this charge exactly
@@ -1074,6 +1121,47 @@ type BoletoPayer struct {
 	Address BoletoAddress
 }
 
+// BoletoModality selects which payment rails a boleto charge is issued with. It exists
+// because the two are genuinely different products to the payer, and the caller — not the
+// state of the tenant's credential — is what should decide which one is being sold.
+//
+// Until now the adapter attached a PIX QR whenever the tenant happened to have a random
+// key registered. That made two very different outcomes indistinguishable: "a plain boleto
+// was requested" and "a BolePix was requested but the tenant is misconfigured, so the payer
+// gets a slip with no QR". Making the choice explicit is what lets the second one be
+// refused instead of silently shipped.
+type BoletoModality string
+
+const (
+	// ModalityBoleto issues a plain bank slip: no PIX QR, even for a tenant that has a
+	// registered key. It is the zero value, so an unset modality never promises a QR.
+	ModalityBoleto BoletoModality = "boleto"
+	// ModalityBolepix issues a slip payable EITHER by boleto or by PIX QR. It requires the
+	// tenant to have a registered random (EVP) PIX key; without one the bank would create
+	// the charge anyway, silently, with no QR at all.
+	ModalityBolepix BoletoModality = "bolepix"
+)
+
+// Normalized returns the modality to act on: empty means ModalityBoleto. The default is
+// deliberately the one that promises LESS — a caller who says nothing gets a slip that
+// works, never a QR that might not materialize.
+func (m BoletoModality) Normalized() BoletoModality {
+	if m == "" {
+		return ModalityBoleto
+	}
+	return m
+}
+
+// Valid reports whether m is a modality this system issues. Anything else is a caller
+// error, refused at the boundary rather than translated into a default.
+func (m BoletoModality) Valid() bool {
+	switch m {
+	case "", ModalityBoleto, ModalityBolepix:
+		return true
+	}
+	return false
+}
+
 // BoletoRequest is the input to register a BolePix boleto at the bank. The fine,
 // interest and discount RATES are transported so the bank registers them, but the
 // amount owed at any instant is computed by the boleto domain, never here
@@ -1103,6 +1191,8 @@ type BoletoRequest struct {
 	// requires it (max 100 chars) — a registration without it is refused by the bank.
 	Description    string
 	IdempotencyKey string
+	// Modality selects plain boleto vs BolePix. The zero value is ModalityBoleto.
+	Modality BoletoModality
 }
 
 // BoletoResult is the bank's response to a boleto registration or read. It carries
@@ -1117,7 +1207,15 @@ type BoletoResult struct {
 	// ledger entry).
 	TxID   string
 	Status string
-	QRCode string // PIX EMV copy-and-paste payload (BolePix)
+	// Modality is the rail set the charge was actually issued with, echoed so a caller
+	// never has to infer it from whether QRCode came back populated.
+	Modality BoletoModality
+	// ExternalReferenceID is the reference WE derive from BoletoID and register with the
+	// bank. It is the key every C6 read/amend/cancel/PDF path is addressed by, and an
+	// inbound settlement notification may carry it instead of the bank's own id — so it
+	// is surfaced rather than recomputed at each call site.
+	ExternalReferenceID string
+	QRCode              string // PIX EMV copy-and-paste payload (BolePix)
 	// OurNumber is C6's "nosso número" (bank_slips `our_number`), reconciliation evidence
 	// (roteiro 6.a). DigitableLine is the linha digitável (bank_slips `digitable_line`),
 	// distinct from the numeric Barcode (`bar_code`). Both zero until the bank returns them.
@@ -1146,11 +1244,70 @@ type BoletoProvider interface {
 	// an already-cancelled boleto succeeds and returns the cancelled state. An unknown
 	// id within the tenant is shared.ErrNotFound; the operation is tenant-scoped.
 	CancelBoleto(ctx context.Context, tenantID, boletoID string) (BoletoResult, error)
-	// UpdateBoleto amends a registered boleto's parameters (roteiro grupo 5): due date
-	// (5.a), validity (5.b) and amount/fine/interest (5.c). req carries the full new
-	// parameter set. An unknown id within the tenant is shared.ErrNotFound; the
-	// operation is tenant-scoped so one tenant can never amend another's boleto.
-	UpdateBoleto(ctx context.Context, tenantID, boletoID string, req BoletoRequest) (BoletoResult, error)
+	// UpdateBoleto amends a registered boleto (roteiro grupo 5): due date (5.a),
+	// validity (5.b) and amount/fine/interest (5.c). It is a PARTIAL update — only the
+	// fields patch actually sets are changed. An unknown id within the tenant is
+	// shared.ErrNotFound; the operation is tenant-scoped so one tenant can never amend
+	// another's boleto.
+	UpdateBoleto(ctx context.Context, tenantID, boletoID string, patch BoletoPatch) (BoletoResult, error)
+	// GetBoletoPDF downloads the registered boleto as a printable document, for the payer.
+	// An unknown id within the tenant is shared.ErrNotFound; the read is tenant-scoped so
+	// one tenant can never download another's slip.
+	GetBoletoPDF(ctx context.Context, tenantID, boletoID string) (BoletoDocument, error)
+	// GetBoletoByBankRef reads a charge by the BANK's external_reference_id, verbatim,
+	// with no local derivation applied.
+	//
+	// It exists for the settlement path. An inbound notification carries an identifier we
+	// cannot always invert back to a local boleto id, and the ordinary GetBoleto derives
+	// the reference FROM that id — so it cannot be used to look up a charge we only know
+	// the reference of. An unknown reference is shared.ErrNotFound; the read is
+	// tenant-scoped like every other.
+	GetBoletoByBankRef(ctx context.Context, tenantID, bankRef string) (BoletoResult, error)
+}
+
+// BoletoDocument is a rendered boleto, carried as bytes rather than a stream because it is
+// small, bounded by the adapter, and has to cross a port that must not leak an open
+// connection into the use-case layer.
+type BoletoDocument struct {
+	// ContentType is the media type to serve it as (application/pdf).
+	ContentType string
+	// Filename is a suggested download name, without a path.
+	Filename string
+	// Content is the document itself.
+	Content []byte
+}
+
+// BoletoFeesPatch is the fee block of an amendment. The bank replaces the fee object
+// wholesale rather than merging into it, so a caller that sets Fees at all must state the
+// complete fee picture — otherwise a rate it left out would be dropped, silently changing
+// what the payer owes.
+type BoletoFeesPatch struct {
+	FineBps            int64
+	FineFixedCents     int64
+	MonthlyInterestBps int64
+	Discounts          []BoletoDiscountTier
+}
+
+// BoletoPatch is a PARTIAL amendment of a registered boleto: a nil field means "leave this
+// alone", never "set it to zero".
+//
+// Pointers rather than plain values because the two meanings are not distinguishable
+// otherwise, and the difference is money. A zero AmountCents sent as "no change" would ask
+// the bank to make the charge free; a zero FineBps would quietly drop a late-payment fine
+// the payer already agreed to. The bank's schema is strict and rejects zero-valued keys,
+// so the distinction has to survive all the way from the boundary to the wire.
+type BoletoPatch struct {
+	AmountCents *int64
+	DueDate     *time.Time
+	// ValidUntil is the last day the boleto may be paid. Amending it requires DueDate too:
+	// the bank expresses expiry as a count of days AFTER the due date, so the anchor has
+	// to be stated rather than guessed from the registered value.
+	ValidUntil  *time.Time
+	Description *string
+	Fees        *BoletoFeesPatch
+	// IdempotencyKey lets the PSP collapse a retried amendment. Empty falls back to the
+	// boleto id in the adapter.
+	IdempotencyKey string
 }
 
 // CheckoutItem is one line of a checkout request (transport mirror of the

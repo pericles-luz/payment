@@ -202,12 +202,28 @@ func (r boletoRouter) CancelBoleto(ctx context.Context, tenantID, boletoID strin
 	return set.Boleto.CancelBoleto(ctx, tenantID, boletoID)
 }
 
-func (r boletoRouter) UpdateBoleto(ctx context.Context, tenantID, boletoID string, req ports.BoletoRequest) (ports.BoletoResult, error) {
+func (r boletoRouter) GetBoletoByBankRef(ctx context.Context, tenantID, bankRef string) (ports.BoletoResult, error) {
 	set, ok := r.reg.resolve(ctx)
 	if !ok || set.Boleto == nil {
 		return ports.BoletoResult{}, shared.ErrUnavailable
 	}
-	return set.Boleto.UpdateBoleto(ctx, tenantID, boletoID, req)
+	return set.Boleto.GetBoletoByBankRef(ctx, tenantID, bankRef)
+}
+
+func (r boletoRouter) GetBoletoPDF(ctx context.Context, tenantID, boletoID string) (ports.BoletoDocument, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.Boleto == nil {
+		return ports.BoletoDocument{}, shared.ErrUnavailable
+	}
+	return set.Boleto.GetBoletoPDF(ctx, tenantID, boletoID)
+}
+
+func (r boletoRouter) UpdateBoleto(ctx context.Context, tenantID, boletoID string, patch ports.BoletoPatch) (ports.BoletoResult, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.Boleto == nil {
+		return ports.BoletoResult{}, shared.ErrUnavailable
+	}
+	return set.Boleto.UpdateBoleto(ctx, tenantID, boletoID, patch)
 }
 
 // --- DDAProvider ---

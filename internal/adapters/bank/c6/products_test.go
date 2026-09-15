@@ -34,7 +34,15 @@ type productServer struct {
 	boletoCreate http.HandlerFunc
 	boletoGet    http.HandlerFunc
 	boletoCancel http.HandlerFunc
-	checkout     http.HandlerFunc
+	boletoPatch  http.HandlerFunc
+	boletoPDF    http.HandlerFunc
+
+	// lastPath and lastMethod record where the adapter actually went. The verb and the
+	// path are part of the contract — an amendment sent as PUT to an id-addressed path is
+	// a different operation from a PATCH on the reference — so tests assert on them.
+	lastPath   string
+	lastMethod string
+	checkout   http.HandlerFunc
 	// cobvPut backs both create and amend (both PUT /v2/pix/cobv/{txid}); cobvGet
 	// backs the reconcile read (roteiro 7.5–7.7).
 	cobvPut http.HandlerFunc
@@ -51,6 +59,8 @@ func newProductServer(t *testing.T) *productServer {
 		ps.lastAuthHeader = r.Header.Get("Authorization")
 		ps.lastIdemKey = r.Header.Get("Idempotency-Key")
 		ps.lastBody, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		ps.lastPath = r.URL.Path
+		ps.lastMethod = r.Method
 	}
 
 	mux := http.NewServeMux()
@@ -82,14 +92,36 @@ func newProductServer(t *testing.T) *productServer {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"bol_1","external_reference_id":"ref1","status":"REGISTERED","amount":10.00,"due_date":"2027-01-15","fees":{"fine_value":2.00,"fine_type":"PERCENTAGE","interest_value":1.00,"interest_type":"MONTHLY_PERCENTAGE","discount_type":"MONTHLY_PERCENTAGE","first_discount_value":5.00,"first_discount_deadline":0},"payment_method":{"bank_slip":{"digitable_line":"dl-1","bar_code":"123","our_number":"55501"},"pix":{"qr_code":"pix-emv"}}}`))
 	})
+	mux.HandleFunc("GET /v2/bank_slips/{id}/pdf", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		if ps.boletoPDF != nil {
+			ps.boletoPDF(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write([]byte("%PDF-1.4\n% boleto\n%%EOF\n"))
+	})
+	mux.HandleFunc("PATCH /v2/bank_slips/{id}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		if ps.boletoPatch != nil {
+			ps.boletoPatch(w, r)
+			return
+		}
+		// The 200 of an amendment is the full get shape.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"01HBANKSLIP0000000000000001","external_reference_id":"ref1","status":"CREATED","amount":70.00,"due_date":"2027-02-01","payment_method":{"bank_slip":{"digitable_line":"dl-1","bar_code":"bc-1","our_number":"55501"}}}`))
+	})
 	mux.HandleFunc("PUT /v2/bank_slips/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		if ps.boletoCancel != nil {
 			ps.boletoCancel(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"bol_1","status":"CANCELLED","amount":10.00,"payment_method":{"bank_slip":{"bar_code":"123"},"pix":{"qr_code":"pix-emv"}}}`))
+		// The contract answers 204 with NO body. Returning JSON here masked a real defect:
+		// CancelBoleto used do(), which json.Unmarshals every 2xx body, so against the real
+		// bank an empty 204 became shared.ErrUnavailable — a successful baixa reported as a
+		// provider outage.
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("POST /v1/checkouts/", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
@@ -155,6 +187,20 @@ func (ps *productServer) body() []byte {
 	return ps.lastBody
 }
 
+// path and method report where the last request went, under the same lock the recorder
+// writes with.
+func (ps *productServer) path() string {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.lastPath
+}
+
+func (ps *productServer) method() string {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.lastMethod
+}
+
 func (ps *productServer) tokenCount() int {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -179,8 +225,13 @@ func TestCreateBoletoSuccess(t *testing.T) {
 	}
 	// Real 201 maps id→TxID (non-empty: billing-finalized marker), our_number, bar_code,
 	// digitable_line and amount(decimal 10.00)→1000 centavos. No status/qr_code on create.
-	if res.TxID != "01HBANKSLIP0000000000000001" || res.BoletoID != "01HBANKSLIP0000000000000001" {
-		t.Fatalf("id must map to BoletoID and TxID, got %+v", res)
+	if res.TxID != "01HBANKSLIP0000000000000001" {
+		t.Fatalf("C6 id must map to TxID, got %+v", res)
+	}
+	// BoletoID is OURS, not the bank's: it is what the caller addresses later operations
+	// by, and what external_reference_id is derived from.
+	if res.BoletoID != "bol_1" {
+		t.Fatalf("BoletoID must be the local id, got %+v", res)
 	}
 	if res.OurNumber != "55501" || res.Barcode != "bc-1" || res.DigitableLine != "dl-1" {
 		t.Fatalf("our_number/bar_code/digitable_line not mapped: %+v", res)

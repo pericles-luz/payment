@@ -16,6 +16,30 @@ corpo de resposta). Esta matriz alimenta a Camada B (`.docx` para o C6).
   `PUT /v1/boletos/{id}` (alteração, grupo 5) + adapter `CancelBoleto`/`UpdateBoleto` +
   domínio `WithValidUntil` (data limite de pagamento, 5.b). **Ciclo 1–6 completo.**
 
+## Atualização 15/09/2026 — modalidade, alteração e PDF
+
+Três mudanças de escopo desta matriz, todas contra as specs oficiais versionadas em
+`docs/compliance/c6-bolepix-oas.yaml` e `c6-bankslip-v1-oas.yaml` (ver
+[ADR-0013](../security/adr-0013-c6-boleto-liquidacao-e-modalidade.md)):
+
+- **A modalidade passou a ser escolhida** (`payment_method`: `boleto` | `bolepix`), em vez
+  de decorrer de a empresa ter chave PIX registrada. `bolepix` sem chave EVP é **recusado**
+  antes de ir ao banco — o banco criaria a cobrança sem QR, em silêncio.
+- **Alteração (grupo 5) existe** e é parcial: `PATCH /v2/bank_slips/{external_reference_id}`.
+  A matriz abaixo dizia que o banco não suportava alteração; era o verbo e o caminho que
+  estavam errados.
+- **PDF** (`GET /v1/boletos/{id}/pdf`) entrou na superfície.
+
+**Limitação assumida no grupo 3.b — desconto escalonado.** O contrato Bolepix v2 expõe
+**uma só** faixa de desconto (`first_discount_*`); as três faixas (`first`/`second`/`third`)
+existem apenas na API v1 legada, que não é a que emitimos. O adapter **recusa** duas ou mais
+faixas com erro de validação, em vez de descartar uma em silêncio — descartar mudaria o que
+o pagador deve. O domínio continua modelando o escalonamento completo.
+
+**Se a homologação exigir 3.b com mais de uma faixa**, a decisão "emitir tudo pela v2"
+precisa ser revista **antes** da janela: a saída seria emitir boleto simples pelo contrato
+v1. Isso é uma pergunta em aberto para o C6, não um defeito a corrigir depois.
+
 ## Endpoints (multi-tenant, deny-by-default, idempotency obrigatória nos writes)
 
 | Método | Rota                  | Sucesso | Grupos      |
@@ -23,7 +47,9 @@ corpo de resposta). Esta matriz alimenta a Camada B (`.docx` para o C6).
 | POST   | `/v1/boletos`         | 201     | 1, 2, 3     |
 | GET    | `/v1/boletos/{id}`    | 200     | 6.a         |
 | DELETE | `/v1/boletos/{id}`    | 204     | 4.a, 4.b    |
-| PUT    | `/v1/boletos/{id}`    | 200     | 5.a–5.c     |
+| PATCH  | `/v1/boletos/{id}`    | 200     | 5.a–5.c     |
+| PUT    | `/v1/boletos/{id}`    | 200     | 5.a–5.c (alias de PATCH) |
+| GET    | `/v1/boletos/{id}/pdf`| 200     | 6.b         |
 
 ## Matriz subitem → teste → evidência (PR-A)
 

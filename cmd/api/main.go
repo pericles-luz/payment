@@ -355,8 +355,27 @@ func run() error {
 	// the PSP routes by the service discriminator in the notification body. Registering
 	// only PIX — the pre-multi-channel behaviour — left the others pointing at whatever
 	// ref was current when they were last written, and the next mint killed them
-	// silently. CHECKOUT is listed explicitly; BANK_SLIP is deliberately absent until the
-	// boleto flow exists, so the PSP is never told to deliver what we cannot process.
+	// silently. CHECKOUT is listed explicitly.
+	//
+	// BANK_SLIP / BANK_SLIP_PIX are still ABSENT, and the reason has changed. The receiver
+	// now exists — resolveWebhook routes both services to webhookKindBoleto and
+	// WebhookService.HandleBoletoEvent reconciles against /v2/bank_slips (ADR-0013). What is
+	// missing is not code, it is a MEASUREMENT: nobody has yet seen a real notification, so
+	// which identifier C6 puts in `external_id` is still inferred rather than known. The
+	// receiver is built to be correct under either answer and to fail loudly rather than
+	// silently when neither matches, but "correct under either answer" is not the same as
+	// "verified", and this is the one step that cannot be undone — the proprietary surface
+	// exposes no DELETE, so a channel registered stays registered.
+	//
+	// The order is therefore: register in SANDBOX, pay a boleto and a BolePix-by-QR, read
+	// the raw bodies out of the webhook logs (logWebhookReject prints them verbatim,
+	// always), confirm the id mapping and the status vocabulary, and only then add the two
+	// services here. See "O que ainda não foi medido" in ADR-0013.
+	//
+	// When they are added, cmd/c6-webhook-sync needs them too: the renewal sweep is off, so
+	// it is the only thing that converges an existing tenant. Expect a ref rotation — adding
+	// a channel re-mints the tenant's ref and revokes the others, so notifications in flight
+	// under the old ref get a 401. Pick a low-traffic window.
 	webhookRegSvc := app.NewWebhookRegistrationService(
 		creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
 		webhookCallbackBaseURL(), slog.Default()).
@@ -665,6 +684,7 @@ func newBankRegistry(cfg config.Config, creds ports.CredentialStore, certs c6.Ce
 		RateLimitBurst:     cfg.C6.RateLimitBurst,
 		MaxRetries:         cfg.C6.MaxRetries,
 		BillingScheme:      cfg.C6.BillingScheme,
+		BankSlipWriteScope: cfg.C6.BankSlipWriteScope,
 	}
 	// C6 requires an mTLS client certificate on the connection. The transport now
 	// sources that certificate from the DURABLE vault, selected PER REQUEST by tenant

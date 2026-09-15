@@ -70,7 +70,9 @@ func newHarnessFor() *harness {
 		Processed:   store,
 		Bus:         bus,
 		Bank:        stub,
+		Boleto:      stub,
 		Credentials: creds,
+		UoW:         store,
 		Clock:       fixedClock{t: time.Unix(1000, 0).UTC()},
 		IDs:         &seqIDs{},
 	}

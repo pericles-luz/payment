@@ -26,10 +26,10 @@ import (
 func TestWebhookAcceptsDocumentedProprietaryEnvelope(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	_, txID := seedCharge(t, f)
+	boletoID, txID := seedBoleto(t, f, "wh-envelope")
 	// O banco confirma o pagamento: é a única situação em que o C6 avisa, e desde
 	// SIN-69580 um aviso de liquidação que a leitura não confirma NÃO é confirmado.
-	f.bank.MarkSettled(f.tenantID, txID)
+	f.bank.MarkBoletoStatus(f.tenantID, boletoID, "PAID")
 
 	// Exactly the documented fields — including date_time and partner_id, whose mere
 	// presence used to produce a 400.
@@ -50,10 +50,10 @@ func TestWebhookAcceptsDocumentedProprietaryEnvelope(t *testing.T) {
 func TestWebhookToleratesUnknownFields(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	_, txID := seedCharge(t, f)
+	boletoID, txID := seedBoleto(t, f, "wh-unknown-fields")
 	// O banco confirma o pagamento: é a única situação em que o C6 avisa, e desde
 	// SIN-69580 um aviso de liquidação que a leitura não confirma NÃO é confirmado.
-	f.bank.MarkSettled(f.tenantID, txID)
+	f.bank.MarkBoletoStatus(f.tenantID, boletoID, "PAID")
 
 	body := map[string]any{
 		"external_id":    txID,

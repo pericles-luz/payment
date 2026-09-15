@@ -141,8 +141,14 @@ func TestCancelBoletoSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CancelBoleto: %v", err)
 	}
-	if res.Status != "CANCELLED" {
-		t.Fatalf("status = %q, want CANCELLED", res.Status)
+	// CANCELED, one L: that is how the Bolepix v2 contract spells it. The legacy v1 boleto
+	// API uses CANCELLED, and comparing against the wrong spelling reads a dead charge as
+	// live.
+	if res.Status != "CANCELED" {
+		t.Fatalf("status = %q, want CANCELED", res.Status)
+	}
+	if res.BoletoID != "bol_1" {
+		t.Fatalf("BoletoID must be the local id, got %q", res.BoletoID)
 	}
 	if ps.lastAuthHeader != "Bearer tok-client-1" {
 		t.Fatalf("bearer not attached: %q", ps.lastAuthHeader)
@@ -159,25 +165,5 @@ func TestCancelBoletoNotFoundMapping(t *testing.T) {
 	p := ps.provider(t, oneTenant("t1", "c", "s"))
 	if _, err := p.CancelBoleto(context.Background(), "t1", "nope"); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("404 should map to ErrNotFound, got %v", err)
-	}
-}
-
-// roteiro grupo 5: alteração via PUT carries the new params; bearer + idempotency.
-// The contract has no amendment endpoint, so UpdateBoleto fails closed. The alternative —
-// PUTting a speculative path — would look like it amended a registered charge while the
-// bank knew nothing about it, leaving our state and the bank's divergent on money.
-func TestUpdateBoletoIsUnsupported(t *testing.T) {
-	t.Parallel()
-	ps := newProductServer(t)
-	p := ps.provider(t, oneTenant("t1", "client-1", "secret-1"))
-
-	_, err := p.UpdateBoleto(context.Background(), "t1", "bol_1", ports.BoletoRequest{
-		TenantID: "t1", BoletoID: "bol_1", AmountCents: 2000, Currency: "BRL",
-	})
-	if !errors.Is(err, shared.ErrValidation) {
-		t.Fatalf("want ErrValidation, got %v", err)
-	}
-	if ps.body() != nil && len(ps.body()) > 0 {
-		t.Fatalf("no request may reach the bank: %s", ps.body())
 	}
 }

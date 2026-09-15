@@ -79,9 +79,17 @@ func (r *recProvider) CancelBoleto(_ context.Context, _ string, _ string) (ports
 	r.hits++
 	return ports.BoletoResult{TxID: r.label}, nil
 }
-func (r *recProvider) UpdateBoleto(_ context.Context, _ string, _ string, _ ports.BoletoRequest) (ports.BoletoResult, error) {
+func (r *recProvider) UpdateBoleto(_ context.Context, _ string, _ string, _ ports.BoletoPatch) (ports.BoletoResult, error) {
 	r.hits++
 	return ports.BoletoResult{TxID: r.label}, nil
+}
+func (r *recProvider) GetBoletoByBankRef(_ context.Context, _ string, _ string) (ports.BoletoResult, error) {
+	r.hits++
+	return ports.BoletoResult{TxID: r.label}, nil
+}
+func (r *recProvider) GetBoletoPDF(_ context.Context, _ string, _ string) (ports.BoletoDocument, error) {
+	r.hits++
+	return ports.BoletoDocument{ContentType: "application/pdf", Content: []byte(r.label)}, nil
 }
 func (r *recProvider) ListOpenBoletos(_ context.Context, _ string) ([]ports.DDABoleto, error) {
 	r.hits++
@@ -266,7 +274,7 @@ func TestAllRouterMethodsDispatchAndFailClosed(t *testing.T) {
 		"boleto.Get":      func(c context.Context) error { _, e := rt.Boleto.GetBoleto(c, "t", "x"); return e },
 		"boleto.Cancel":   func(c context.Context) error { _, e := rt.Boleto.CancelBoleto(c, "t", "x"); return e },
 		"boleto.Update": func(c context.Context) error {
-			_, e := rt.Boleto.UpdateBoleto(c, "t", "x", ports.BoletoRequest{})
+			_, e := rt.Boleto.UpdateBoleto(c, "t", "x", ports.BoletoPatch{})
 			return e
 		},
 		"dda.ListOpen": func(c context.Context) error { _, e := rt.DDA.ListOpenBoletos(c, "t"); return e },

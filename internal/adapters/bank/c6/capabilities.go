@@ -2,6 +2,7 @@ package c6
 
 import (
 	"context"
+	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
@@ -37,8 +38,46 @@ func (p *Provider) BankCapabilities(ctx context.Context, tenantID string) (ports
 		_, ok := scopes[name]
 		return ok
 	}
-	return ports.BankCapabilities{
+	caps := ports.BankCapabilities{
 		PIX:  has(scopePixWrite) && has(scopeCobWrite),
 		Card: has(scopeCheckoutWrite),
-	}, nil
+	}
+	caps.Boleto, caps.Bolepix = p.boletoCapabilities(ctx, tenantID, has)
+	return caps, nil
+}
+
+// boletoCapabilities translates the bank-slip scope and the tenant's PIX key into the two
+// boleto capabilities.
+//
+// Unlike PIX and cartão, the scope NAME here is not known: it is absent from the published
+// C6 OpenAPI (which documents only bearerAuth) and has never been captured from a granted
+// token. So when it is unconfigured the answer is Unknown, not false — telling an empresa
+// "sua conta não pode emitir boleto" on the strength of a name we never verified would be
+// stating something we have not checked.
+//
+// BolePix carries one extra precondition that is NOT a scope: a registered random (EVP)
+// PIX key. The bank does not enforce it — it creates the charge with no QR and reports
+// success — so the check has to happen here for the console to be able to say why.
+func (p *Provider) boletoCapabilities(ctx context.Context, tenantID string, has func(string) bool) (boleto, bolepix ports.Capability) {
+	scope := strings.TrimSpace(p.bankSlipWriteScope)
+	switch {
+	case scope == "":
+		boleto = ports.CapabilityUnknown
+	case has(scope):
+		boleto = ports.CapabilityGranted
+	default:
+		boleto = ports.CapabilityDenied
+	}
+
+	// Bolepix is never stronger than boleto: a denial upstream dominates.
+	if boleto == ports.CapabilityDenied {
+		return boleto, ports.CapabilityDenied
+	}
+	cred, err := p.creds.GetBankCredential(ctx, tenantID, p.bankID)
+	if err != nil || strings.TrimSpace(cred.CreditorKey) == "" {
+		// No key ⇒ no QR, whatever the scope says. This is a definite no, so it is Denied
+		// even when the scope itself is Unknown.
+		return boleto, ports.CapabilityDenied
+	}
+	return boleto, boleto
 }

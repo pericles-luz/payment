@@ -2,6 +2,7 @@ package http
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +57,11 @@ type createBoletoRequest struct {
 	Payer              boletoPayerReq      `json:"payer"`
 	// Description is printed on the slip and required by the bank (max 100 chars).
 	Description string `json:"description"`
+	// PaymentMethod selects "boleto" (plain slip) or "bolepix" (slip + PIX QR on the same
+	// charge). Absent means "boleto": the default promises the least, because a bolepix we
+	// cannot actually issue would reach the payer as a slip advertising a QR that is not
+	// there. An unknown value is rejected rather than defaulted.
+	PaymentMethod string `json:"payment_method"`
 	// Bank optionally selects which configured bank registers this boleto (multi-bank,
 	// SIN-66022); empty keeps header/default routing, overrides X-Bank-Id (ADR-0007).
 	Bank string `json:"bank"`
@@ -77,17 +83,22 @@ func toPayerInput(p boletoPayerReq) app.BoletoPayerInput {
 	}
 }
 
-// updateBoletoRequest is the boundary body for PUT /v1/boletos/{id} (alteração, grupo
-// 5): due date (5.a), validity (5.b), amount/fine/interest (5.c). due_date/valid_until
-// are RFC3339. Unknown fields are rejected by decodeJSON (anti mass-assignment).
+// updateBoletoRequest is the boundary body for PATCH (and PUT) /v1/boletos/{id}
+// (alteração, grupo 5): due date (5.a), validity (5.b), amount/fine/interest (5.c).
+// due_date/valid_until are RFC3339. Unknown fields are rejected by decodeJSON (anti
+// mass-assignment).
+//
+// The amendment is PARTIAL, so every field is a pointer: an absent key means "leave this
+// alone", which is not the same as sending zero. Without the distinction a client that
+// only wants to postpone the due date would also zero the amount and drop the fine.
 type updateBoletoRequest struct {
-	AmountCents        int64               `json:"amount_cents"`
+	AmountCents        *int64              `json:"amount_cents"`
 	Currency           string              `json:"currency"`
-	DueDate            string              `json:"due_date"`
-	ValidUntil         string              `json:"valid_until"`
-	FineBps            int64               `json:"fine_bps"`
-	FineFixedCents     int64               `json:"fine_fixed_cents"`
-	MonthlyInterestBps int64               `json:"monthly_interest_bps"`
+	DueDate            *string             `json:"due_date"`
+	ValidUntil         *string             `json:"valid_until"`
+	FineBps            *int64              `json:"fine_bps"`
+	FineFixedCents     *int64              `json:"fine_fixed_cents"`
+	MonthlyInterestBps *int64              `json:"monthly_interest_bps"`
 	Discounts          []boletoDiscountReq `json:"discounts"`
 }
 
@@ -111,10 +122,14 @@ type boletoDiscountView struct {
 // qr_code is the BolePix EMV copy-and-paste payload and barcode the linha digitável;
 // the registered parameters are echoed for reconciliation/homologação evidence.
 type boletoView struct {
-	BoletoID           string               `json:"boleto_id"`
-	TxID               string               `json:"txid"`
-	Status             string               `json:"status"`
-	QRCode             string               `json:"qr_code"`
+	BoletoID string `json:"boleto_id"`
+	TxID     string `json:"txid"`
+	Status   string `json:"status"`
+	// PaymentMethod echoes the rails the charge was issued with, so a caller reads the
+	// modality directly instead of inferring it from whether qr_code came back populated.
+	PaymentMethod string `json:"payment_method"`
+	// QRCode is omitted entirely for a plain boleto rather than rendered as "".
+	QRCode             string               `json:"qr_code,omitempty"`
 	Barcode            string               `json:"barcode"`
 	OurNumber          string               `json:"our_number,omitempty"`
 	DigitableLine      string               `json:"digitable_line,omitempty"`
@@ -134,6 +149,7 @@ func toBoletoView(r ports.BoletoResult, amountCents int64) boletoView {
 		BoletoID:           r.BoletoID,
 		TxID:               r.TxID,
 		Status:             r.Status,
+		PaymentMethod:      string(r.Modality.Normalized()),
 		QRCode:             r.QRCode,
 		Barcode:            r.Barcode,
 		OurNumber:          r.OurNumber,
@@ -194,6 +210,7 @@ func (s *Server) handleCreateBoleto(w http.ResponseWriter, r *http.Request) {
 		Description:        req.Description,
 		IdempotencyKey:     idemKey,
 		Discounts:          toDiscountInputs(req.Discounts),
+		Modality:           ports.BoletoModality(strings.ToLower(strings.TrimSpace(req.PaymentMethod))),
 	}
 
 	p, res, err := s.boleto.RegisterBoleto(r.Context(), in)
@@ -242,30 +259,33 @@ func (s *Server) handleUpdateBoleto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	due, ok := parseRFC3339(req.DueDate)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid or missing due_date (RFC3339)")
-		return
-	}
-
 	in := app.UpdateBoletoInput{
 		TenantID:           tenantID,
 		AmountCents:        req.AmountCents,
 		Currency:           req.Currency,
-		DueDate:            due,
 		FineBps:            req.FineBps,
 		FineFixedCents:     req.FineFixedCents,
 		MonthlyInterestBps: req.MonthlyInterestBps,
 		IdempotencyKey:     idemKey,
 		Discounts:          toDiscountInputs(req.Discounts),
 	}
-	if raw := strings.TrimSpace(req.ValidUntil); raw != "" {
-		vu, ok := parseRFC3339(raw)
+	// due_date is now OPTIONAL: an amendment that only changes, say, the fine has no
+	// business restating the vencimento.
+	if req.DueDate != nil {
+		due, ok := parseRFC3339(*req.DueDate)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid due_date (RFC3339)")
+			return
+		}
+		in.DueDate = &due
+	}
+	if req.ValidUntil != nil && strings.TrimSpace(*req.ValidUntil) != "" {
+		vu, ok := parseRFC3339(*req.ValidUntil)
 		if !ok {
 			writeError(w, http.StatusBadRequest, "invalid valid_until (RFC3339)")
 			return
 		}
-		in.ValidUntil = vu
+		in.ValidUntil = &vu
 	}
 
 	res, err := s.boleto.UpdateBoleto(r.Context(), tenantID, id, in)
@@ -274,4 +294,55 @@ func (s *Server) handleUpdateBoleto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toBoletoView(res, res.AmountCents))
+}
+
+// handleGetBoletoPDF streams the registered boleto as a PDF (roteiro grupo 6).
+//
+// The 200 is BINARY, deliberately: the integrator can hand this URL straight to a browser,
+// an iframe or an email pipeline. Base64 inside a JSON envelope would inflate it by a third
+// and force every consumer to write decoding glue to render a document. Errors keep the
+// normal JSON envelope — only the success path is binary.
+func (s *Server) handleGetBoletoPDF(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	id := chi.URLParam(r, "id")
+
+	doc, err := s.boleto.GetBoletoPDF(r.Context(), tenantID, id)
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+
+	contentType := doc.ContentType
+	if contentType == "" {
+		contentType = "application/pdf"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(doc.Content)))
+	w.Header().Set("Content-Disposition", "inline; filename=\""+sanitizeFilename(doc.Filename)+"\"")
+	// The slip carries payer PII (name, CPF/CNPJ, address), so it must not be cached by
+	// any intermediary.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(doc.Content)
+}
+
+// sanitizeFilename keeps a suggested download name to characters that cannot break out of
+// the Content-Disposition quoting or smuggle a path.
+func sanitizeFilename(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "boleto.pdf"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
 }

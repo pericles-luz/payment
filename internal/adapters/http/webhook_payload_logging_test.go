@@ -100,9 +100,9 @@ func TestWebhookMalformedBodyLogsRawPayload(t *testing.T) {
 // exposure — payer name and tax id — for nothing.
 func TestWebhookAcceptedPayloadNotLoggedByDefault(t *testing.T) {
 	f := newFixture(t)
-	_, txID := seedCharge(t, f)
+	boletoID, txID := seedBoleto(t, f, "wh-log-"+t.Name())
 	// O banco confirma o pagamento: é a única situação em que o C6 avisa.
-	f.bank.MarkSettled(f.tenantID, txID)
+	f.bank.MarkBoletoStatus(f.tenantID, boletoID, "PAID")
 
 	const marker = "SENSITIVE-PAYER-MARKER"
 	body := map[string]any{
@@ -130,9 +130,9 @@ func TestWebhookAcceptedPayloadNotLoggedByDefault(t *testing.T) {
 // not change what the receiver accepts. A well-formed notification still settles.
 func TestWebhookStillAcceptsAfterBuffering(t *testing.T) {
 	f := newFixture(t)
-	_, txID := seedCharge(t, f)
+	boletoID, txID := seedBoleto(t, f, "wh-log-"+t.Name())
 	// O banco confirma o pagamento: é a única situação em que o C6 avisa.
-	f.bank.MarkSettled(f.tenantID, txID)
+	f.bank.MarkBoletoStatus(f.tenantID, boletoID, "PAID")
 
 	body, err := json.Marshal(map[string]any{
 		"external_id": txID,

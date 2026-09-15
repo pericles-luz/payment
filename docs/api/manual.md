@@ -357,12 +357,42 @@ Duas exigências do banco que recusam o registro quando ausentes:
 
 O QR Code do PIX vem **na própria resposta do registro**, não numa consulta posterior:
 uma cobrança BolePix é pagável por boleto ou por PIX desde o momento em que é criada.
-Ele é gerado a partir da chave aleatória registrada da empresa-cliente — sem chave, a
-cobrança é criada normalmente, só que sem QR.
+Ele é gerado a partir da chave aleatória registrada da empresa-cliente.
 
-**Alteração não existe.** O banco expõe emissão, consulta, PDF, listagem e baixa; não há
-endpoint de alteração. `PUT /v1/boletos/{id}` responde `400` em vez de fingir que alterou
-uma cobrança já registrada. Para mudar algo: cancele e emita outra.
+### Escolher a modalidade: `payment_method`
+
+`POST /v1/boletos` aceita `payment_method`: `"boleto"` (boleto simples) ou `"bolepix"`
+(a mesma cobrança, pagável também por QR Code PIX). **Ausente equivale a `boleto`** — o
+padrão promete o menos.
+
+Antes, a modalidade não era escolhida: o QR era anexado sempre que a empresa tinha chave
+aleatória registrada. Isso tornava indistinguíveis dois resultados muito diferentes — "foi
+pedido um boleto simples" e "foi pedido um BolePix, mas a empresa está mal configurada, e o
+pagador recebeu um boleto sem QR".
+
+**`bolepix` sem chave EVP registrada é recusado com `400`, antes de qualquer chamada ao
+banco.** O banco nunca avisaria: o contrato diz que uma chave ausente ou inválida cria a
+cobrança do mesmo jeito, apenas sem QR. A falha só apareceria na hora do pagamento, para
+quem está pagando. Para saber se a conta autoriza a modalidade, leia
+`GET /v1/bank-capabilities` (campos `boleto` e `bolepix`) — `null` ali significa "ainda não
+verificamos", que é diferente de `false`.
+
+A resposta ecoa `payment_method`, e `qr_code` é **omitido** numa cobrança `boleto` em vez de
+vir vazio.
+
+**Alteração existe, e é parcial.** `PATCH /v1/boletos/{id}` (ou `PUT`, alias mantido)
+altera vencimento, validade, valor, multa, juros e desconto. Só os campos presentes mudam:
+omitir um campo o preserva, e **não** é o mesmo que enviar zero — `amount_cents: 0` zeraria
+a cobrança. `valid_until` exige `due_date` junto, porque o banco conta a validade em dias
+**após** o vencimento.
+
+> Até 15/09/2026 este manual afirmava que alteração não existia e a rota respondia `400`.
+> O contrato publicado do banco tem `PATCH /v2/bank_slips/{external_reference_id}`: o que
+> estava errado era o verbo e o caminho que tentávamos, não a operação.
+
+**PDF.** `GET /v1/boletos/{id}/pdf` devolve o documento em binário (`application/pdf`),
+pronto para entregar ao navegador ou anexar num e-mail. Como carrega dados pessoais do
+pagador, a resposta vai com `Cache-Control: no-store`.
 
 ### 4.6 Cobrança com vencimento (cobv): devedor completo e chave obrigatória
 

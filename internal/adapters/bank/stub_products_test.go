@@ -30,15 +30,35 @@ func TestStubBoleto(t *testing.T) {
 	s := newStub(t)
 	ctx := context.Background()
 
-	res, err := s.CreateBoleto(ctx, "t1", ports.BoletoRequest{TenantID: "t1", BoletoID: "bol_1", AmountCents: 2500, Currency: "BRL"})
+	res, err := s.CreateBoleto(ctx, "t1", ports.BoletoRequest{
+		TenantID: "t1", BoletoID: "bol_1", AmountCents: 2500, Currency: "BRL",
+		Modality: ports.ModalityBolepix,
+	})
 	if err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
 	}
 	if res.TxID != "tx_bol_1" || res.Status != "REGISTERED" || res.AmountCents != 2500 {
 		t.Fatalf("unexpected: %+v", res)
 	}
+	// A BolePix carries BOTH rails: the barcode and the PIX QR.
 	if res.QRCode == "" || res.Barcode == "" {
 		t.Fatalf("expected scannable artifacts: %+v", res)
+	}
+
+	// A plain boleto carries the slip only. The stub must distinguish the two, or nothing
+	// above this layer could test the difference.
+	plain, err := s.CreateBoleto(ctx, "t1", ports.BoletoRequest{
+		TenantID: "t1", BoletoID: "bol_plain", AmountCents: 2500, Currency: "BRL",
+		Modality: ports.ModalityBoleto,
+	})
+	if err != nil {
+		t.Fatalf("CreateBoleto plain: %v", err)
+	}
+	if plain.QRCode != "" {
+		t.Fatalf("a plain boleto must carry no QR: %+v", plain)
+	}
+	if plain.Barcode == "" {
+		t.Fatalf("a plain boleto must still carry a barcode: %+v", plain)
 	}
 
 	if _, err := s.CreateBoleto(ctx, "other", ports.BoletoRequest{TenantID: "other", BoletoID: "b"}); !errors.Is(err, shared.ErrNotFound) {

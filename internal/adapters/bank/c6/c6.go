@@ -31,6 +31,12 @@ import (
 // on a hostile or buggy PSP response.
 const maxResponseBytes = 1 << 20 // 1 MiB
 
+// maxDocumentBytes caps a BINARY document response (the boleto PDF). It is separate from
+// maxResponseBytes because that ceiling is sized for JSON: a slip PDF carrying a QR bitmap
+// can exceed 1 MiB, and silently clipping it would hand the payer a corrupt file that is
+// indistinguishable from a good one.
+const maxDocumentBytes = 8 << 20 // 8 MiB
+
 // defaultTimeout is the per-request timeout when Config.Timeout is unset.
 const defaultTimeout = 15 * time.Second
 
@@ -55,6 +61,15 @@ type Config struct {
 	// (production: 15, sandbox: 21 — per the C6 Bolepix contract). Empty selects
 	// defaultBillingScheme.
 	BillingScheme string
+	// BankSlipWriteScope is the C6 scope name that authorises issuing boletos. It is
+	// CONFIGURATION rather than a constant because, unlike pix.write/cob.write/
+	// checkout.write, it has never been observed on a granted token: the published
+	// OpenAPI documents only bearerAuth, and nothing in this repo records the name.
+	//
+	// Empty — the default — means "not known", and BankCapabilities then reports the
+	// boleto capabilities as Unknown instead of guessing. Hardcoding a plausible name
+	// would turn a guess into an assertion about someone's bank account.
+	BankSlipWriteScope string
 	// RateLimitPerSecond is the steady-state outbound request rate (tokens/sec) to
 	// C6, capping the load this adapter can generate (Termo A5, no DoS-shaped
 	// traffic). Zero or negative ⇒ defaultRatePerSecond.
@@ -77,8 +92,11 @@ type Provider struct {
 	// deployment pointed at the wrong environment must be fixed by config, not by a
 	// rebuild. Defaults to defaultBillingScheme when unset.
 	billingScheme string
-	httpc         *http.Client
-	tokens        *tokenManager
+	// bankSlipWriteScope is the granted-scope name that authorises boleto issuance, or
+	// empty when it has not been established. See Config.BankSlipWriteScope.
+	bankSlipWriteScope string
+	httpc              *http.Client
+	tokens             *tokenManager
 	// creds resolves a tenant's bank credential, including its registered PIX
 	// creditor key (chave do recebedor), which the adapter injects into a cob/cobv
 	// when the request omits one (per-tenant config injection, ADR-0004 /
@@ -174,19 +192,21 @@ func New(cfg Config, creds ports.CredentialStore) (*Provider, error) {
 		maxRetries = 0
 	}
 
+	bankSlipScope := strings.TrimSpace(cfg.BankSlipWriteScope)
 	billingScheme := strings.TrimSpace(cfg.BillingScheme)
 	if billingScheme == "" {
 		billingScheme = defaultBillingScheme
 	}
 
 	return &Provider{
-		baseURL:       trimTrailingSlash(cfg.BaseURL),
-		billingScheme: billingScheme,
-		httpc:         httpc,
-		tokens:        newTokenManager(creds, ports.BankIDC6, cfg.TokenURL, cfg.Scope, httpc, now),
-		creds:         creds,
-		bankID:        ports.BankIDC6,
-		now:           now,
+		baseURL:            trimTrailingSlash(cfg.BaseURL),
+		billingScheme:      billingScheme,
+		bankSlipWriteScope: bankSlipScope,
+		httpc:              httpc,
+		tokens:             newTokenManager(creds, ports.BankIDC6, cfg.TokenURL, cfg.Scope, httpc, now),
+		creds:              creds,
+		bankID:             ports.BankIDC6,
+		now:                now,
 		limiter: &tokenBucket{
 			tokens:       float64(burst),
 			capacity:     float64(burst),

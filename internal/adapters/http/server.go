@@ -477,10 +477,15 @@ func (s *Server) Router() http.Handler {
 			r.Delete("/checkout/{id}", s.handleCancelCheckout)
 			// BolePix boletos — full lifecycle: register with fine/interest/discount
 			// variants (grupos 1–3), read by id (6.a), baixa/cancelamento (DELETE, grupo
-			// 4) and alteração de vencimento/validade/valor (PUT, grupo 5).
+			// 4) and alteração parcial de vencimento/validade/valor (PATCH, grupo 5).
 			r.Post("/boletos", s.handleCreateBoleto)
 			r.Get("/boletos/{id}", s.handleGetBoleto)
+			r.Get("/boletos/{id}/pdf", s.handleGetBoletoPDF)
 			r.Delete("/boletos/{id}", s.handleDeleteBoleto)
+			// PATCH is the honest verb: the amendment is partial, and the bank's own
+			// contract models it that way. PUT is kept as an alias so the already-published
+			// updateBoleto operation keeps working for existing callers.
+			r.Patch("/boletos/{id}", s.handleUpdateBoleto)
 			r.Put("/boletos/{id}", s.handleUpdateBoleto)
 			// DDA / agendamento de pagamentos (roteiro grupo 8): list the boletos open in
 			// the tenant's DDA (8.1), submit a payment group for the initial consult (8.2),

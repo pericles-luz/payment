@@ -1,16 +1,20 @@
 package c6
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
@@ -31,21 +35,98 @@ const bankSlipsPath = "/v2/bank_slips"
 // adapter (ADR-0005).
 const dueDateLayout = "2006-01-02"
 
-// externalReferenceID derives the C6 external_reference_id (^[a-zA-Z0-9]{1,10}$) from
-// the boleto id. The boleto id is a UUID (>10 chars, contains hyphens), so it cannot
-// be sent verbatim. The derivation is a pure function of the id — deterministic and
-// idempotent — so a retried registration of the same boleto yields the same reference
-// and C6 collapses the retry. Mechanism: base36 of the first 64 bits of SHA-256(id),
-// truncated to 10 chars (~3.6e15 space, collision-resistant within a tenant's boletos,
-// stable across processes). Lives in the adapter because it is a transport mapping,
-// not a domain concept (ADR-0005 §"Hexagonal — o que NÃO entra no port").
+// externalRefAlphabet is Crockford base32 — 32 symbols drawn entirely from [A-Z0-9],
+// with the visually ambiguous I, L, O and U omitted. Every symbol therefore satisfies
+// the C6 charset, and 26 symbols carry 130 bits, enough to hold a 128-bit id whole.
+const externalRefAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+// externalRefLen is the EXACT length the C6 bank_slips contract demands of
+// external_reference_id: `^[A-Z0-9]{26}$`, minLength == maxLength == 26 (Bolepix OAS
+// 1.1.0, docs/compliance/c6-bolepix-oas.yaml). It is not a maximum — a 25-char value is
+// rejected just as a 27-char one is.
+const externalRefLen = 26
+
+// externalRefBytes is the id width the encoding round-trips: 16 bytes == 128 bits.
+const externalRefBytes = 16
+
+// externalReferenceID maps the local boleto id onto the C6 external_reference_id.
+//
+// The local id is 16 random bytes rendered as 32 hex chars (system.IDProvider.NewID), so
+// it cannot be sent verbatim: the contract wants 26 chars of [A-Z0-9]. Encoding those
+// same 128 bits in Crockford base32 yields exactly 26 symbols — which makes this a
+// BIJECTION, not a digest. That matters for three separate reasons:
+//
+//   - Deterministic and idempotent across processes, so a retried registration derives
+//     the same reference and C6 collapses it. The contract is explicit that a duplicate
+//     external_reference_id "retornará os dados da cobrança já existente", which is
+//     precisely the retry-collapse we want — but only if the derivation never varies.
+//   - No collisions at all. A truncated hash would trade a birthday bound for nothing;
+//     here distinct ids cannot share a reference, because the map is invertible.
+//   - Invertible, so an inbound webhook carrying the reference can be resolved back to
+//     the local boleto without a lookup table (see boletoIDFromExternalReference).
+//
+// An id that is not 16 bytes of hex (only a caller bug, or a future id scheme) falls back
+// to a digest of the same width, so the function is total and still deterministic — it
+// simply stops being invertible, which boletoIDFromExternalReference reports honestly.
+//
+// This lives in the adapter because it is a transport mapping, not a domain concept
+// (ADR-0005 §"Hexagonal — o que NÃO entra no port").
 func externalReferenceID(boletoID string) string {
-	sum := sha256.Sum256([]byte(boletoID))
-	ref := strconv.FormatUint(binary.BigEndian.Uint64(sum[:8]), 36)
-	if len(ref) > 10 {
-		ref = ref[:10]
+	raw, err := hex.DecodeString(boletoID)
+	if err != nil || len(raw) != externalRefBytes {
+		sum := sha256.Sum256([]byte(boletoID))
+		raw = sum[:externalRefBytes]
 	}
-	return ref
+	return encodeCrockford(raw)
+}
+
+// encodeCrockford renders 16 bytes as 26 Crockford base32 symbols, most-significant
+// symbol first. The 130-bit output is 2 bits wider than the input, so the leading symbol
+// only ever carries the top 3 bits of the id — the padding is on the high end, which is
+// what keeps decoding exact.
+func encodeCrockford(raw []byte) string {
+	n := new(big.Int).SetBytes(raw)
+	out := make([]byte, externalRefLen)
+	base := big.NewInt(int64(len(externalRefAlphabet)))
+	rem := new(big.Int)
+	for i := externalRefLen - 1; i >= 0; i-- {
+		n.QuoRem(n, base, rem)
+		out[i] = externalRefAlphabet[rem.Int64()]
+	}
+	return string(out)
+}
+
+// boletoIDFromExternalReference is the inverse of externalReferenceID: it recovers the
+// local boleto id from a C6 external_reference_id. ok is false when ref is not a
+// well-formed 26-symbol Crockford value, or when it decodes to more than 16 bytes —
+// which is what happens when the value handed in is NOT one of ours (C6's own charge
+// `id` is also 26 chars of [A-Z0-9], so shape alone cannot tell the two apart; only the
+// decode can, and even then only probabilistically).
+//
+// Callers MUST treat a successful decode as a candidate to be confirmed against the
+// store, never as proof: a foreign 26-char id can decode cleanly to 16 bytes that simply
+// match no boleto we ever issued.
+func boletoIDFromExternalReference(ref string) (string, bool) {
+	if len(ref) != externalRefLen {
+		return "", false
+	}
+	n := new(big.Int)
+	base := big.NewInt(int64(len(externalRefAlphabet)))
+	for i := 0; i < len(ref); i++ {
+		idx := strings.IndexByte(externalRefAlphabet, ref[i])
+		if idx < 0 {
+			return "", false
+		}
+		n.Mul(n, base).Add(n, big.NewInt(int64(idx)))
+	}
+	raw := n.Bytes()
+	if len(raw) > externalRefBytes {
+		return "", false
+	}
+	// Left-pad: Bytes() drops leading zero bytes, which a low-valued id legitimately has.
+	padded := make([]byte, externalRefBytes)
+	copy(padded[externalRefBytes-len(raw):], raw)
+	return hex.EncodeToString(padded), true
 }
 
 // brlDecimal is a money quantity carried in the port as integer minor units (centavos)
@@ -168,6 +249,15 @@ const (
 	feeTypeValuePerDay       = "VALUE_PER_DAY"
 	feeTypeMonthlyPercentage = "MONTHLY_PERCENTAGE"
 )
+
+// bankSlipStatusCanceled is the state a successful baixa leaves the charge in. The contract
+// answers the cancel with 204 and no body, so this is synthesized rather than read back.
+//
+// Note the single L: the Bolepix contract spells it CANCELED, while the legacy v1 boleto API
+// spells the same state CANCELLED. The full status vocabulary is INTERPRETED one layer up,
+// in the settlement path (internal/app/webhook_boleto.go), which is what decides whether a
+// status settles, waits or is terminal — the adapter only maps the wire.
+const bankSlipStatusCanceled = "CANCELED"
 
 // pixKeyTypeEVP is the only PIX key type C6 accepts here: a random key (chave aleatória)
 // already registered at the bank. A key of any other type yields a charge with no PIX.
@@ -325,11 +415,14 @@ func (p *Provider) toBankSlipRequestBody(op string, req ports.BoletoRequest, pix
 		return bankSlipRequestBody{}, &Error{Op: op, sentinel: shared.ErrValidation, detail: "payer neighborhood is required"}
 	}
 	description := strings.TrimSpace(req.Description)
-	switch {
-	case description == "":
+	if description == "" {
 		return bankSlipRequestBody{}, &Error{Op: op, sentinel: shared.ErrValidation, detail: "description is required"}
-	case len(description) > maxDescriptionLen:
-		return bankSlipRequestBody{}, &Error{Op: op, sentinel: shared.ErrValidation, detail: "description is too long"}
+	}
+	// The UF is normalized before validation so a lowercase "sp" is accepted and sent as
+	// "SP" rather than refused by the bank's [A-Z]{2} pattern.
+	req.Payer.Address.State = strings.ToUpper(strings.TrimSpace(req.Payer.Address.State))
+	if err := validateBankSlipLimits(op, req, description); err != nil {
+		return bankSlipRequestBody{}, err
 	}
 	fees, err := toBankSlipFees(op, req)
 	if err != nil {
@@ -356,31 +449,151 @@ func (p *Provider) toBankSlipRequestBody(op string, req ports.BoletoRequest, pix
 		Fees:          fees,
 		PaymentMethod: bankSlipPaymentMethodBody{BankSlip: bankSlipMethodBody{BillingScheme: p.billingScheme}},
 	}
-	if k := strings.TrimSpace(pixKey); k != "" {
+	// The pix sub-object is what makes a BolePix a BolePix, so it rides on the CALLER's
+	// choice, not on whether a key happens to exist. A plain boleto never carries it, even
+	// for a tenant that has a key registered.
+	if req.Modality.Normalized() == ports.ModalityBolepix {
+		k := strings.TrimSpace(pixKey)
+		if k == "" {
+			// Fail closed. The bank does not refuse this: it creates the charge and returns
+			// payment_method.pix = null, so the payer is handed a slip promising a QR that
+			// does not exist and nobody finds out until payment time. Since no error path
+			// exists downstream, this is the only place it can be caught.
+			return bankSlipRequestBody{}, &Error{Op: op, sentinel: shared.ErrValidation,
+				detail: "bolepix requires a registered random (EVP) pix key for the tenant"}
+		}
 		body.PaymentMethod.Pix = &bankSlipPixMethodBody{Key: k, Type: pixKeyTypeEVP}
 	}
 	return body, nil
 }
 
-// maxDescriptionLen is the C6 cap on the slip description.
-const maxDescriptionLen = 100
+// Field limits the C6 Bolepix contract enforces (docs/compliance/c6-bolepix-oas.yaml).
+//
+// They are checked HERE, in the adapter, for two reasons. First, they are the bank's
+// limits, not ours — the stub must stay lenient (ADR-0005). Second, a violation caught
+// here names the offending field, while the same violation caught by C6 comes back as an
+// opaque 400 whose problem+json this adapter deliberately discards.
+//
+// Every one of these is a CHARACTER count in JSON Schema, so they are measured with
+// utf8.RuneCountInString and never len(). Measuring bytes rejects perfectly legal
+// Portuguese: "Mensalidade de Março/2026 — condomínio do Edifício Solar" is 57 characters
+// but 63 bytes, and a description at the 100-character limit routinely exceeds 100 bytes.
+const (
+	maxDescriptionLen  = 100
+	maxPayerNameLen    = 40
+	maxAddressLineLen  = 40 // `address` = logradouro AND número, composed
+	maxNeighborhoodLen = 40
+	maxCityLen         = 40
+	maxEmailLen        = 70
 
-// toBankSlipResult maps the C6 response onto the port result. CRITICAL: id -> TxID. id is
-// the bank's registration reference and the app treats a non-empty TxID as the
-// billing-finalized marker (app/boleto.go); leaving it empty would let a retry or a
-// concurrent registration re-bill (duplicate ledger entry).
-func toBankSlipResult(out bankSlipResponseBody) ports.BoletoResult {
+	// maxAmountCents mirrors the contract's `amount` maximum of R$ 5.000.000,00. The port
+	// carries centavos, so the ceiling is expressed in centavos too.
+	maxAmountCents = 5_000_000_00
+)
+
+// tooLong reports whether s exceeds n CHARACTERS (not bytes).
+func tooLong(s string, n int) bool { return utf8.RuneCountInString(s) > n }
+
+// validateBankSlipLimits enforces the contract's field constraints on an outgoing
+// registration. It runs after validatePayer (which enforces presence) and checks size and
+// shape, so a caller gets one named field back instead of an opaque bank rejection.
+func validateBankSlipLimits(op string, req ports.BoletoRequest, description string) error {
+	bad := func(detail string) error {
+		return &Error{Op: op, sentinel: shared.ErrValidation, detail: detail}
+	}
+	switch {
+	case req.AmountCents > maxAmountCents:
+		return bad("amount exceeds the bank maximum of BRL 5,000,000.00")
+	case tooLong(description, maxDescriptionLen):
+		return bad("description is too long")
+	case tooLong(req.Payer.Name, maxPayerNameLen):
+		return bad("payer.name is too long")
+	// The contract models logradouro and número as ONE 40-character field, so the limit
+	// applies to the composed value — checking street alone would let a long number push
+	// the composed line over.
+	case tooLong(payerStreet(req.Payer.Address), maxAddressLineLen):
+		return bad("payer.address street and number exceed the combined limit")
+	case tooLong(req.Payer.Address.Neighborhood, maxNeighborhoodLen):
+		return bad("payer.address.neighborhood is too long")
+	case tooLong(req.Payer.Address.City, maxCityLen):
+		return bad("payer.address.city is too long")
+	case !validTaxIDDigits(req.Payer.TaxID):
+		return bad("payer.tax_id must be 11 (CPF) or 14 (CNPJ) digits")
+	case !validUFCode(req.Payer.Address.State):
+		return bad("payer.address.state must be a two-letter UF")
+	case !validZipDigits(req.Payer.Address.ZipCode):
+		return bad("payer.address.zip_code must be 8 digits")
+	}
+	return nil
+}
+
+// validTaxIDDigits accepts only an unmasked CPF (11 digits) or CNPJ (14). The contract
+// says "somente números, sem máscara, respeitando zeros à esquerda"; a masked value is
+// the common integration mistake and is worth naming rather than forwarding.
+func validTaxIDDigits(s string) bool {
+	if len(s) != 11 && len(s) != 14 {
+		return false
+	}
+	return allDigits(s)
+}
+
+// validZipDigits accepts an unmasked 8-digit CEP (contract pattern \d{8}).
+func validZipDigits(s string) bool { return len(s) == 8 && allDigits(s) }
+
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validUFCode accepts exactly two ASCII uppercase letters (contract pattern [A-Z]{2}).
+// The value is uppercased before this runs, so a lowercase "sp" is normalized rather than
+// rejected — it is unambiguous, and refusing it would be pedantry, not safety.
+func validUFCode(s string) bool {
+	if len(s) != 2 {
+		return false
+	}
+	return s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'A' && s[1] <= 'Z'
+}
+
+// toBankSlipResult maps the C6 response onto the port result.
+//
+// Two identifiers, two destinations, and they must not be swapped:
+//
+//   - C6's `id` -> TxID. It is the bank's registration reference, and the app treats a
+//     non-empty TxID as the billing-finalized marker (app/boleto.go); leaving it empty
+//     would let a retry or a concurrent registration re-bill (duplicate ledger entry).
+//   - boletoID (OURS) -> BoletoID. This is the one the caller addresses every later
+//     operation by, and every later operation derives external_reference_id FROM it.
+//     Returning C6's id here instead — as this did until now — meant the caller was handed
+//     an id whose derived reference was never registered, so every subsequent read, PDF,
+//     amendment and cancellation answered 404. It went unnoticed because the in-memory
+//     stub echoes back the id it was given, so only the real bank ever showed it.
+//
+// external_reference_id is echoed onto the result too: it is the key the C6 read/cancel/
+// patch paths address, and an inbound settlement notification may carry it.
+func toBankSlipResult(boletoID string, out bankSlipResponseBody) ports.BoletoResult {
 	slip := out.PaymentMethod.BankSlip
 	res := ports.BoletoResult{
-		BoletoID:      out.ID,
-		TxID:          out.ID,
-		Status:        out.Status,
-		OurNumber:     slip.OurNumber,
-		DigitableLine: slip.DigitableLine,
-		Barcode:       slip.BarCode,
-		AmountCents:   int64(out.Amount),
+		BoletoID:            boletoID,
+		TxID:                out.ID,
+		ExternalReferenceID: out.ExternalReferenceID,
+		Status:              out.Status,
+		OurNumber:           slip.OurNumber,
+		DigitableLine:       slip.DigitableLine,
+		Barcode:             slip.BarCode,
+		AmountCents:         int64(out.Amount),
 		// The BolePix QR Code is returned at REGISTRATION, not only on a later read.
 		QRCode: out.PaymentMethod.Pix.QRCode,
+	}
+	// Report what the charge actually is, read off the bank's own answer rather than off
+	// what was asked for: a QR present means both rails are live.
+	res.Modality = ports.ModalityBoleto
+	if res.QRCode != "" {
+		res.Modality = ports.ModalityBolepix
 	}
 	if out.DueDate != "" {
 		if t, err := time.Parse(dueDateLayout, out.DueDate); err == nil {
@@ -494,7 +707,7 @@ func (p *Provider) CreateBoleto(ctx context.Context, tenantID string, req ports.
 	if err := p.do(httpReq, "create_boleto", &out); err != nil {
 		return ports.BoletoResult{}, err
 	}
-	return toBankSlipResult(out), nil
+	return toBankSlipResult(req.BoletoID, out), nil
 }
 
 // GetBoleto reconciles the authoritative state of a registered boleto from C6
@@ -502,54 +715,275 @@ func (p *Provider) CreateBoleto(ctx context.Context, tenantID string, req ports.
 // mapping; the read is tenant-scoped through the per-tenant OAuth2 bearer token, so
 // one tenant can never read another's boleto.
 func (p *Provider) GetBoleto(ctx context.Context, tenantID, boletoID string) (ports.BoletoResult, error) {
-	endpoint := p.baseURL + bankSlipsPath + "/" + url.PathEscape(externalReferenceID(boletoID))
-	httpReq, err := p.authedJSONRequest(ctx, tenantID, "get_boleto", http.MethodGet, endpoint, nil, "")
+	return p.getBankSlip(ctx, tenantID, externalReferenceID(boletoID), boletoID, "get_boleto")
+}
+
+// GetBoletoByBankRef reads a charge addressed by the bank's external_reference_id VERBATIM.
+//
+// The settlement path needs this because an inbound notification carries an identifier we
+// cannot always map back to a local boleto id, and GetBoleto derives the reference FROM
+// that id — so it is the wrong tool for a charge we only know the reference of.
+//
+// The reference is validated against the contract's shape BEFORE any call: a malformed one
+// is a local error rather than a round trip that the bank would reject anyway.
+//
+// Note the result's BoletoID is left EMPTY on purpose. A reference that is not one of ours
+// does not decode to a boleto id, and inventing one here would let a caller believe a local
+// boleto exists when none does — the caller resolves that against the store.
+func (p *Provider) GetBoletoByBankRef(ctx context.Context, tenantID, bankRef string) (ports.BoletoResult, error) {
+	const op = "get_boleto_by_ref"
+	ref := strings.TrimSpace(bankRef)
+	if !validExternalReference(ref) {
+		return ports.BoletoResult{}, &Error{Op: op, sentinel: shared.ErrValidation,
+			detail: "external reference must be 26 uppercase alphanumerics"}
+	}
+	res, err := p.getBankSlip(ctx, tenantID, ref, "", op)
+	if err != nil {
+		return ports.BoletoResult{}, err
+	}
+	// If the reference IS one of ours, the bijection recovers the local id for free.
+	if localID, ok := boletoIDFromExternalReference(ref); ok {
+		res.BoletoID = localID
+	}
+	return res, nil
+}
+
+// validExternalReference reports whether ref matches the contract's ^[A-Z0-9]{26}$.
+func validExternalReference(ref string) bool {
+	if len(ref) != externalRefLen {
+		return false
+	}
+	for i := 0; i < len(ref); i++ {
+		c := ref[i]
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// getBankSlip is the shared read: one endpoint, addressed by reference, mapped onto the
+// port. boletoID is what the result should report as the LOCAL id, which the caller knows
+// and this function does not.
+func (p *Provider) getBankSlip(ctx context.Context, tenantID, ref, boletoID, op string) (ports.BoletoResult, error) {
+	endpoint := p.baseURL + bankSlipsPath + "/" + url.PathEscape(ref)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodGet, endpoint, nil, "")
 	if err != nil {
 		return ports.BoletoResult{}, err
 	}
 
 	var out bankSlipResponseBody
-	if err := p.do(httpReq, "get_boleto", &out); err != nil {
+	if err := p.do(httpReq, op, &out); err != nil {
 		return ports.BoletoResult{}, err
 	}
-	return toBankSlipResult(out), nil
+	return toBankSlipResult(boletoID, out), nil
 }
 
 // CancelBoleto performs the baixa/cancelamento of a registered boleto at C6 (roteiro
-// grupo 4) via DELETE. The boleto id doubles as the idempotency anchor so a retried
-// cancel is collapsed. A 404 surfaces as shared.ErrNotFound; the operation is
-// tenant-scoped through the per-tenant OAuth2 bearer token.
+// grupo 4). The boleto id doubles as the idempotency anchor so a retried cancel is
+// collapsed. A 404 surfaces as shared.ErrNotFound; the operation is tenant-scoped through
+// the per-tenant OAuth2 bearer token.
+//
+// The contract answers 204 with NO body, so this uses doNoContent rather than do(): do()
+// json.Unmarshals every 2xx body and would read the empty 204 as a malformed response,
+// turning a successful baixa into shared.ErrUnavailable. The result is therefore
+// synthesized from what the call proves — this boleto is now cancelled — instead of being
+// mapped from a body the bank never sends.
 func (p *Provider) CancelBoleto(ctx context.Context, tenantID, boletoID string) (ports.BoletoResult, error) {
 	// Baixa is a PUT on a /cancel sub-resource — the contract exposes no DELETE.
-	endpoint := p.baseURL + bankSlipsPath + "/" + url.PathEscape(externalReferenceID(boletoID)) + "/cancel"
+	ref := externalReferenceID(boletoID)
+	endpoint := p.baseURL + bankSlipsPath + "/" + url.PathEscape(ref) + "/cancel"
 	httpReq, err := p.authedJSONRequest(ctx, tenantID, "cancel_boleto", http.MethodPut, endpoint, nil, boletoID)
 	if err != nil {
 		return ports.BoletoResult{}, err
 	}
-
-	var out bankSlipResponseBody
-	if err := p.do(httpReq, "cancel_boleto", &out); err != nil {
+	if err := p.doNoContent(httpReq, "cancel_boleto"); err != nil {
 		return ports.BoletoResult{}, err
 	}
-	return toBankSlipResult(out), nil
+	return ports.BoletoResult{
+		BoletoID:            boletoID,
+		ExternalReferenceID: ref,
+		Status:              bankSlipStatusCanceled,
+	}, nil
 }
 
-// UpdateBoleto amends a registered boleto's parameters at C6 (roteiro grupo 5) via
-// PUT. The caller's IdempotencyKey (falling back to the boleto id) is forwarded so a
-// retried amendment is collapsed. A 404 surfaces as shared.ErrNotFound; the operation
-// is tenant-scoped through the per-tenant OAuth2 bearer token.
-func (p *Provider) UpdateBoleto(context.Context, string, string, ports.BoletoRequest) (ports.BoletoResult, error) {
-	// The published C6 BolePix contract exposes registration, read, PDF, listing and
-	// cancellation — there is NO amendment endpoint. The previous implementation PUT to a
-	// speculative /boletos/{id}, which the bank does not serve.
-	//
-	// Failing closed here is deliberate: the alternative is a call that looks like it
-	// amended a registered charge and did not, leaving our state and the bank's silently
-	// divergent on money. A caller that needs to change a registered boleto cancels it and
-	// registers a new one.
-	return ports.BoletoResult{}, &Error{
-		Op:       "update_boleto",
-		sentinel: shared.ErrValidation,
-		detail:   "bank does not support amending a registered boleto; cancel and re-register",
+// bankSlipPatchFees mirrors bankSlipFees for a PATCH: every field a pointer, so a fee the
+// caller did not mention is OMITTED rather than sent as zero. The contract's schema is
+// strict and a zero-valued key is rejected, which is why the create body already takes the
+// same discipline.
+type bankSlipPatchBody struct {
+	Amount           *brlDecimal   `json:"amount,omitempty"`
+	DueDate          *string       `json:"due_date,omitempty"`
+	Description      *string       `json:"description,omitempty"`
+	DaysAfterDueDate *int          `json:"days_after_due_date,omitempty"`
+	Fees             *bankSlipFees `json:"fees,omitempty"`
+}
+
+// toBankSlipPatchBody maps a partial amendment onto the C6 PATCH contract.
+//
+// Partial means partial: a nil field is left out of the JSON entirely. That distinction is
+// the whole point of the type — sending amount: 0 to mean "do not change the amount" would
+// ask the bank to make the charge free.
+func toBankSlipPatchBody(op string, patch ports.BoletoPatch) (bankSlipPatchBody, error) {
+	body := bankSlipPatchBody{}
+	if patch.AmountCents != nil {
+		if *patch.AmountCents > maxAmountCents {
+			return body, &Error{Op: op, sentinel: shared.ErrValidation,
+				detail: "amount exceeds the bank maximum of BRL 5,000,000.00"}
+		}
+		v := brlDecimal(*patch.AmountCents)
+		body.Amount = &v
 	}
+	if patch.DueDate != nil {
+		d := patch.DueDate.Format(dueDateLayout)
+		body.DueDate = &d
+	}
+	if patch.Description != nil {
+		d := strings.TrimSpace(*patch.Description)
+		if tooLong(d, maxDescriptionLen) {
+			return body, &Error{Op: op, sentinel: shared.ErrValidation, detail: "description is too long"}
+		}
+		body.Description = &d
+	}
+	// ValidUntil is expressed to the bank as whole days after the due date, so amending it
+	// requires knowing which due date it is counted from. Rather than read-modify-write the
+	// registered one (a race on money), the caller supplies both.
+	if patch.ValidUntil != nil {
+		if patch.DueDate == nil {
+			return body, &Error{Op: op, sentinel: shared.ErrValidation,
+				detail: "valid_until requires due_date: the bank counts expiry in days after the due date"}
+		}
+		body.DaysAfterDueDate = daysAfterDueDate(*patch.DueDate, *patch.ValidUntil)
+	}
+	if patch.Fees != nil {
+		fees, err := toBankSlipFees(op, ports.BoletoRequest{
+			FineBps:            patch.Fees.FineBps,
+			FineFixedCents:     patch.Fees.FineFixedCents,
+			MonthlyInterestBps: patch.Fees.MonthlyInterestBps,
+			Discounts:          patch.Fees.Discounts,
+		})
+		if err != nil {
+			return body, err
+		}
+		body.Fees = fees
+	}
+	return body, nil
+}
+
+// empty reports whether the patch would send no changes at all.
+func (b bankSlipPatchBody) empty() bool {
+	return b.Amount == nil && b.DueDate == nil && b.Description == nil &&
+		b.DaysAfterDueDate == nil && b.Fees == nil
+}
+
+// UpdateBoleto amends a registered boleto at C6 (roteiro grupo 5).
+//
+// This used to fail closed on the premise that the bank had no amendment endpoint. That
+// premise was wrong: the published Bolepix contract (v1.1.0, docs/compliance/
+// c6-bolepix-oas.yaml) exposes PATCH /v2/bank_slips/{external_reference_id}. What the
+// earlier implementation actually got wrong was the verb and the path — it PUT to a
+// speculative /boletos/{id} — not the existence of the operation.
+//
+// It is a PARTIAL update, so only the fields the caller set are sent. A patch that would
+// change nothing is refused here rather than sent as an empty body.
+func (p *Provider) UpdateBoleto(ctx context.Context, tenantID, boletoID string, patch ports.BoletoPatch) (ports.BoletoResult, error) {
+	const op = "update_boleto"
+	body, err := toBankSlipPatchBody(op, patch)
+	if err != nil {
+		return ports.BoletoResult{}, err
+	}
+	if body.empty() {
+		return ports.BoletoResult{}, &Error{Op: op, sentinel: shared.ErrValidation,
+			detail: "no amendable field was supplied"}
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return ports.BoletoResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+
+	ref := externalReferenceID(boletoID)
+	endpoint := p.baseURL + bankSlipsPath + "/" + url.PathEscape(ref)
+	idem := patch.IdempotencyKey
+	if idem == "" {
+		idem = boletoID
+	}
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodPatch, endpoint, payload, idem)
+	if err != nil {
+		return ports.BoletoResult{}, err
+	}
+
+	var out bankSlipResponseBody
+	if err := p.do(httpReq, op, &out); err != nil {
+		return ports.BoletoResult{}, err
+	}
+	return toBankSlipResult(boletoID, out), nil
+}
+
+// pdfMediaType is what a boleto document is served as.
+const pdfMediaType = "application/pdf"
+
+// pdfMagic is the signature every PDF starts with. It is checked before returning, so an
+// error page or a JSON body that arrived with the wrong Content-Type is never handed back
+// labelled as a PDF.
+var pdfMagic = []byte("%PDF-")
+
+// GetBoletoPDF downloads the registered boleto as a PDF from C6.
+//
+// The contract declares the 200 with no content type at all, and the legacy v1 API returned
+// the document base64-encoded INSIDE a JSON body. Both shapes are therefore accepted: what
+// identifies a PDF is its own signature, not a header the bank may or may not set.
+func (p *Provider) GetBoletoPDF(ctx context.Context, tenantID, boletoID string) (ports.BoletoDocument, error) {
+	const op = "get_boleto_pdf"
+	ref := externalReferenceID(boletoID)
+	endpoint := p.baseURL + bankSlipsPath + "/" + url.PathEscape(ref) + "/pdf"
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodGet, endpoint, nil, "")
+	if err != nil {
+		return ports.BoletoDocument{}, err
+	}
+
+	body, contentType, err := p.doRaw(httpReq, op, maxDocumentBytes)
+	if err != nil {
+		return ports.BoletoDocument{}, err
+	}
+
+	content := body
+	if !bytes.HasPrefix(content, pdfMagic) {
+		// Not raw bytes — try the legacy JSON envelope before giving up.
+		decoded, ok := decodeBase64PDFEnvelope(body)
+		if !ok {
+			return ports.BoletoDocument{}, &Error{Op: op, sentinel: shared.ErrUnavailable,
+				detail: "response is not a PDF"}
+		}
+		content = decoded
+	}
+	_ = contentType // the signature decides; the header is advisory on this endpoint
+	return ports.BoletoDocument{
+		ContentType: pdfMediaType,
+		Filename:    "boleto-" + boletoID + ".pdf",
+		Content:     content,
+	}, nil
+}
+
+// decodeBase64PDFEnvelope unwraps the legacy JSON shape {"base64_pdf_file": "..."} (or one
+// of its aliases). It returns ok only when the decoded bytes are actually a PDF, so a
+// base64 field carrying something else is rejected rather than forwarded.
+func decodeBase64PDFEnvelope(body []byte) ([]byte, bool) {
+	var env struct {
+		Base64PDFFile string `json:"base64_pdf_file"`
+		PDF           string `json:"pdf"`
+		Content       string `json:"content"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, false
+	}
+	for _, encoded := range []string{env.Base64PDFFile, env.PDF, env.Content} {
+		if encoded == "" {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err == nil && bytes.HasPrefix(decoded, pdfMagic) {
+			return decoded, true
+		}
+	}
+	return nil, false
 }
