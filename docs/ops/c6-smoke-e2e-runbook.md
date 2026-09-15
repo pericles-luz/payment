@@ -412,10 +412,10 @@ Janela: seg–sex 7h–23h BRT. Erros = **RFC7807 problem+json** (BACEN PIX:
 | PIX cobv (com venc.) | `/v2/pix/cobv/{txid}` | ⏳ DTO real pendente (follow-up) |
 | PIX recebidos / recorrência | `/v2/pix/pix` · `/v2/pix/rec` | ⏳ follow-up |
 | Extrato | `GET /v1/statement?start_date=&end_date=` (yyyy-MM-dd) | ✅ params remapeados |
-| Boleto | `POST /v1/bank_slips` | ⏳ path descoberto; DTO real pendente (follow-up) |
+| Boleto / BolePix | `POST /v2/bank_slips` | ✅ contrato oficial versionado (`docs/compliance/c6-bolepix-oas.yaml`); emissão, consulta, `PATCH`, PDF e baixa implementados |
 | Checkout | `POST /v1/checkouts` | ⏳ path descoberto; schema `payment` portal-gated (follow-up) |
 | Webhook PIX (registro) | `PUT`/`GET /v2/pix/webhook/{chave}` (`chave` no path; corpo `{"webhookUrl":"…"}`) | ✅ implementado (`internal/adapters/bank/c6/webhook.go` + `cmd/register-webhook`) |
-| Webhook C6-próprio (boleto/checkout) | `/v1/webhooks` (req: `service`∈{BANK_SLIP,CHECKOUT,BANK_SLIP_PIX}, `url`) | ⏳ follow-up (superfície distinta do registro PIX acima) |
+| Webhook C6-próprio (boleto/checkout) | `/v1/webhooks` (req: `service`∈{BANK_SLIP,CHECKOUT,BANK_SLIP_PIX}, `url`) | ✅ os três registrados (`cmd/api`, `cmd/c6-webhook-sync`); receptor em `webhookKindBoleto` |
 
 ### 9.1 PIX cob — caminho positivo confirmado (HTTP 200)
 

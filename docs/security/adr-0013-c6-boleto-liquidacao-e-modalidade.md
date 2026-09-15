@@ -168,10 +168,22 @@ ainda assim ser incapaz de emitir um BolePix.
 
 ## O que ainda não foi medido
 
-O registro dos serviços `BANK_SLIP`/`BANK_SLIP_PIX` no C6 **não foi ligado** por este
-trabalho, de propósito: a regra da casa é nunca mandar o PSP entregar o que ainda não
-sabemos processar, e ela não se inverte porque o receptor agora existe — ela se cumpre
-medindo primeiro. Pendente de uma janela de sandbox:
+> **Addendum (PR #53).** O registro dos serviços `BANK_SLIP`/`BANK_SLIP_PIX` foi **ligado**,
+> antes das medições abaixo. Este ADR dizia originalmente que não seria, e a inversão é
+> deliberada e do dono do produto, não um descuido — fica registrada aqui em vez de a
+> decisão sumir no histórico.
+>
+> O que a torna defensável é o comportamento do receptor no caso não medido, não o
+> desaparecimento da incerteza: ele resolve a cobrança tentando a linha local primeiro e a
+> referência do banco depois — correto qualquer que seja o identificador que chegue — e,
+> quando nenhum resolve, devolve **erro** em vez de confirmação, de modo que o aviso é
+> reentregue e o corpo bruto fica no log verbatim. O pior caso vira "repetido e registrado
+> alto", não "dinheiro perdido em silêncio". E é esse log que responde ao item 1.
+>
+> O que **não** muda: nada disto substitui as medições, e o registro é de mão única (sem
+> DELETE na superfície proprietária). Os cinco itens abaixo continuam abertos.
+
+Pendente de uma janela de sandbox:
 
 1. **Qual identificador o C6 põe em `external_id`** do aviso: o `id` dele ou a nossa
    referência. Mitigado, não resolvido: a resolução tenta a leitura local primeiro e a

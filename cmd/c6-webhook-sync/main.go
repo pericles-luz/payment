@@ -176,6 +176,24 @@ func run() error {
 				return provider.GetServiceWebhook(ctx, tenantID, c6.ServiceCheckout)
 			},
 		},
+		// Os dois canais de boleto. Precisam estar AQUI e nao so no cmd/api: a varredura de
+		// renovacao esta desligada, entao esta ferramenta e a unica coisa que converge um
+		// tenant que ja existe. Deixar a lista fora de passo com a do cmd/api significa um
+		// tenant convergido "com sucesso" e ainda sem receber aviso de boleto pago.
+		{
+			name:     "boleto (superficie propria)",
+			register: func() error { return provider.RegisterServiceWebhook(ctx, tenantID, c6.ServiceBankSlip, callback) },
+			confirm: func() (ports.WebhookRegistration, error) {
+				return provider.GetServiceWebhook(ctx, tenantID, c6.ServiceBankSlip)
+			},
+		},
+		{
+			name:     "bolepix (superficie propria)",
+			register: func() error { return provider.RegisterServiceWebhook(ctx, tenantID, c6.ServiceBankSlipPix, callback) },
+			confirm: func() (ports.WebhookRegistration, error) {
+				return provider.GetServiceWebhook(ctx, tenantID, c6.ServiceBankSlipPix)
+			},
+		},
 	}
 
 	var failures int
@@ -229,6 +247,12 @@ func reportCurrent(ctx context.Context, p *c6.Provider, tenantID, chave string) 
 	show("recorrencia: cobranca", func() (ports.WebhookRegistration, error) { return p.GetCobRWebhook(ctx, tenantID) })
 	show("checkout", func() (ports.WebhookRegistration, error) {
 		return p.GetServiceWebhook(ctx, tenantID, c6.ServiceCheckout)
+	})
+	show("boleto", func() (ports.WebhookRegistration, error) {
+		return p.GetServiceWebhook(ctx, tenantID, c6.ServiceBankSlip)
+	})
+	show("bolepix", func() (ports.WebhookRegistration, error) {
+		return p.GetServiceWebhook(ctx, tenantID, c6.ServiceBankSlipPix)
 	})
 }
 

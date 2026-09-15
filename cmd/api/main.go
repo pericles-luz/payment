@@ -355,34 +355,42 @@ func run() error {
 	// the PSP routes by the service discriminator in the notification body. Registering
 	// only PIX — the pre-multi-channel behaviour — left the others pointing at whatever
 	// ref was current when they were last written, and the next mint killed them
-	// silently. CHECKOUT is listed explicitly.
+	// silently. All three proprietary channels are listed explicitly.
 	//
-	// BANK_SLIP / BANK_SLIP_PIX are still ABSENT, and the reason has changed. The receiver
-	// now exists — resolveWebhook routes both services to webhookKindBoleto and
-	// WebhookService.HandleBoletoEvent reconciles against /v2/bank_slips (ADR-0013). What is
-	// missing is not code, it is a MEASUREMENT: nobody has yet seen a real notification, so
-	// which identifier C6 puts in `external_id` is still inferred rather than known. The
-	// receiver is built to be correct under either answer and to fail loudly rather than
-	// silently when neither matches, but "correct under either answer" is not the same as
-	// "verified", and this is the one step that cannot be undone — the proprietary surface
-	// exposes no DELETE, so a channel registered stays registered.
+	// BANK_SLIP / BANK_SLIP_PIX were held back until the receiver existed, so the PSP was
+	// never told to deliver what we could not process. It exists now: resolveWebhook routes
+	// both services to webhookKindBoleto and WebhookService.HandleBoletoEvent reconciles
+	// against /v2/bank_slips (ADR-0013).
 	//
-	// The order is therefore: register in SANDBOX, pay a boleto and a BolePix-by-QR, read
-	// the raw bodies out of the webhook logs (logWebhookReject prints them verbatim,
-	// always), confirm the id mapping and the status vocabulary, and only then add the two
-	// services here. See "O que ainda não foi medido" in ADR-0013.
+	// Two properties of the receiver are what make enabling this tolerable BEFORE the id
+	// mapping has been seen on a real notification. It resolves the charge by trying the
+	// local payment row first and the bank reference second, which is correct whichever of
+	// the two identifiers C6 puts in `external_id`; and when neither resolves it returns an
+	// error rather than an ack, so the notification is redelivered and its raw body is
+	// logged verbatim instead of being dropped. The unmeasured case degrades to "retried
+	// and loudly logged", never to "money quietly lost".
 	//
-	// When they are added, cmd/c6-webhook-sync needs them too: the renewal sweep is off, so
-	// it is the only thing that converges an existing tenant. Expect a ref rotation — adding
-	// a channel re-mints the tenant's ref and revokes the others, so notifications in flight
-	// under the old ref get a 401. Pick a low-traffic window.
+	// Operationally this is ONE-WAY: the proprietary surface exposes no DELETE
+	// (docs/api/manual.md §4.7), so a channel registered here stays registered until it is
+	// overwritten. Two consequences to know before deploying:
+	//
+	//   - Adding a channel re-mints the tenant's ref and REVOKES the others, so every
+	//     channel is rewritten at once and a notification in flight under the old ref is
+	//     answered 401. That touches PIX and checkout too, not only boleto.
+	//   - The renewal sweep is off, so nothing converges on its own. An existing tenant is
+	//     converged by cmd/c6-webhook-sync, by a self-serve credential/PIX-key write, or by
+	//     one interval with PAYMENT_WEBHOOK_RECONCILE on.
+	//
+	// Prefer a low-traffic window, and keep cmd/c6-webhook-sync's service list in step with
+	// this one — it is the only tool that converges a tenant while the sweep is off.
 	webhookRegSvc := app.NewWebhookRegistrationService(
 		creds, webhookRegistrar, app.NewWebhookRefMintService(webhookRefStore),
 		webhookCallbackBaseURL(), slog.Default()).
 		WithRefLookup(webhookRefStore).
 		WithTenants(store).
 		WithRecurrenceRegistrar(recWebhookRegistrar).
-		WithServiceRegistrar(svcWebhookRegistrar, c6.ServiceCheckout)
+		WithServiceRegistrar(svcWebhookRegistrar,
+			c6.ServiceCheckout, c6.ServiceBankSlip, c6.ServiceBankSlipPix)
 
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:   app.NewChargeService(deps),
