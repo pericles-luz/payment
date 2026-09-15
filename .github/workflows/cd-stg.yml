@@ -104,6 +104,27 @@ jobs:
             -o build/payment-api ./cmd/api
           echo "DEPLOY_COMMIT=$COMMIT" >> "$GITHUB_ENV"
 
+      - name: Build operator tools with the same stamped provenance
+        # The CD used to build ONLY cmd/api, so every other binary in /opt/payment/bin was
+        # hand-installed and drifted. c6-webhook-sync sat 25 days stale — missing the boleto
+        # channels AND the reachability report — and it is the tool an operator consults to
+        # decide whether production is sane. A tool that silently ages into lying is worse
+        # than no tool, so they ship with the service now.
+        #
+        # Same flags and same -X stamping as the api: an operator can tell which commit the
+        # tool in their hand came from.
+        run: |
+          set -euo pipefail
+          VERSION="$(git describe --tags --always)"
+          COMMIT="$(git rev-parse HEAD)"
+          BUILD_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PKG="github.com/ia-dev-sindireceita/payment/internal/version"
+          for tool in c6-webhook-sync c6-webhook-probe db-migrate vault-reseal; do
+            CGO_ENABLED=0 go build -v -trimpath \
+              -ldflags "-s -w -X ${PKG}.Version=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.BuildAt=${BUILD_AT}" \
+              -o "build/${tool}" "./cmd/${tool}"
+          done
+
       - name: Log binary fingerprint
         run: |
           set -euo pipefail
@@ -153,6 +174,28 @@ jobs:
             echo "::error::preflight failed — the CD cannot reach or authenticate to the deploy target, so nothing was shipped. Diagnose in the order given by docs/deploy/staging.md section 11: (1) does sshd on the target log the runner's attempt for the deploy user; (2) is authorized_keys under that account's REAL home (getent passwd), not an assumed /home; (3) only then suspect the key material. Do NOT start by rotating the key."
             exit 1
           fi
+
+      - name: Ship operator tools (one locked verb each, no restart)
+        # BEFORE the service, deliberately. These verbs install a binary and restart
+        # nothing, so running them first is harmless — and if one fails the job stops
+        # without having bounced payment-api. Shipping them AFTER would mean a tool failure
+        # leaves the new service running with stale tools, which is exactly the drift this
+        # step exists to end.
+        #
+        # One verb per tool: the wrapper matches whole literal verbs and builds the target
+        # path from its own constants, so no tool name is ever caller input. Adding a tool
+        # is a case branch there plus a line here.
+        env:
+          STG_HOST: ${{ secrets.PAYMENT_STG_HOST }}
+          STG_USER: ${{ secrets.PAYMENT_STG_USER }}
+        run: |
+          set -euo pipefail
+          { set +x; } 2>/dev/null
+          for tool in c6-webhook-sync c6-webhook-probe db-migrate vault-reseal; do
+            echo "shipping ${tool}"
+            ssh -o StrictHostKeyChecking=yes -o BatchMode=yes \
+              "${STG_USER}@${STG_HOST}" "deploy-${tool}" < "build/${tool}"
+          done
 
       - name: Ship + deploy (pipe binary over the locked deploy verb on stdin)
         # set +x so the host/user never leak into logs. The deploy key is pinned on
