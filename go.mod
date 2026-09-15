@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/rabbitmq/amqp091-go v1.10.0
+	github.com/rabbitmq/amqp091-go v1.13.0
 	golang.org/x/crypto v0.55.0
 	modernc.org/sqlite v1.34.4
 )
