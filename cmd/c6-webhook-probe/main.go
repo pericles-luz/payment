@@ -376,6 +376,69 @@ func run() error {
 	// captured amount ("EM BREVE"). That claim came from a code comment, never from an
 	// observed response, and it is the single thing standing between a paid checkout and
 	// settlement (SIN-65726). Printing the raw body checks it against the wire.
+	// --bolepix: emite uma cobranca /v2/bank_slips e imprime o corpo BRUTO da resposta.
+	//
+	// Existe porque o adapter mapeia um 400 do C6 para shared.ErrValidation e o boundary
+	// responde {"error":"invalid request"} sem detalhe e sem log — entao, quando o banco
+	// recusa o nosso corpo, o motivo fica invisivel pela API. Mesmo buraco que o extrato
+	// tinha (PR #49). Este modo ESCREVE: usa valor minimo e so deve rodar em sandbox.
+	if len(os.Args) > 2 && os.Args[2] == "--bolepix" {
+		comPix := len(os.Args) > 3 && os.Args[3] == "--com-pix"
+		carteira := strings.TrimSpace(cfg.C6.BillingScheme)
+		if carteira == "" {
+			carteira = "21"
+		}
+		// external_reference_id: 26 chars [A-Z0-9], como o contrato exige.
+		ref := strings.ToUpper(hex.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
+		for len(ref) < 26 {
+			ref += "0"
+		}
+		ref = ref[:26]
+
+		bankSlip := map[string]any{"billing_scheme": carteira}
+		metodo := map[string]any{"bank_slip": bankSlip}
+		if comPix {
+			if strings.TrimSpace(cred.CreditorKey) == "" {
+				return fmt.Errorf("--com-pix exige chave PIX aleatoria registrada no tenant")
+			}
+			metodo["pix"] = map[string]any{"key": cred.CreditorKey, "type": "EVP"}
+		}
+		corpo := map[string]any{
+			"external_reference_id": ref,
+			"amount":                1.23,
+			"due_date":              time.Now().AddDate(0, 0, 7).UTC().Format("2006-01-02"),
+			"description":           "Sonda BolePix",
+			"payer": map[string]any{
+				"name":   "Fulano de Teste",
+				"tax_id": "11144477735",
+				"address": map[string]any{
+					"address":      "Rua das Flores, 123",
+					"neighborhood": "Centro",
+					"city":         "Brasilia",
+					"state":        "DF",
+					"zip_code":     "70000000",
+				},
+			},
+			"payment_method": metodo,
+		}
+		payload, err := json.Marshal(corpo)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("   external_reference_id: %s (len=%d)\n", ref, len(ref))
+		fmt.Printf("   carteira: %s | com pix: %v\n", carteira, comPix)
+		fmt.Printf("   corpo enviado: %s\n", payload)
+		section("POST /v2/bank_slips (corpo bruto da resposta)")
+		return call(ctx, httpc, http.MethodPost, base+"/v2/bank_slips", token, payload, "application/json")
+	}
+
+	// --ver-bolepix <external_reference_id>: le a cobranca, corpo bruto.
+	if len(os.Args) > 3 && os.Args[2] == "--ver-bolepix" {
+		ref := strings.TrimSpace(os.Args[3])
+		section("GET /v2/bank_slips/" + ref + " (corpo bruto)")
+		return call(ctx, httpc, http.MethodGet, base+"/v2/bank_slips/"+url.PathEscape(ref), token, nil, "application/json")
+	}
+
 	if len(os.Args) > 3 && os.Args[2] == "--get-checkout" {
 		id := strings.TrimSpace(os.Args[3])
 		section("GET /v1/checkouts/" + id + " (corpo bruto)")
@@ -399,7 +462,7 @@ func run() error {
 			"redirect_url":          "https://payment-sbx.lmhost.com.br/",
 			"payer": map[string]any{
 				"name":   "Fulano de Tal",
-				"tax_id": "12345678901",
+				"tax_id": "11144477735",
 				"email":  "fulano@example.com",
 				"address": map[string]any{
 					"street": "Rua das Flores", "number": 123,

@@ -183,6 +183,69 @@ ainda assim ser incapaz de emitir um BolePix.
 > O que **não** muda: nada disto substitui as medições, e o registro é de mão única (sem
 > DELETE na superfície proprietária). Os cinco itens abaixo continuam abertos.
 
+### Medido em 15/09/2026 contra o C6 sandbox
+
+Emissão ponta a ponta pela nossa API: **HTTP 201**. O que isso fechou:
+
+- **A referência de 26 chars é aceita E endereçável.** `POST /v2/bank_slips` aceitou a
+  derivação Crockford, e `GET /v2/bank_slips/552S2QFD8D61V3BZGWXK27SDQT` — a referência
+  derivada do id local `a5164577b50d307635fe1cecc47cb6fa` — devolveu **200** com a cobrança
+  certa. A bijeção da decisão 1 funciona contra o banco real, não só em teste.
+- **O shape da resposta bate com `bankSlipResponseBody`**: artefatos aninhados em
+  `payment_method.bank_slip` (`bar_code`, `digitable_line`, `our_number`, `originator_id`,
+  `billing_type`) e o QR em `payment_method.pix` (`qr_code`, `image_content`, `mime_type`,
+  `reference`). O QR vem **na criação**, como o ADR-0005 dizia.
+- **`amount` é decimal em reais**: `12.34` ↔ 1234 centavos. `brlDecimal` correto.
+- **`status` é ausente na criação e `CREATED` na leitura** — vocabulário v2 confirmado.
+- **O `id` do C6 é um ULID** (`01M2KEFNXH680SBM714RX13CJT`): 26 chars `[A-Z0-9]`, ou seja
+  **indistinguível em forma** da nossa referência. A premissa da decisão 2 (§"o problema dos
+  três identificadores") está confirmada: forma não decide, só o store decide.
+- **A correção do `boleto_id` está validada ao vivo**: a resposta trouxe o id **local** em
+  `boleto_id` e o id do C6 em `txid`, então as operações seguintes endereçam o que existe.
+- **Escopos concedidos** (medição 4, fechada): `v2.bankslip.write`, `v2.bankslip.read` e
+  **`v2.bankslip.pix.write`**. A perna PIX tem escopo **próprio** — confirmação independente
+  de que `boleto` e `bolepix` deviam ser bits separados (decisão 7).
+  `PAYMENT_C6_SCOPE_BANK_SLIP_WRITE=v2.bankslip.write`.
+
+#### Dois achados que pedem correção
+
+1. **O C6 recusa erro semântico com `422`, não `400`**, em `application/problem+json`, e o
+   `detail` embrulha um erro do Matera:
+
+   ```
+   HTTP 422
+   detail: Error generating boleto: {"type":"MATERA_CLIENT_ERROR_400",
+           "message":"Valor informado no campo <cnpjCpf do grupo pagador> não pertence ao Domínio."}
+   ```
+
+   Pela nossa API isso chega como `400 {"error":"invalid request"}` — **sem detalhe e sem
+   log**, porque `writeDomainError` mapeia `ErrValidation` para uma mensagem genérica e não
+   registra nada. O motivo fica invisível, exatamente o buraco do incidente do extrato
+   (PR #49). Um CPF inválido custou uma ida ao banco e uma hora de diagnóstico que só a sonda
+   resolveu. **Vale registrar o `detail` do PSP em log** (não na resposta) nos erros do
+   adapter.
+
+2. **Não validamos dígito verificador de CPF/CNPJ**, só a largura (11 ou 14). Um CPF
+   sintaticamente correto mas inválido só é recusado pelo banco, como acima. Validar o DV
+   localmente transformaria um 422 opaco num erro de campo nomeado, de graça.
+
+#### Por que a liquidação NÃO foi medida
+
+Não há como liquidar um boleto no sandbox do C6 a partir daqui:
+
+- o catálogo de APIs do portal não expõe **nenhum simulador** de pagamento;
+- `Agendamento de Pagamentos` (DDA) responde **404** para esta conta — ela não tem DDA, e de
+  todo modo o DDA lista boletos em que a conta é *pagadora*, não cedente;
+- pagar o QR PIX exige um PSP pagador, que não temos.
+
+Então as medições 1, 2, 3 e 5 continuam abertas e dependem de o C6 liquidar uma cobrança de
+sandbox — pedido para o gerente de contas, não trabalho de código. A cobrança emitida está de
+pé e pode ser usada para isso:
+
+    external_reference_id  552S2QFD8D61V3BZGWXK27SDQT
+    id (C6)                01M2KEFNXH680SBM714RX13CJT
+    linha digitável        33690.00009 65729.430010 04489.482135 9 15770000001234
+
 Pendente de uma janela de sandbox:
 
 1. **Qual identificador o C6 põe em `external_id`** do aviso: o `id` dele ou a nossa
