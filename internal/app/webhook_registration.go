@@ -67,11 +67,69 @@ type tenantActiveLookup interface {
 	FindTenantByID(ctx context.Context, id string) (*tenant.Tenant, error)
 }
 
-// webhookRefLookup is the narrow slice of ports.WebhookRefStore the idempotency gate
+// WebhookRefLookup is the narrow slice of ports.WebhookRefStore the idempotency gate
 // needs: resolve a ref's sha256 to its owning tenant. Revoked refs do not resolve, which
 // is exactly the property the gate relies on to tell a live registration from a stale one.
-type webhookRefLookup interface {
+//
+// It is exported so operator tooling outside this package (cmd/c6-webhook-sync) can reach
+// the SAME classification the gate uses, rather than reimplementing it. A second copy of
+// "is this registration still reachable?" is the kind of duplication that drifts silently
+// and then lies to an operator mid-procedure.
+type WebhookRefLookup interface {
 	LookupWebhookRef(ctx context.Context, refSHA []byte) (tenantID string, ok bool, err error)
+}
+
+// webhookRefLookup is the internal spelling, kept as an alias so the existing wiring and
+// tests read unchanged.
+type webhookRefLookup = WebhookRefLookup
+
+// RegistrationHealth is the operator-facing verdict about ONE channel's registration at the
+// PSP. It exists because "registered" is not a useful answer on its own: a channel can hold
+// a URL that no longer authenticates, and an operator reading "registered" would conclude
+// the channel works when callbacks through it are answered 401.
+type RegistrationHealth string
+
+const (
+	// RegistrationHealthLive: the PSP holds a URL carrying an ACTIVE ref of this tenant, so
+	// callbacks through it authenticate.
+	RegistrationHealthLive RegistrationHealth = "viva"
+	// RegistrationHealthStale: the PSP holds a URL, but it is unreachable — a foreign
+	// origin, or a revoked/superseded ref, or a ref owned by another tenant. This is the
+	// state that "registered" used to hide.
+	RegistrationHealthStale RegistrationHealth = "obsoleta"
+	// RegistrationHealthAbsent: the PSP holds nothing for this channel.
+	RegistrationHealthAbsent RegistrationHealth = "ausente"
+	// RegistrationHealthUnknown: the ref store could not answer, so neither conclusion is
+	// safe. Distinct from stale on purpose: acting on a guess here causes ref churn.
+	RegistrationHealthUnknown RegistrationHealth = "indeterminada"
+)
+
+// ClassifyWebhookRegistration reports whether registeredURL — the URL a PSP currently holds
+// for one channel — is one tenantID can actually be reached through.
+//
+// refs may be nil, which degrades to the historical origin-prefix check so a deployment
+// without the durable ref store behaves exactly as it did before that store existed.
+func ClassifyWebhookRegistration(ctx context.Context, refs WebhookRefLookup, baseURL, tenantID, registeredURL string) RegistrationHealth {
+	prefix := baseURL + webhookCallbackPathPrefix
+	if !strings.HasPrefix(registeredURL, prefix) {
+		return RegistrationHealthStale
+	}
+	ref := strings.TrimPrefix(registeredURL, prefix)
+	if ref == "" {
+		return RegistrationHealthStale
+	}
+	if refs == nil {
+		return RegistrationHealthLive // pre-F1 behaviour: origin prefix is all we can check
+	}
+	sum := webhookref.Sum(ref)
+	owner, ok, err := refs.LookupWebhookRef(ctx, sum[:])
+	if err != nil {
+		return RegistrationHealthUnknown
+	}
+	if !ok || owner != tenantID {
+		return RegistrationHealthStale
+	}
+	return RegistrationHealthLive
 }
 
 // registrationState classifies what C6 currently holds for a tenant's PIX key.
@@ -91,27 +149,17 @@ const (
 // registrationState reports whether the URL C6 holds is one this tenant can actually be
 // reached through. With no ref lookup wired it degrades to the historical prefix check, so
 // a deployment without the durable store behaves exactly as before.
+// It delegates to ClassifyWebhookRegistration so the gate and the operator tooling can
+// never disagree about what "reachable" means.
 func (s *WebhookRegistrationService) registrationState(ctx context.Context, tenantID, registeredURL string) registrationState {
-	prefix := s.baseURL + webhookCallbackPathPrefix
-	if !strings.HasPrefix(registeredURL, prefix) {
-		return registrationStale
-	}
-	ref := strings.TrimPrefix(registeredURL, prefix)
-	if ref == "" {
-		return registrationStale
-	}
-	if s.refs == nil {
-		return registrationLive // pre-F1 behaviour: origin prefix is all we can check
-	}
-	sum := webhookref.Sum(ref)
-	owner, ok, err := s.refs.LookupWebhookRef(ctx, sum[:])
-	if err != nil {
+	switch ClassifyWebhookRegistration(ctx, s.refs, s.baseURL, tenantID, registeredURL) {
+	case RegistrationHealthLive:
+		return registrationLive
+	case RegistrationHealthUnknown:
 		return registrationUnknown
-	}
-	if !ok || owner != tenantID {
+	default:
 		return registrationStale
 	}
-	return registrationLive
 }
 
 // NewWebhookRegistrationService wires the in-flow registrar over the credential store

@@ -133,7 +133,7 @@ func run() error {
 
 	if dryRun {
 		fmt.Println("\n-- dry-run: nada sera mintado nem registrado --")
-		reportCurrent(ctx, provider, tenantID, chave)
+		reportCurrent(ctx, provider, refStore, base, tenantID, chave)
 		return nil
 	}
 
@@ -221,6 +221,13 @@ func run() error {
 		}
 	}
 	if failures > 0 {
+		// Spell out the state this leaves behind. The mint already revoked the tenant's
+		// previous ref, so a channel this run did not re-register is not "unchanged" — it is
+		// DEAD, and it was working a moment ago. Reporting only a failure count invites the
+		// reading that nothing happened.
+		fmt.Printf("\nATENCAO: %d de %d canais falharam, e a ref anterior JA foi revogada pelo mint.\n", failures, len(channels))
+		fmt.Println("Os canais que nao confirmaram estao OBSOLETOS agora: avisos por eles levam 401.")
+		fmt.Println("Rode de novo (o comando e reexecutavel) e confira com --dry-run que os seis estao 'viva'.")
 		return fmt.Errorf("%d de %d canais falharam", failures, len(channels))
 	}
 	fmt.Println("\ntodos os canais convergidos para a mesma ref viva")
@@ -228,18 +235,52 @@ func run() error {
 }
 
 // reportCurrent prints what the PSP holds today, without printing any URL.
-func reportCurrent(ctx context.Context, p *c6.Provider, tenantID, chave string) {
+//
+// It reports REACHABILITY, not mere presence, and the difference is the whole point. A
+// channel can hold a URL whose ref has been revoked — which happens to every channel the
+// moment a mint supersedes the tenant's ref, and stays that way for any channel a
+// half-finished sync never got to re-register. Reporting that as "registrado" told an
+// operator the channel worked while callbacks through it were being answered 401, so a sync
+// that died midway looked identical to one that succeeded. Measured on 15/09/2026: a run
+// interrupted after the first channel left five channels dead and this report called all six
+// registered.
+//
+// The verdict comes from app.ClassifyWebhookRegistration — the same function the in-flow
+// idempotency gate uses — so the tool and the service can never disagree about what
+// "reachable" means.
+func reportCurrent(ctx context.Context, p *c6.Provider, refs app.WebhookRefLookup, baseURL, tenantID, chave string) {
+	var stale, unknown int
 	show := func(name string, get func() (ports.WebhookRegistration, error)) {
-		_, err := get()
+		reg, err := get()
 		switch {
-		case err == nil:
-			fmt.Printf("  %-38s registrado\n", name)
 		case errors.Is(err, shared.ErrNotFound):
-			fmt.Printf("  %-38s NAO registrado\n", name)
-		default:
+			fmt.Printf("  %-38s %s\n", name, app.RegistrationHealthAbsent)
+		case err != nil:
 			fmt.Printf("  %-38s erro: %v\n", name, err)
+			unknown++
+		default:
+			health := app.ClassifyWebhookRegistration(ctx, refs, baseURL, tenantID, reg.WebhookURL)
+			fmt.Printf("  %-38s %s\n", name, health)
+			switch health {
+			case app.RegistrationHealthStale:
+				stale++
+			case app.RegistrationHealthUnknown:
+				unknown++
+			}
 		}
 	}
+	// Printed after every channel, because a single "obsoleta" buried in a six-line list is
+	// exactly what gets skimmed past.
+	defer func() {
+		switch {
+		case stale > 0:
+			fmt.Printf("\n  ATENCAO: %d canal(is) OBSOLETO(s) — o C6 tem uma URL cuja ref nao autentica mais.\n", stale)
+			fmt.Println("  Avisos por esses canais levam 401. Rode este comando sem --dry-run para reconvergir.")
+		case unknown > 0:
+			fmt.Printf("\n  ATENCAO: %d canal(is) INDETERMINADO(s) — o cofre de refs nao respondeu.\n", unknown)
+			fmt.Println("  Nao conclua nada: reconverger no escuro pode trocar a ref sem necessidade.")
+		}
+	}()
 	if chave != "" {
 		show("PIX imediato", func() (ports.WebhookRegistration, error) { return p.GetWebhook(ctx, tenantID, chave) })
 	}
