@@ -18,8 +18,29 @@
 # validates it (non-empty + ELF), then atomically installs + restarts.
 #
 # Allowed verbs:
-#   deploy     — read the binary from stdin, atomically install it, restart the service.
+#   deploy     — read the service binary from stdin, atomically install it, restart the unit.
 #   preflight  — read-only sanity check (paths/units present); installs nothing.
+#
+#   deploy-c6-webhook-sync, deploy-c6-webhook-probe, deploy-db-migrate,
+#   deploy-vault-reseal
+#              — read that OPERATOR TOOL from stdin and atomically install it.
+#                No restart, no sudo: these are one-shot commands an operator runs,
+#                not services.
+#
+# Why one literal verb per tool, instead of a single `deploy-tool <name>`:
+# this wrapper's invariant is that only the FIRST whitespace-delimited token is read and
+# NOTHING is taken from the caller (see the fixed paths below). A verb carrying a name
+# would mean reading caller input as part of a path, which is precisely the surface the
+# forced command exists to eliminate — even with an allow-list on the name. With one
+# literal verb per tool the verb is matched against fixed alternatives and the target
+# path is a script constant, so no new caller-controlled surface appears at all. The cost
+# is one case branch per tool, which is cheap and self-documenting.
+#
+# Why operator tools ship at all (SIN follow-up to the #54 incident): the CD used to
+# build ONLY cmd/api, so every other binary in /opt/payment/bin was hand-installed and
+# drifted. c6-webhook-sync sat 25 days stale, missing the boleto channels AND the
+# reachability report — and it is the tool an operator consults to decide whether
+# production is sane. A tool that silently ages into lying is worse than no tool.
 #
 # Least privilege: this script runs as the non-root `payment` user. The single
 # privileged action — restarting the unit — is granted by ONE NOPASSWD sudoers
@@ -31,7 +52,8 @@
 set -euo pipefail
 
 # Fixed, non-overridable paths. Nothing here is taken from the caller.
-readonly INCOMING="/opt/payment/incoming/payment-api"   # stdin upload scratch path
+readonly INCOMING_DIR="/opt/payment/incoming"           # stdin upload scratch dir
+readonly INCOMING="${INCOMING_DIR}/payment-api"         # stdin upload scratch path
 readonly BIN_DIR="/opt/payment/bin"
 readonly INSTALLED="${BIN_DIR}/payment-api"
 readonly UNIT="payment-api"
@@ -39,6 +61,47 @@ readonly SYSTEMCTL="/usr/bin/systemctl"
 
 log()  { printf '[payment-deploy] %s\n' "$*" >&2; }
 die()  { printf '[payment-deploy] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# receive_binary reads stdin into a staging path and validates it, or dies.
+# Shared by the service and the operator-tool branches so the "non-empty + ELF" gate
+# can never diverge between them.
+receive_binary() {
+  local incoming="$1"
+  install -d -m 0755 "$(dirname "${incoming}")"
+  cat > "${incoming}"
+  [ -s "${incoming}" ] || die "empty upload on stdin"
+  # It must be an executable ELF; reject anything that isn't a Linux binary so a bad
+  # upload can't be installed.
+  head -c 4 "${incoming}" | grep -q $'\x7fELF' || die "uploaded file is not an ELF binary"
+}
+
+# install_atomic moves a validated staging file over the live path atomically.
+# rename(2) is atomic, so a concurrent exec never sees a partial file, and any process
+# already running the previous binary keeps its open inode.
+install_atomic() {
+  local incoming="$1" installed="$2"
+  install -d -m 0755 "${BIN_DIR}"
+  chmod 0755 "${incoming}"
+  local tmp="${installed}.new.$$"
+  cp -f "${incoming}" "${tmp}"
+  chmod 0755 "${tmp}"
+  mv -f "${tmp}" "${installed}"
+  rm -f "${incoming}"
+}
+
+# install_tool receives and installs ONE operator tool. The name is a literal supplied
+# by a case branch below — never caller input — so the paths it builds are as fixed as
+# the service ones. No restart and no sudo: an operator tool is a command, not a unit,
+# so this path is strictly LESS privileged than `deploy`.
+install_tool() {
+  local name="$1"
+  local incoming="${INCOMING_DIR}/${name}"
+  local installed="${BIN_DIR}/${name}"
+  log "deploy-${name}: receiving operator tool on stdin → ${incoming}"
+  receive_binary "${incoming}"
+  install_atomic "${incoming}" "${installed}"
+  log "installed operator tool at ${installed} (no restart: not a service)"
+}
 
 # Resolve the requested verb. With an authorized_keys command= pin the real verb
 # is in SSH_ORIGINAL_COMMAND; fall back to $1 for local/manual invocation by the
@@ -54,32 +117,23 @@ case "${verb}" in
     # there is no scp. Capture it to the incoming scratch path first, then validate.
     # The incoming dir is provisioned by the bootstrap (see docs/deploy/staging.md).
     log "deploy: receiving binary on stdin → ${INCOMING}"
-    install -d -m 0755 "$(dirname "${INCOMING}")"
-    cat > "${INCOMING}"
-    [ -s "${INCOMING}" ] || die "empty upload on stdin"
-    # It must be an executable ELF; reject anything that isn't a Linux binary so a
-    # bad upload can't be installed and crash-loop the service.
-    head -c 4 "${INCOMING}" | grep -q $'\x7fELF' || die "uploaded file is not an ELF binary"
-
-    install -d -m 0755 "${BIN_DIR}"
-    chmod 0755 "${INCOMING}"
-    # Atomic install: write to a temp name on the SAME filesystem, then rename over
-    # the live path. rename(2) is atomic, so a concurrent exec never sees a partial
-    # file. The previous binary's open inode keeps running until systemd restarts.
-    tmp="${INSTALLED}.new.$$"
-    cp -f "${INCOMING}" "${tmp}"
-    chmod 0755 "${tmp}"
-    mv -f "${tmp}" "${INSTALLED}"
+    receive_binary "${INCOMING}"
+    # Atomic install, then restart. install_atomic also removes the staging file so a
+    # stale binary can't be reinstalled by a later bad invocation.
+    install_atomic "${INCOMING}" "${INSTALLED}"
     log "installed new binary at ${INSTALLED}"
 
     log "restarting ${UNIT} via scoped sudo"
     sudo -n "${SYSTEMCTL}" restart "${UNIT}" || die "systemctl restart ${UNIT} failed"
-
-    # Clean up the upload so a stale binary can't be reinstalled by a later bad
-    # invocation.
-    rm -f "${INCOMING}"
     log "deploy complete"
     ;;
+
+  # Operator tools. One literal verb each (see the header): the name passed to
+  # install_tool is a constant in THIS script, never caller input.
+  deploy-c6-webhook-sync)  install_tool "c6-webhook-sync" ;;
+  deploy-c6-webhook-probe) install_tool "c6-webhook-probe" ;;
+  deploy-db-migrate)       install_tool "db-migrate" ;;
+  deploy-vault-reseal)     install_tool "vault-reseal" ;;
 
   preflight)
     log "preflight: read-only checks"
@@ -92,6 +146,6 @@ case "${verb}" in
     ;;
 
   *)
-    die "refused: only 'deploy' (and 'preflight') are permitted, got '${verb:-<empty>}'"
+    die "refused: only 'deploy', 'preflight' and the deploy-<tool> verbs are permitted, got '${verb:-<empty>}'"
     ;;
 esac
