@@ -222,12 +222,31 @@ Emissão ponta a ponta pela nossa API: **HTTP 201**. O que isso fechou:
    log**, porque `writeDomainError` mapeia `ErrValidation` para uma mensagem genérica e não
    registra nada. O motivo fica invisível, exatamente o buraco do incidente do extrato
    (PR #49). Um CPF inválido custou uma ida ao banco e uma hora de diagnóstico que só a sonda
-   resolveu. **Vale registrar o `detail` do PSP em log** (não na resposta) nos erros do
-   adapter.
+   resolveu.
 
-2. **Não validamos dígito verificador de CPF/CNPJ**, só a largura (11 ou 14). Um CPF
-   sintaticamente correto mas inválido só é recusado pelo banco, como acima. Validar o DV
-   localmente transformaria um 422 opaco num erro de campo nomeado, de graça.
+   **Corrigido — mas não como eu havia proposto.** A recomendação original aqui era
+   registrar o `detail` do PSP em log. Ao implementar, ficou claro que era a decisão errada:
+   o `detail` é texto livre que o PSP compõe, e na superfície de boleto o request **é feito
+   de** dados pessoais do pagador (nome, CPF/CNPJ, endereço). Um `detail` que ecoe um valor
+   recusado colocaria PII no log justamente da superfície onde isso é menos aceitável
+   (ameaça C1/C4) — e a decisão de `errorEnvelope` de nunca ler `title`/`detail` estava
+   certa.
+
+   O que entrou: `mapError` passa a registrar em WARN (`c6.psp_rejected`) a operação, o
+   status, o código de máquina, os **nomes** dos campos recusados e o
+   **`correlation_id`** do PSP. O correlation id é o equivalente seguro — não carrega dado
+   nenhum e ainda assim deixa o suporte do C6 localizar a chamada exata. Para o texto livre,
+   a sonda continua sendo a porta sancionada, de uso pontual e por operador. Test-locked nas
+   duas direções: o correlation id aparece, o `detail` nunca.
+
+2. **Não validávamos dígito verificador de CPF/CNPJ**, só a largura (11 ou 14) — então um
+   CPF sintaticamente correto mas inválido só era recusado pelo banco, como acima.
+   **Corrigido:** `validTaxIDDigits` passa a conferir os dois dígitos por módulo 11 (CPF e
+   CNPJ têm pesos diferentes) e recusa dígitos repetidos, que satisfazem a aritmética mas não
+   são emissíveis. Um CPF errado volta agora como erro de campo nomeado, sem ida ao banco.
+
+   Isso tornou visível que as próprias fixtures de teste usavam o `12345678901` — o valor
+   que o banco recusa. Trocadas por um CPF com DV válido.
 
 #### Por que a liquidação NÃO foi medida
 
