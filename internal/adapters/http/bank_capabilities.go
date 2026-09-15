@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
+	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
 // bankCapabilitiesView tells an empresa-cliente which payment methods its OWN bank
@@ -18,6 +19,23 @@ type bankCapabilitiesView struct {
 	Configured bool `json:"configured"`
 	PIX        bool `json:"pix"`
 	Card       bool `json:"card"`
+	// Boleto and Bolepix are nullable on purpose: null means "ainda não sabemos", which is
+	// NOT the same as false ("a conta não pode"). The C6 scope name for bank-slip writes
+	// has not been observed on a granted token yet, so reporting false would state
+	// something about the empresa's account that we never checked. A screen can render
+	// null as "não verificado" and offer to check, which false would never prompt.
+	Boleto  *bool `json:"boleto"`
+	Bolepix *bool `json:"bolepix"`
+}
+
+// capabilityFlag renders a tri-state capability as a nullable JSON boolean: nil when the
+// answer is genuinely unknown, otherwise the decision itself.
+func capabilityFlag(c ports.Capability) *bool {
+	if !c.Known() {
+		return nil
+	}
+	allowed := c.Allowed()
+	return &allowed
 }
 
 // handleTenantBankCapabilities answers GET /v1/bank-capabilities for the authenticated
@@ -56,5 +74,7 @@ func (s *Server) handleTenantBankCapabilities(w http.ResponseWriter, r *http.Req
 		Configured: true,
 		PIX:        caps.PIX,
 		Card:       caps.Card,
+		Boleto:     capabilityFlag(caps.Boleto),
+		Bolepix:    capabilityFlag(caps.Bolepix),
 	})
 }

@@ -111,6 +111,9 @@ type RegisterBoletoInput struct {
 	// the Boleto aggregate.
 	Description    string
 	IdempotencyKey string
+	// Modality selects plain boleto vs BolePix (boleto + PIX QR on the same charge).
+	// Empty means plain boleto — the default promises the least.
+	Modality ports.BoletoModality
 }
 
 // RegisterBoleto registers a boleto at the bank and records the billable event,
@@ -131,6 +134,9 @@ func (s *BoletoService) RegisterBoleto(ctx context.Context, in RegisterBoletoInp
 	}
 	if err := validateBoletoPayer(in.Payer); err != nil {
 		return nil, ports.BoletoResult{}, err
+	}
+	if !in.Modality.Valid() {
+		return nil, ports.BoletoResult{}, shared.NewValidationError("payment_method", "payment method must be boleto or bolepix")
 	}
 
 	principal, err := shared.NewMoney(in.AmountCents, in.Currency)
@@ -165,7 +171,7 @@ func (s *BoletoService) RegisterBoleto(ctx context.Context, in RegisterBoletoInp
 		return nil, ports.BoletoResult{}, err
 	}
 
-	res, err := s.boleto.CreateBoleto(ctx, in.TenantID, toBoletoRequest(b, in.Payer, in.Description, in.IdempotencyKey))
+	res, err := s.boleto.CreateBoleto(ctx, in.TenantID, toBoletoRequest(b, in.Payer, in.Description, in.IdempotencyKey, in.Modality))
 	if err != nil {
 		return nil, ports.BoletoResult{}, fmt.Errorf("bank create boleto: %w", err)
 	}
@@ -233,27 +239,47 @@ func (s *BoletoService) CancelBoleto(ctx context.Context, tenantID, boletoID str
 	return err
 }
 
-// UpdateBoletoInput is the validated boundary input for amending a boleto (roteiro
-// grupo 5): due date (5.a), validity (5.b), amount/fine/interest (5.c). It mirrors
-// the registration fields minus the payer (the payer is not amended here).
+// UpdateBoletoInput is the boundary input for amending a registered boleto (roteiro
+// grupo 5): due date (5.a), validity (5.b), amount/fine/interest (5.c).
+//
+// Every amendable field is a POINTER because the amendment is partial and the difference
+// between "leave this alone" and "set it to zero" is money: a plain zero AmountCents meant
+// as "unchanged" would make the charge free, and a zero FineBps would silently drop a
+// late-payment fine. The payer is not amendable here.
 type UpdateBoletoInput struct {
-	TenantID           string
-	AmountCents        int64
+	TenantID    string
+	AmountCents *int64
+	// Currency is required whenever AmountCents is set: money is validated in the domain
+	// core, and the core has no currency-less Money.
 	Currency           string
-	DueDate            time.Time
-	ValidUntil         time.Time
-	FineBps            int64
-	FineFixedCents     int64
-	MonthlyInterestBps int64
-	Discounts          []DiscountTierInput
-	IdempotencyKey     string
+	DueDate            *time.Time
+	ValidUntil         *time.Time
+	FineBps            *int64
+	FineFixedCents     *int64
+	MonthlyInterestBps *int64
+	// Discounts replaces the whole discount schedule when non-nil (the bank replaces the
+	// fee object wholesale rather than merging into it).
+	Discounts      []DiscountTierInput
+	IdempotencyKey string
 }
 
-// UpdateBoleto amends a registered boleto's parameters for the authenticated tenant
-// (roteiro grupo 5). Like the register path, the full new parameter set is validated
-// in the core before it reaches the bank; the amendment is idempotent on the
-// forwarded key. It does not bill again (the boleto was billed at registration). An
-// unknown id surfaces as not-found (tenant-scoped: no cross-tenant amend).
+// touchesFees reports whether the amendment changes any fee parameter, which is what
+// decides whether the fee object is sent at all.
+func (in UpdateBoletoInput) touchesFees() bool {
+	return in.FineBps != nil || in.FineFixedCents != nil ||
+		in.MonthlyInterestBps != nil || in.Discounts != nil
+}
+
+// UpdateBoleto amends a registered boleto for the authenticated tenant (roteiro grupo 5).
+// It does not bill again (the boleto was billed at registration). An unknown id surfaces
+// as not-found (tenant-scoped: no cross-tenant amend).
+//
+// It reads the registered state first and validates the MERGED result in the domain core
+// before sending. That read is what keeps the service's original invariant — the whole
+// parameter set is validated before it reaches the bank — true under a partial patch: a
+// fine rate is only over the legal cap relative to the amount it applies to, so the fields
+// the caller left alone still have to take part in the check. The bank's own 200 carries
+// the authoritative post-state, which is what is returned.
 func (s *BoletoService) UpdateBoleto(ctx context.Context, tenantID, boletoID string, in UpdateBoletoInput) (ports.BoletoResult, error) {
 	boletoID = strings.TrimSpace(boletoID)
 	if boletoID == "" {
@@ -262,19 +288,136 @@ func (s *BoletoService) UpdateBoleto(ctx context.Context, tenantID, boletoID str
 	if in.IdempotencyKey == "" {
 		return ports.BoletoResult{}, shared.NewValidationError("idempotency_key", "idempotency key is required")
 	}
-	principal, err := shared.NewMoney(in.AmountCents, in.Currency)
+
+	current, err := s.boleto.GetBoleto(ctx, tenantID, boletoID)
 	if err != nil {
 		return ports.BoletoResult{}, err
 	}
-	tiers, err := buildDiscountTiers(in.Discounts)
+	merged, err := mergeBoletoPatch(boletoID, tenantID, current, in)
 	if err != nil {
 		return ports.BoletoResult{}, err
 	}
-	b, err := buildBoleto(boletoID, tenantID, principal, in.DueDate, in.ValidUntil, in.FineBps, in.FineFixedCents, in.MonthlyInterestBps, tiers)
-	if err != nil {
+	// Validated as a whole in the core: caps on fine and mora, discount ordering, due date.
+	if _, err := buildBoleto(boletoID, tenantID, merged.principal, merged.dueDate, merged.validUntil,
+		merged.fineBps, merged.fineFixedCents, merged.monthlyInterestBps, merged.tiers); err != nil {
 		return ports.BoletoResult{}, err
 	}
-	return s.boleto.UpdateBoleto(ctx, tenantID, boletoID, toBoletoRequest(b, BoletoPayerInput{}, "", in.IdempotencyKey))
+	return s.boleto.UpdateBoleto(ctx, tenantID, boletoID, toBoletoPatch(in, merged))
+}
+
+// mergedBoleto is the registered state with the amendment applied, ready to be validated
+// by the domain core as one coherent boleto.
+type mergedBoleto struct {
+	principal          shared.Money
+	dueDate            time.Time
+	validUntil         time.Time
+	fineBps            int64
+	fineFixedCents     int64
+	monthlyInterestBps int64
+	tiers              []boleto.DiscountTier
+}
+
+// mergeBoletoPatch overlays the amendment onto what the bank currently holds.
+func mergeBoletoPatch(boletoID, tenantID string, current ports.BoletoResult, in UpdateBoletoInput) (mergedBoleto, error) {
+	m := mergedBoleto{
+		dueDate:            current.DueDate,
+		validUntil:         current.ValidUntil,
+		fineBps:            current.FineBps,
+		fineFixedCents:     current.FineFixedCents,
+		monthlyInterestBps: current.MonthlyInterestBps,
+	}
+
+	amountCents, currency := current.AmountCents, strings.TrimSpace(in.Currency)
+	if in.AmountCents != nil {
+		amountCents = *in.AmountCents
+		if currency == "" {
+			return m, shared.NewValidationError("currency", "currency is required when amending the amount")
+		}
+	}
+	if currency == "" {
+		// The port carries no currency on a read, so an amendment that leaves the amount
+		// alone inherits the only currency this system issues boletos in.
+		currency = defaultBoletoCurrency
+	}
+	principal, err := shared.NewMoney(amountCents, currency)
+	if err != nil {
+		return m, err
+	}
+	m.principal = principal
+
+	if in.DueDate != nil {
+		m.dueDate = *in.DueDate
+	}
+	if in.ValidUntil != nil {
+		m.validUntil = *in.ValidUntil
+	}
+	if in.FineBps != nil {
+		m.fineBps = *in.FineBps
+	}
+	if in.FineFixedCents != nil {
+		m.fineFixedCents = *in.FineFixedCents
+	}
+	if in.MonthlyInterestBps != nil {
+		m.monthlyInterestBps = *in.MonthlyInterestBps
+	}
+
+	if in.Discounts != nil {
+		tiers, err := buildDiscountTiers(in.Discounts)
+		if err != nil {
+			return m, err
+		}
+		m.tiers = tiers
+	} else {
+		tiers := make([]boleto.DiscountTier, len(current.Discounts))
+		for i, d := range current.Discounts {
+			tiers[i] = boleto.DiscountTier{DaysBeforeDue: d.DaysBeforeDue, Bps: d.Bps, FixedCents: d.FixedCents}
+		}
+		m.tiers = tiers
+	}
+	return m, nil
+}
+
+// defaultBoletoCurrency is the only currency a Brazilian boleto is issued in; it fills in
+// for an amendment that does not touch the amount, since a bank read carries no currency.
+const defaultBoletoCurrency = "BRL"
+
+// toBoletoPatch maps the amendment onto the port's partial patch. Only fields the caller
+// actually set are carried, so the adapter can omit the rest from the wire.
+func toBoletoPatch(in UpdateBoletoInput, merged mergedBoleto) ports.BoletoPatch {
+	patch := ports.BoletoPatch{
+		AmountCents:    in.AmountCents,
+		DueDate:        in.DueDate,
+		ValidUntil:     in.ValidUntil,
+		IdempotencyKey: in.IdempotencyKey,
+	}
+	// The bank replaces the fee object wholesale, so touching any fee means restating all
+	// of them — from the merged view, which already carries the registered values for the
+	// ones the caller left alone.
+	if in.touchesFees() {
+		tiers := make([]ports.BoletoDiscountTier, len(merged.tiers))
+		for i, d := range merged.tiers {
+			tiers[i] = ports.BoletoDiscountTier{DaysBeforeDue: d.DaysBeforeDue, Bps: d.Bps, FixedCents: d.FixedCents}
+		}
+		patch.Fees = &ports.BoletoFeesPatch{
+			FineBps:            merged.fineBps,
+			FineFixedCents:     merged.fineFixedCents,
+			MonthlyInterestBps: merged.monthlyInterestBps,
+			Discounts:          tiers,
+		}
+	}
+	return patch
+}
+
+// GetBoletoPDF downloads a registered boleto as a printable document for the authenticated
+// tenant. It does NOT bill: the boleto was billed at registration, and this is a read of an
+// existing charge, same posture as GetBoleto and CancelBoleto. An unknown id surfaces as
+// not-found (tenant-scoped: no cross-tenant download, no existence oracle).
+func (s *BoletoService) GetBoletoPDF(ctx context.Context, tenantID, boletoID string) (ports.BoletoDocument, error) {
+	boletoID = strings.TrimSpace(boletoID)
+	if boletoID == "" {
+		return ports.BoletoDocument{}, shared.NewValidationError("id", "boleto id is required")
+	}
+	return s.boleto.GetBoletoPDF(ctx, tenantID, boletoID)
 }
 
 // reservePayment returns the payment to bill for this boleto: an existing one for the
@@ -380,7 +523,7 @@ func buildDiscountTiers(in []DiscountTierInput) ([]boleto.DiscountTier, error) {
 // toBoletoRequest maps a validated domain boleto to the PSP port request. The boleto
 // id is taken from the domain object (b.ID()); payer/idemKey are supplied by the
 // caller (register carries a payer; amend passes the zero payer).
-func toBoletoRequest(b boleto.Boleto, payer BoletoPayerInput, description, idemKey string) ports.BoletoRequest {
+func toBoletoRequest(b boleto.Boleto, payer BoletoPayerInput, description, idemKey string, modality ports.BoletoModality) ports.BoletoRequest {
 	domainTiers := b.Discounts()
 	tiers := make([]ports.BoletoDiscountTier, len(domainTiers))
 	for i, d := range domainTiers {
@@ -400,6 +543,7 @@ func toBoletoRequest(b boleto.Boleto, payer BoletoPayerInput, description, idemK
 		Payer:              toPortBoletoPayer(payer),
 		Description:        strings.TrimSpace(description),
 		IdempotencyKey:     idemKey,
+		Modality:           modality,
 	}
 }
 

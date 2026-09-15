@@ -29,6 +29,14 @@ const systemOperatorWebhook = "system:c6-webhook"
 type WebhookService struct {
 	bank     ports.BankProvider
 	checkout ports.CheckoutReconciler
+	// boleto reconciles a registered boleto before a BANK_SLIP/BANK_SLIP_PIX notification
+	// is acted on. Nil leaves the boleto dispatch unwired and HandleBoletoEvent fails
+	// closed rather than dropping a settlement notification.
+	boleto ports.BoletoProvider
+	// payments resolves the local row from the id a notification carries, BEFORE the
+	// transactional unit of work. It is a read of our own store, so it costs nothing and
+	// spends no billed PSP call on a duplicate delivery.
+	payments ports.PaymentRepository
 	bus      ports.MessageBus
 	clock    ports.Clock
 	uow      ports.UnitOfWork
@@ -58,6 +66,8 @@ func NewWebhookService(d Deps) *WebhookService {
 	return &WebhookService{
 		bank:       d.Bank,
 		checkout:   d.Checkout,
+		boleto:     d.Boleto,
+		payments:   d.Payments,
 		bus:        d.Bus,
 		clock:      d.Clock,
 		uow:        resolveUoW(d),
@@ -268,11 +278,19 @@ func (s *WebhookService) settle(ctx context.Context, ev PaymentEvent, reconcile 
 			return nil
 		}
 
-		p, err := r.FindPaymentByTxID(ctx, ev.TenantID, ev.TxID)
+		// The reconcile step may know the local row is keyed by a different id than the
+		// one the PSP sent — the boleto rail has three identifiers in play and the
+		// notification may carry either of two. Empty means "the event's tx id", which is
+		// the PIX and checkout behaviour, unchanged.
+		settlementKey := res.SettlementKey
+		if settlementKey == "" {
+			settlementKey = ev.TxID
+		}
+		p, err := r.FindPaymentByTxID(ctx, ev.TenantID, settlementKey)
 		if err != nil {
 			return fmt.Errorf("find payment by tx: %w", err)
 		}
-		if err := p.MarkPaid(ev.TxID, s.clock.Now()); err != nil {
+		if err := p.MarkPaid(settlementKey, s.clock.Now()); err != nil {
 			if errors.Is(err, shared.ErrConflict) {
 				return nil // already settled with a different txid: ignore on replay
 			}

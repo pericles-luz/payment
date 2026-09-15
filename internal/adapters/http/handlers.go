@@ -292,13 +292,30 @@ func (s *Server) handleSetBankCertificate(w http.ResponseWriter, r *http.Request
 // notification is a few hundred bytes — 64 KiB is generous. Oversize → 413.
 const maxWebhookBytes = 64 << 10
 
-// Service discriminators that change how a notification is routed. BANK_SLIP and
-// BANK_SLIP_PIX need no constant: they reconcile as ordinary charges, which is the
-// default branch. PIX is the odd one — same channel, different envelope entirely (see
-// c6WebhookNotification).
+// Service discriminators that change how a notification is routed.
+//
+// BANK_SLIP and BANK_SLIP_PIX used to have no constants here, on the reasoning that they
+// "reconcile as ordinary charges, which is the default branch". That was wrong in a way
+// that cost every boleto settlement: the default branch reconciles through the PIX
+// immediate-charge read, and a bank-slip id is not a PIX cob txid, so the read 404s and the
+// charge stays pending forever.
 const (
 	webhookServicePix      = "pix"
 	webhookServiceCheckout = "checkout"
+	// The two proprietary boleto services. A charge issued as BolePix is payable by EITHER
+	// rail, so the same charge can notify under either discriminator.
+	webhookServiceBankSlip    = "bank_slip"
+	webhookServiceBankSlipPix = "bank_slip_pix"
+
+	// webhookLabelBoleto is the event-key label BOTH boleto services share.
+	//
+	// The key is objectID|label|status, so giving the two services distinct labels would
+	// let one charge settle twice — once per rail — and publish two payment.paid events
+	// and two outbound webhooks to the Conta. A BolePix can only actually be paid once
+	// (the bank closes the other rail), so the two notifications are the SAME settlement
+	// and must collide. Which rail paid belongs in the log and in the settlement message,
+	// not in the deduplication key.
+	webhookLabelBoleto = "boleto"
 
 	// Labels for the two recurrence streams, used in the event key.
 	webhookLabelRec  = "rec"
@@ -398,6 +415,7 @@ const (
 	webhookKindCheckout
 	webhookKindRec
 	webhookKindCobR
+	webhookKindBoleto
 )
 
 // resolveWebhook classifies an inbound notification and extracts its reconcile id.
@@ -407,6 +425,18 @@ const (
 // than reconciling against an empty id.
 func resolveWebhook(note c6WebhookNotification) (kind webhookKind, id, label string, ok bool) {
 	switch {
+	// Boleto comes FIRST, ahead of the PIX case below, and the order is load-bearing.
+	//
+	// That case fires on `len(note.Pix) > 0` alone, because the real BACEN webhook carries
+	// no discriminator. But a BolePix QR is generated from the tenant's registered PIX key
+	// — the same key the BACEN webhook is registered against — so a BolePix paid by QR may
+	// well arrive carrying a pix array. Resolved there, it would be reconciled against
+	// GET /v2/pix/cob/{txid}, which knows nothing about a bank slip: 404, and a paid charge
+	// that never settles. An explicit, documented service discriminator outranks a
+	// heuristic.
+	case strings.EqualFold(note.Service, webhookServiceBankSlip),
+		strings.EqualFold(note.Service, webhookServiceBankSlipPix):
+		return webhookKindBoleto, note.ExternalID, webhookLabelBoleto, note.ExternalID != ""
 	// A top-level `pix` array identifies a PIX settlement on its own, with or without a
 	// `service` field. The BACEN webhook C6 actually sends carries NO discriminator at
 	// all — the live body is exactly {"pix":[{endToEndId, valor, chave, horario, txid}]}
@@ -449,7 +479,8 @@ func resolveWebhook(note c6WebhookNotification) (kind webhookKind, id, label str
 	case strings.EqualFold(note.Service, webhookServiceCheckout):
 		return webhookKindCheckout, note.ExternalID, webhookServiceCheckout, note.ExternalID != ""
 	case note.ExternalID != "":
-		// BANK_SLIP / BANK_SLIP_PIX and anything else identified by external_id.
+		// Anything else identified by external_id. BANK_SLIP / BANK_SLIP_PIX no longer
+		// reach here: they are resolved explicitly at the top of this switch.
 		return webhookKindPayment, note.ExternalID, strings.ToLower(note.Service), true
 	}
 	return 0, "", "", false
@@ -580,6 +611,11 @@ func (s *Server) handleC6Webhook(w http.ResponseWriter, r *http.Request) {
 	case webhookKindCobR:
 		err = s.webhooks.HandleCobREvent(r.Context(), app.CobREvent{
 			TenantID: id.TenantID, TxID: objectID, EventKey: eventKey,
+		})
+	case webhookKindBoleto:
+		err = s.webhooks.HandleBoletoEvent(r.Context(), app.PaymentEvent{
+			TenantID: id.TenantID, TxID: objectID, EventKey: eventKey,
+			ClaimsSettlement: claimsSettlement,
 		})
 	default:
 		err = s.webhooks.HandlePaymentEvent(r.Context(), app.PaymentEvent{

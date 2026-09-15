@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank"
 	httpadapter "github.com/ia-dev-sindireceita/payment/internal/adapters/http"
@@ -70,9 +71,14 @@ func newFixtureAuth(t *testing.T, adminTokens []string) *fixture {
 		Processed:   store,
 		Bus:         bus,
 		Bank:        stub,
+		Boleto:      stub,
 		Credentials: creds,
-		Clock:       system.Clock{},
-		IDs:         system.IDProvider{},
+		// The real transactional boundary. Without it these fixtures fell back to the
+		// autocommit unit of work, so a rolled-back settlement still left its anti-replay
+		// mark behind — the very behaviour the settlement tests mean to exercise.
+		UoW:   store,
+		Clock: system.Clock{},
+		IDs:   system.IDProvider{},
 	}
 	admin := app.NewAdminService(deps)
 	tn, err := admin.CreateTenant(context.Background(), "Acme")
@@ -92,6 +98,7 @@ func newFixtureAuth(t *testing.T, adminTokens []string) *fixture {
 	auth := httpadapter.NewStaticTokenAuth(map[string]string{tenantToken: tn.ID()}, adminTokens, webhookRefs)
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:     app.NewChargeService(deps),
+		Boleto:      app.NewBoletoService(deps),
 		Admin:       admin,
 		Webhooks:    app.NewWebhookService(deps),
 		TenantAuth:  auth,
@@ -278,6 +285,38 @@ func seedCharge(t *testing.T, f *fixture) (id, txID string) {
 		t.Fatalf("seed charge: empty ids (code %d body %s)", rec.Code, rec.Body.String())
 	}
 	return pv.ID, pv.TxID
+}
+
+// seedBoleto registers a real boleto through the API and returns its id and the bank tx id
+// the notification will carry. A BANK_SLIP notification is only meaningful for a charge
+// that IS a boleto — before the boleto rail existed, these tests notified BANK_SLIP over a
+// PIX charge and passed only because the receiver reconciled everything through the PIX
+// reader.
+func seedBoleto(t *testing.T, f *fixture, idemKey string) (boletoID, txID string) {
+	t.Helper()
+	body := map[string]any{
+		"amount_cents":   2500,
+		"currency":       "BRL",
+		"due_date":       time.Now().Add(240 * time.Hour).UTC().Format(time.RFC3339),
+		"payment_method": "bolepix",
+		"description":    "Mensalidade",
+	}
+	rec := do(t, f.handler, http.MethodPost, "/v1/boletos", tenantToken,
+		map[string]string{"Idempotency-Key": idemKey}, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("seed boleto: status %d body %s", rec.Code, rec.Body.String())
+	}
+	var bv struct {
+		BoletoID string `json:"boleto_id"`
+		TxID     string `json:"txid"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &bv); err != nil {
+		t.Fatalf("seed boleto decode: %v", err)
+	}
+	if bv.BoletoID == "" || bv.TxID == "" {
+		t.Fatalf("seed boleto: empty ids (%s)", rec.Body.String())
+	}
+	return bv.BoletoID, bv.TxID
 }
 
 func TestWebhookFlow(t *testing.T) {

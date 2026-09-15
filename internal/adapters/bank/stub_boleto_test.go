@@ -106,9 +106,12 @@ func TestStubUpdateBoleto(t *testing.T) {
 
 	newDue := due.Add(48 * time.Hour)
 	validUntil := newDue.Add(120 * time.Hour)
-	res, err := s.UpdateBoleto(ctx, "t1", "bol_1", ports.BoletoRequest{
-		TenantID: "t1", BoletoID: "bol_1", AmountCents: 90000, Currency: "BRL",
-		DueDate: newDue, ValidUntil: validUntil, FineBps: 150, MonthlyInterestBps: 50,
+	amount := int64(90000)
+	res, err := s.UpdateBoleto(ctx, "t1", "bol_1", ports.BoletoPatch{
+		AmountCents: &amount,
+		DueDate:     &newDue,
+		ValidUntil:  &validUntil,
+		Fees:        &ports.BoletoFeesPatch{FineBps: 150, MonthlyInterestBps: 50},
 	})
 	if err != nil {
 		t.Fatalf("UpdateBoleto: %v", err)
@@ -121,10 +124,24 @@ func TestStubUpdateBoleto(t *testing.T) {
 	if got.TxID != "tx_bol_1" || got.AmountCents != 90000 {
 		t.Fatalf("get after update: %+v", got)
 	}
-	if _, err := s.UpdateBoleto(ctx, "t1", "nope", ports.BoletoRequest{TenantID: "t1", BoletoID: "nope"}); !errors.Is(err, shared.ErrNotFound) {
+
+	// A field the patch leaves nil must be untouched, not zeroed — the distinction the
+	// pointer type exists to preserve.
+	onlyAmount := int64(80000)
+	kept, err := s.UpdateBoleto(ctx, "t1", "bol_1", ports.BoletoPatch{AmountCents: &onlyAmount})
+	if err != nil {
+		t.Fatalf("UpdateBoleto partial: %v", err)
+	}
+	if kept.AmountCents != 80000 {
+		t.Fatalf("amount not amended: %+v", kept)
+	}
+	if kept.FineBps != 150 || !kept.DueDate.Equal(newDue) {
+		t.Fatalf("untouched fields must survive a partial patch: %+v", kept)
+	}
+	if _, err := s.UpdateBoleto(ctx, "t1", "nope", ports.BoletoPatch{}); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("unknown update: want ErrNotFound, got %v", err)
 	}
-	if _, err := s.UpdateBoleto(ctx, "other", "bol_1", ports.BoletoRequest{TenantID: "other", BoletoID: "bol_1"}); !errors.Is(err, shared.ErrNotFound) {
+	if _, err := s.UpdateBoleto(ctx, "other", "bol_1", ports.BoletoPatch{}); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("cross-tenant update: want ErrNotFound, got %v", err)
 	}
 }

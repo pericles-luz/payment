@@ -31,12 +31,16 @@ func fullBoletoPayer() ports.BoletoPayer {
 	}
 }
 
-// externalRefPattern is the exact format the C6 bank_slips contract requires for
-// external_reference_id (ADR-0005).
-var externalRefPattern = regexp.MustCompile(`^[a-zA-Z0-9]{1,10}$`)
+// externalRefPattern is the exact format the C6 Bolepix contract requires for
+// external_reference_id: EXACTLY 26 uppercase alphanumerics, minLength == maxLength == 26
+// (docs/compliance/c6-bolepix-oas.yaml, OAS 1.1.0). This is NOT a maximum — 25 and 27 are
+// both rejected. The `^[a-zA-Z0-9]{1,10}$` this pinned until now is the LEGACY v1 boleto
+// API's pattern, and the adapter posts to v2, so every registration would have been
+// refused by the bank.
+var externalRefPattern = regexp.MustCompile(`^[A-Z0-9]{26}$`)
 
 // roteiro grupos 1–3 (ADR-0005): CreateBoleto must serialize the real C6 bank_slips
-// contract — amount, due_date (yyyy-MM-dd), external_reference_id (^[a-zA-Z0-9]{1,10}$),
+// contract — amount, due_date (yyyy-MM-dd), external_reference_id (^[A-Z0-9]{26}$),
 // and the nested payer{name,tax_id,address{...}} — to POST /v1/bank_slips, NOT the
 // previous invented /boletos body.
 func TestCreateBoletoBankSlipsBody(t *testing.T) {
@@ -57,6 +61,9 @@ func TestCreateBoletoBankSlipsBody(t *testing.T) {
 		FineBps: 200, MonthlyInterestBps: 100,
 		Payer:       fullBoletoPayer(),
 		Description: "Compra de produto X",
+		// This test pins the BolePix shape, so it asks for BolePix. The pix sub-object now
+		// follows the caller's choice, not merely the presence of a key.
+		Modality: ports.ModalityBolepix,
 	}); err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
 	}
@@ -179,16 +186,22 @@ func TestCreateBoleto201Mapped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateBoleto: %v", err)
 	}
-	if res.BoletoID != "01KW0CY8QNAQK50SJ2ESDG5YFP" {
-		t.Fatalf("BoletoID: want C6 id, got %q", res.BoletoID)
+	// BoletoID must come back as OUR id, never the bank's. Every later operation is
+	// addressed by it and derives external_reference_id FROM it, so handing back the C6 id
+	// makes every subsequent read, PDF, amendment and cancellation 404.
+	if res.BoletoID != "bol_9" {
+		t.Fatalf("BoletoID: want the local id, got %q", res.BoletoID)
 	}
 	// CRITICAL (billing-finalized invariant): id must map to TxID, never empty — an empty
 	// TxID lets a retry/concurrent registration re-bill (duplicate ledger entry).
 	if res.TxID == "" {
 		t.Fatalf("TxID must be non-empty (id), else double-bill: %+v", res)
 	}
-	if res.TxID != res.BoletoID {
-		t.Fatalf("TxID must equal the C6 id (%q), got %q", res.BoletoID, res.TxID)
+	if res.TxID != "01KW0CY8QNAQK50SJ2ESDG5YFP" {
+		t.Fatalf("TxID must be the C6 id, got %q", res.TxID)
+	}
+	if res.ExternalReferenceID != "ref1" {
+		t.Fatalf("external_reference_id must be echoed onto the result, got %q", res.ExternalReferenceID)
 	}
 	if res.OurNumber != "10233820" {
 		t.Fatalf("OurNumber: want 10233820, got %q", res.OurNumber)
@@ -270,10 +283,12 @@ func TestCreateBoletoRequiresFullPayer(t *testing.T) {
 }
 
 // external_reference_id is a deterministic, idempotent function of the boleto id so a
-// retried registration yields the same reference and C6 collapses the retry.
+// retried registration yields the same reference and C6 collapses the retry — the contract
+// states a duplicate reference "retornará os dados da cobrança já existente", which is the
+// retry-collapse we rely on, and it only holds if the derivation never varies.
 func TestExternalReferenceID(t *testing.T) {
 	t.Parallel()
-	const id = "11111111-2222-3333-4444-555555555555"
+	const id = "11111111222233334444555555555555"
 	a := externalReferenceID(id)
 	b := externalReferenceID(id)
 	if a != b {
@@ -282,8 +297,68 @@ func TestExternalReferenceID(t *testing.T) {
 	if !externalRefPattern.MatchString(a) {
 		t.Fatalf("ref %q must match %s", a, externalRefPattern)
 	}
-	if other := externalReferenceID("99999999-8888-7777-6666-555555555555"); other == a {
+	if other := externalReferenceID("99999999888877776666555555555555"); other == a {
 		t.Fatalf("distinct ids should (almost surely) differ: both %q", a)
+	}
+}
+
+// The derivation is a BIJECTION, not a digest: a local boleto id is 16 random bytes in hex
+// (system.IDProvider.NewID) and 26 Crockford base32 symbols carry 130 bits, so the id
+// survives the round trip whole. That is what lets an inbound settlement notification
+// carrying the reference be resolved back to the boleto without a lookup table, and what
+// makes collisions impossible rather than merely improbable.
+func TestExternalReferenceIDRoundTrips(t *testing.T) {
+	t.Parallel()
+	for _, id := range []string{
+		"3f2a9c1d7e4b48a0b5c6d7e8f9a0b1c2",
+		"00000000000000000000000000000000", // all-zero: leading zeros must survive
+		"ffffffffffffffffffffffffffffffff", // all-ones: must not overflow 26 symbols
+		"0000000000000000000000000000000f",
+	} {
+		ref := externalReferenceID(id)
+		if !externalRefPattern.MatchString(ref) {
+			t.Fatalf("ref %q for id %q must match %s", ref, id, externalRefPattern)
+		}
+		back, ok := boletoIDFromExternalReference(ref)
+		if !ok || back != id {
+			t.Fatalf("round trip failed for %q: ref=%q back=%q ok=%v", id, ref, back, ok)
+		}
+	}
+}
+
+// A golden vector: the derivation is part of the wire contract in the sense that the
+// reference is the ONLY key C6 exposes for reading, amending, cancelling and downloading a
+// registered charge. Changing it silently would orphan every boleto already registered —
+// there is no read-by-id endpoint to recover them with. This vector makes such a change
+// fail loudly instead.
+func TestExternalReferenceIDGoldenVector(t *testing.T) {
+	t.Parallel()
+	const (
+		id   = "3f2a9c1d7e4b48a0b5c6d7e8f9a0b1c2"
+		want = "1Z5AE1TZJB92GBBHPQX3WT1CE2"
+	)
+	if got := externalReferenceID(id); got != want {
+		t.Fatalf("derivation changed: got %q, want %q — this orphans every registered boleto", got, want)
+	}
+}
+
+// A reference that is not one of ours must be rejected rather than decoded into a
+// plausible-looking id. Shape alone cannot distinguish them (C6's own charge id is also 26
+// chars of [A-Z0-9]), so callers must confirm a decode against the store; these are the
+// cases the decoder can reject on its own.
+func TestBoletoIDFromExternalReferenceRejectsMalformed(t *testing.T) {
+	t.Parallel()
+	for _, ref := range []string{
+		"",
+		"TOOSHORT",
+		"1Z5AE1TZJB92GBBHPQX3WT1CE",   // 25 symbols
+		"1Z5AE1TZJB92GBBHPQX3WT1CE22", // 27 symbols
+		"1Z5AE1TZJB92GBBHPQX3WT1CEU",  // U is not in the Crockford alphabet
+		"1z5ae1tzjb92gbbhpqx3wt1ce2",  // lowercase is outside the contract charset
+	} {
+		if got, ok := boletoIDFromExternalReference(ref); ok {
+			t.Fatalf("ref %q must not decode, got %q", ref, got)
+		}
 	}
 }
 

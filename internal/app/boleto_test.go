@@ -45,6 +45,9 @@ func baseBoletoInput(tenantID, idemKey string) app.RegisterBoletoInput {
 		FineBps:            200,
 		MonthlyInterestBps: 100,
 		IdempotencyKey:     idemKey,
+		// The roteiro's grupos 1–3 are the BolePix product, so the fixture asks for it
+		// explicitly. The modality is no longer implied by the tenant having a PIX key.
+		Modality: ports.ModalityBolepix,
 	}
 }
 
@@ -94,6 +97,9 @@ func TestRegisterBoletoVariants(t *testing.T) {
 			}
 			if res.BoletoID != p.ID() || res.Status != "REGISTERED" || res.QRCode == "" || res.Barcode == "" {
 				t.Fatalf("unexpected result: %+v", res)
+			}
+			if res.Modality != ports.ModalityBolepix {
+				t.Fatalf("modality must be echoed back as issued: %+v", res)
 			}
 			if h.store.LedgerLen() != 1 {
 				t.Fatalf("expected 1 ledger entry, got %d", h.store.LedgerLen())
@@ -309,14 +315,18 @@ func TestGetBoletoValidationAndNotFound(t *testing.T) {
 	}
 }
 
+// ptr is the pointer helper the partial-amendment input needs: every amendable field is a
+// pointer so "leave alone" and "set to zero" stay distinguishable.
+func ptr[T any](v T) *T { return &v }
+
 func baseUpdateInput(tenantID, idemKey string) app.UpdateBoletoInput {
 	return app.UpdateBoletoInput{
 		TenantID:           tenantID,
-		AmountCents:        90000,
+		AmountCents:        ptr(int64(90000)),
 		Currency:           "BRL",
-		DueDate:            boletoDueDate,
-		FineBps:            150,
-		MonthlyInterestBps: 50,
+		DueDate:            ptr(boletoDueDate),
+		FineBps:            ptr(int64(150)),
+		MonthlyInterestBps: ptr(int64(50)),
 		IdempotencyKey:     idemKey,
 	}
 }
@@ -372,23 +382,23 @@ func TestUpdateBoletoVariants(t *testing.T) {
 		mut    func(*app.UpdateBoletoInput)
 		verify func(*testing.T, ports.BoletoResult)
 	}{
-		{"5a_due_date", func(in *app.UpdateBoletoInput) { in.DueDate = boletoDueDate.Add(72 * time.Hour) },
+		{"5a_due_date", func(in *app.UpdateBoletoInput) { in.DueDate = ptr(boletoDueDate.Add(72 * time.Hour)) },
 			func(t *testing.T, r ports.BoletoResult) {
 				if !r.DueDate.Equal(boletoDueDate.Add(72 * time.Hour)) {
 					t.Fatalf("due not amended: %v", r.DueDate)
 				}
 			}},
-		{"5b_validity", func(in *app.UpdateBoletoInput) { in.ValidUntil = boletoDueDate.Add(240 * time.Hour) },
+		{"5b_validity", func(in *app.UpdateBoletoInput) { in.ValidUntil = ptr(boletoDueDate.Add(240 * time.Hour)) },
 			func(t *testing.T, r ports.BoletoResult) {
 				if !r.ValidUntil.Equal(boletoDueDate.Add(240 * time.Hour)) {
 					t.Fatalf("validity not amended: %v", r.ValidUntil)
 				}
 			}},
 		{"5c_amount_fine_interest", func(in *app.UpdateBoletoInput) {
-			in.AmountCents = 70000
-			in.FineFixedCents = 1000
-			in.FineBps = 0
-			in.MonthlyInterestBps = 80
+			in.AmountCents = ptr(int64(70000))
+			in.FineFixedCents = ptr(int64(1000))
+			in.FineBps = ptr(int64(0))
+			in.MonthlyInterestBps = ptr(int64(80))
 		}, func(t *testing.T, r ports.BoletoResult) {
 			if r.AmountCents != 70000 || r.FineFixedCents != 1000 || r.MonthlyInterestBps != 80 {
 				t.Fatalf("amount/fine/interest not amended: %+v", r)
@@ -438,8 +448,8 @@ func TestUpdateBoletoErrors(t *testing.T) {
 		{"blank_id", "  ", baseUpdateInput(tenantID, "u1"), shared.ErrValidation},
 		{"missing_idem", id, mut(func(in *app.UpdateBoletoInput) { in.IdempotencyKey = "" }), shared.ErrValidation},
 		{"bad_currency", id, mut(func(in *app.UpdateBoletoInput) { in.Currency = "XX" }), shared.ErrValidation},
-		{"fine_over_cap", id, mut(func(in *app.UpdateBoletoInput) { in.FineBps = 201 }), shared.ErrValidation},
-		{"validity_before_due", id, mut(func(in *app.UpdateBoletoInput) { in.ValidUntil = boletoDueDate.Add(-48 * time.Hour) }), shared.ErrValidation},
+		{"fine_over_cap", id, mut(func(in *app.UpdateBoletoInput) { in.FineBps = ptr(int64(201)) }), shared.ErrValidation},
+		{"validity_before_due", id, mut(func(in *app.UpdateBoletoInput) { in.ValidUntil = ptr(boletoDueDate.Add(-48 * time.Hour)) }), shared.ErrValidation},
 		{"unknown_id", "missing", baseUpdateInput(tenantID, "u1"), shared.ErrNotFound},
 	}
 	for _, tc := range cases {
@@ -501,5 +511,32 @@ func TestRegisterBoletoConcurrentSameKey(t *testing.T) {
 	}
 	if got := h.store.LedgerLen(); got != 1 {
 		t.Fatalf("concurrent same-key registers must bill once: ledger len = %d, want 1", got)
+	}
+}
+
+// The PDF is a read of an already-billed charge: it must not bill again, and it must stay
+// tenant-scoped.
+func TestGetBoletoPDF(t *testing.T) {
+	t.Parallel()
+	svc, h, tenantID := newBoletoHarness(t)
+	id := registerOne(t, svc, tenantID, "pdf-1")
+	ledgerBefore := h.store.LedgerLen()
+
+	doc, err := svc.GetBoletoPDF(context.Background(), tenantID, id)
+	if err != nil {
+		t.Fatalf("GetBoletoPDF: %v", err)
+	}
+	if len(doc.Content) == 0 || doc.ContentType != "application/pdf" {
+		t.Fatalf("unexpected document: %+v", doc)
+	}
+	if h.store.LedgerLen() != ledgerBefore {
+		t.Fatal("downloading a slip must not bill again")
+	}
+
+	if _, err := svc.GetBoletoPDF(context.Background(), tenantID, "  "); !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("blank id: want validation, got %v", err)
+	}
+	if _, err := svc.GetBoletoPDF(context.Background(), tenantID, "missing"); !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("unknown id: want not found, got %v", err)
 	}
 }

@@ -187,6 +187,12 @@ type C6Config struct {
 	// registers against the wrong carteira when the environment changes. Empty selects the
 	// adapter default (production). Set PAYMENT_C6_BILLING_SCHEME.
 	BillingScheme string
+	// BankSlipWriteScope is the C6 granted-scope name that authorises issuing boletos
+	// (PAYMENT_C6_SCOPE_BANK_SLIP_WRITE). Unlike the PIX and checkout scope names, this
+	// one is not documented by C6 and has not been observed on a granted token, so it is
+	// configuration rather than a constant. EMPTY (the default) makes the boleto
+	// capabilities report "unknown" instead of guessing an answer about the account.
+	BankSlipWriteScope string
 	// RateLimitRPS and RateLimitBurst configure the proactive outbound token bucket
 	// that paces requests to C6 (Termo A5 — no DoS-shaped load). Zero/unparseable ⇒
 	// the adapter's conservative defaults. MaxRetries bounds retries on a retryable
@@ -224,16 +230,17 @@ func FromEnv() Config {
 		ConsoleUsername:        getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
 		ConsoleBootstrapToken:  os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
 		C6: C6Config{
-			BaseURL:        os.Getenv("PAYMENT_C6_BASE_URL"),
-			TokenURL:       os.Getenv("PAYMENT_C6_TOKEN_URL"),
-			Scope:          os.Getenv("PAYMENT_C6_SCOPE"),
-			Timeout:        getenvDuration("PAYMENT_C6_TIMEOUT", 15*time.Second),
-			ClientCertPath: os.Getenv("PAYMENT_C6_CLIENT_CERT"),
-			ClientKeyPath:  os.Getenv("PAYMENT_C6_CLIENT_KEY"),
-			BillingScheme:  strings.TrimSpace(os.Getenv("PAYMENT_C6_BILLING_SCHEME")),
-			RateLimitRPS:   getenvFloat("PAYMENT_C6_RATE_LIMIT_RPS", 0),
-			RateLimitBurst: getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
-			MaxRetries:     getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
+			BaseURL:            os.Getenv("PAYMENT_C6_BASE_URL"),
+			TokenURL:           os.Getenv("PAYMENT_C6_TOKEN_URL"),
+			Scope:              os.Getenv("PAYMENT_C6_SCOPE"),
+			Timeout:            getenvDuration("PAYMENT_C6_TIMEOUT", 15*time.Second),
+			ClientCertPath:     os.Getenv("PAYMENT_C6_CLIENT_CERT"),
+			ClientKeyPath:      os.Getenv("PAYMENT_C6_CLIENT_KEY"),
+			BillingScheme:      strings.TrimSpace(os.Getenv("PAYMENT_C6_BILLING_SCHEME")),
+			BankSlipWriteScope: strings.TrimSpace(os.Getenv("PAYMENT_C6_SCOPE_BANK_SLIP_WRITE")),
+			RateLimitRPS:       getenvFloat("PAYMENT_C6_RATE_LIMIT_RPS", 0),
+			RateLimitBurst:     getenvInt("PAYMENT_C6_RATE_LIMIT_BURST", 0),
+			MaxRetries:         getenvIntSigned("PAYMENT_C6_MAX_RETRIES", 0),
 		},
 		WebhookReconcile:         getenvBool("PAYMENT_WEBHOOK_RECONCILE", false),
 		WebhookReconcileInterval: getenvDuration("PAYMENT_WEBHOOK_RECONCILE_INTERVAL", 5*time.Minute),

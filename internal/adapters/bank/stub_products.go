@@ -38,7 +38,7 @@ func (s *StubProvider) CreateBoleto(ctx context.Context, tenantID string, req po
 		BoletoID:           req.BoletoID,
 		TxID:               "tx_" + req.BoletoID,
 		Status:             "REGISTERED",
-		QRCode:             "pix-emv-" + req.BoletoID,
+		Modality:           req.Modality.Normalized(),
 		Barcode:            "barcode-" + req.BoletoID,
 		AmountCents:        req.AmountCents,
 		DueDate:            req.DueDate,
@@ -47,6 +47,13 @@ func (s *StubProvider) CreateBoleto(ctx context.Context, tenantID string, req po
 		FineFixedCents:     req.FineFixedCents,
 		MonthlyInterestBps: req.MonthlyInterestBps,
 		Discounts:          req.Discounts,
+	}
+	// Only a BolePix carries a QR. The stub stays LENIENT about the precondition (it never
+	// refuses a keyless bolepix — that rule belongs to the C6 adapter, ADR-0005), but it
+	// must still distinguish the two modalities, or no test above this layer could tell a
+	// plain boleto from a BolePix.
+	if res.Modality == ports.ModalityBolepix {
+		res.QRCode = "pix-emv-" + req.BoletoID
 	}
 	s.boletos[k] = res
 	return res, nil
@@ -91,7 +98,7 @@ func (s *StubProvider) CancelBoleto(ctx context.Context, tenantID, boletoID stri
 // UpdateBoleto amends a registered boleto's mutable parameters (roteiro grupo 5),
 // preserving its identity and scannable artifacts. An unknown (tenant, id) is
 // shared.ErrNotFound, so one tenant can never amend another's boleto.
-func (s *StubProvider) UpdateBoleto(ctx context.Context, tenantID, boletoID string, req ports.BoletoRequest) (ports.BoletoResult, error) {
+func (s *StubProvider) UpdateBoleto(ctx context.Context, tenantID, boletoID string, patch ports.BoletoPatch) (ports.BoletoResult, error) {
 	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
 		return ports.BoletoResult{}, err
 	}
@@ -102,14 +109,23 @@ func (s *StubProvider) UpdateBoleto(ctx context.Context, tenantID, boletoID stri
 	if !ok {
 		return ports.BoletoResult{}, shared.ErrNotFound
 	}
-	// Amend only the mutable parameters; identity (id/txid) and artifacts stay put.
-	res.AmountCents = req.AmountCents
-	res.DueDate = req.DueDate
-	res.ValidUntil = req.ValidUntil
-	res.FineBps = req.FineBps
-	res.FineFixedCents = req.FineFixedCents
-	res.MonthlyInterestBps = req.MonthlyInterestBps
-	res.Discounts = req.Discounts
+	// Amend only the fields the patch actually sets; identity (id/txid), artifacts and
+	// anything left nil stay put. A nil field means "leave alone", never "zero it".
+	if patch.AmountCents != nil {
+		res.AmountCents = *patch.AmountCents
+	}
+	if patch.DueDate != nil {
+		res.DueDate = *patch.DueDate
+	}
+	if patch.ValidUntil != nil {
+		res.ValidUntil = *patch.ValidUntil
+	}
+	if patch.Fees != nil {
+		res.FineBps = patch.Fees.FineBps
+		res.FineFixedCents = patch.Fees.FineFixedCents
+		res.MonthlyInterestBps = patch.Fees.MonthlyInterestBps
+		res.Discounts = patch.Fees.Discounts
+	}
 	s.boletos[k] = res
 	return res, nil
 }
@@ -211,5 +227,45 @@ func (s *StubProvider) MarkCheckoutPaidWithReceived(tenantID, sessionID string, 
 		res.Status = "paid"
 		res.ReceivedAmountCents = receivedCents
 		s.checkouts[k] = res
+	}
+}
+
+// GetBoletoPDF returns a minimal but STRUCTURALLY VALID PDF for a registered boleto, so a
+// caller exercising the download path gets bytes that actually parse as a document rather
+// than a placeholder string. An unknown (tenant, id) is shared.ErrNotFound, keeping the
+// same tenant scoping as every other boleto read.
+func (s *StubProvider) GetBoletoPDF(ctx context.Context, tenantID, boletoID string) (ports.BoletoDocument, error) {
+	if _, err := s.creds.GetBankCredential(ctx, tenantID, s.bankID); err != nil {
+		return ports.BoletoDocument{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.boletos[key(tenantID, boletoID)]; !ok {
+		return ports.BoletoDocument{}, shared.ErrNotFound
+	}
+	return ports.BoletoDocument{
+		ContentType: "application/pdf",
+		Filename:    "boleto-" + boletoID + ".pdf",
+		Content:     []byte("%PDF-1.4\n% stub boleto " + boletoID + "\n%%EOF\n"),
+	}, nil
+}
+
+// GetBoletoByBankRef resolves a charge by the bank reference. The stub mints no references
+// of its own, so it treats the reference as the boleto id — enough for the settlement path
+// to be exercised end to end without a real bank.
+func (s *StubProvider) GetBoletoByBankRef(ctx context.Context, tenantID, bankRef string) (ports.BoletoResult, error) {
+	return s.GetBoleto(ctx, tenantID, bankRef)
+}
+
+// MarkBoletoStatus flips a registered boleto to a bank status (test/dev hook). It is how a
+// test drives the settlement path — PAID, WAITING_CONFIRMATION or CANCELED — without a real
+// bank. Unknown (tenant, id) is a no-op.
+func (s *StubProvider) MarkBoletoStatus(tenantID, boletoID, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := key(tenantID, boletoID)
+	if res, ok := s.boletos[k]; ok {
+		res.Status = status
+		s.boletos[k] = res
 	}
 }
