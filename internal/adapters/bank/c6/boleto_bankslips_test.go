@@ -19,7 +19,7 @@ import (
 func fullBoletoPayer() ports.BoletoPayer {
 	return ports.BoletoPayer{
 		Name:  "Fulano de Tal",
-		TaxID: "12345678901",
+		TaxID: "11144477735", // CPF com DV valido: o banco recusa DV errado (422)
 		Address: ports.BoletoAddress{
 			Street:       "Rua das Flores",
 			Number:       123,
@@ -130,7 +130,7 @@ func TestCreateBoletoBankSlipsBody(t *testing.T) {
 	if sent.Fees.InterestValue.String() != "1.00" || sent.Fees.InterestType != "MONTHLY_PERCENTAGE" {
 		t.Fatalf("interest not mapped: %+v (body=%s)", sent.Fees, ps.body())
 	}
-	if sent.Payer.Name != "Fulano de Tal" || sent.Payer.TaxID != "12345678901" {
+	if sent.Payer.Name != "Fulano de Tal" || sent.Payer.TaxID != "11144477735" {
 		t.Fatalf("payer not mapped: %+v", sent.Payer)
 	}
 	// The contract has ONE address line (street composed with the number) plus a

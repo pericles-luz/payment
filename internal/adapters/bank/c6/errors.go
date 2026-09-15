@@ -3,6 +3,7 @@ package c6
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
@@ -83,13 +84,64 @@ func transportError(op string) *Error {
 // appropriate shared sentinel. body is parsed only for the safe machine code; its
 // raw contents are never surfaced.
 func mapError(op string, status int, body []byte) *Error {
-	return &Error{
+	e := &Error{
 		Op:         op,
 		StatusCode: status,
 		Code:       parseErrorCode(body),
 		Fields:     parseViolatedFields(body),
 		sentinel:   sentinelForStatus(status),
 	}
+	logPSPRejection(op, status, e.Code, e.Fields, parseCorrelationID(body))
+	return e
+}
+
+// parseCorrelationID extracts the PSP's opaque request id, or "" when absent.
+func parseCorrelationID(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return ""
+	}
+	id := strings.TrimSpace(env.CorrelationID)
+	if len(id) > maxFieldNameLength {
+		return ""
+	}
+	return id
+}
+
+// logPSPRejection records that the PSP refused a call, with every field that is safe to
+// keep: the operation, the status, the machine code, the rejected field NAMES, and the
+// PSP's correlation id.
+//
+// It exists because a refusal used to leave no trace at all. The adapter maps the PSP
+// error to a sentinel and the boundary answers a generic message, so
+// `400 {"error":"invalid request"}` was the whole story — measured 15/09/2026, an invalid
+// payer CPF took an hour to diagnose and only the probe could show the reason.
+//
+// What is NOT logged, and will not be: the problem+json `title`/`detail`. They are free
+// text the PSP composes, and on the boleto surface the request is MADE of payer personal
+// data — name, CPF/CNPJ, address — so a detail that echoes a rejected value would put PII
+// in the logs of the one surface where that is least acceptable (threat C1/C4). The
+// correlation id is the safe equivalent: it carries no data and still lets C6 support find
+// the exact request. For the free text itself, cmd/c6-webhook-probe remains the sanctioned
+// one-shot escape hatch.
+func logPSPRejection(op string, status int, code string, fields []string, correlationID string) {
+	attrs := []any{
+		slog.String("op", op),
+		slog.Int("status", status),
+	}
+	if code != "" {
+		attrs = append(attrs, slog.String("psp_code", code))
+	}
+	if correlationID != "" {
+		attrs = append(attrs, slog.String("psp_correlation_id", correlationID))
+	}
+	if len(fields) > 0 {
+		attrs = append(attrs, slog.Any("psp_rejected_fields", fields))
+	}
+	slog.Warn("c6.psp_rejected", attrs...)
 }
 
 // sentinelForStatus maps an HTTP status to a domain sentinel. The mapping is by
@@ -126,10 +178,18 @@ func sentinelForStatus(status int) error {
 // C6-proprietary surfaces echo ".../v1/error/invalid_request". Only its final path
 // segment (a stable token) is surfaced as the code.
 type errorEnvelope struct {
-	Error     string     `json:"error"` // OAuth2 style: "invalid_client", "invalid_scope"
-	Code      string     `json:"code"`  // legacy C6 REST style machine code
-	Type      string     `json:"type"`  // RFC7807 problem+json type URN
-	Violacoes []violacao `json:"violacoes"`
+	Error string `json:"error"` // OAuth2 style: "invalid_client", "invalid_scope"
+	Code  string `json:"code"`  // legacy C6 REST style machine code
+	Type  string `json:"type"`  // RFC7807 problem+json type URN
+	// CorrelationID is the PSP's own opaque request identifier (problem+json
+	// "correlation_id", e.g. "a3ba9b636de21acb-GRU"). It is read and LOGGED because it is
+	// the one field that makes a rejection diagnosable without carrying any request data:
+	// an operator hands it to C6 support and they locate the exact call.
+	//
+	// It is deliberately the ONLY human-useful field added. `title`/`detail` stay unread —
+	// see parseErrorDiagnostics.
+	CorrelationID string     `json:"correlation_id"`
+	Violacoes     []violacao `json:"violacoes"`
 }
 
 // violacao is a single entry of the RFC7807 BACEN "violacoes" array. Only the

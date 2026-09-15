@@ -518,7 +518,7 @@ func validateBankSlipLimits(op string, req ports.BoletoRequest, description stri
 	case tooLong(req.Payer.Address.City, maxCityLen):
 		return bad("payer.address.city is too long")
 	case !validTaxIDDigits(req.Payer.TaxID):
-		return bad("payer.tax_id must be 11 (CPF) or 14 (CNPJ) digits")
+		return bad("payer.tax_id must be a valid CPF (11 digits) or CNPJ (14 digits), unmasked")
 	case !validUFCode(req.Payer.Address.State):
 		return bad("payer.address.state must be a two-letter UF")
 	case !validZipDigits(req.Payer.Address.ZipCode):
@@ -531,10 +531,84 @@ func validateBankSlipLimits(op string, req ports.BoletoRequest, description stri
 // says "somente números, sem máscara, respeitando zeros à esquerda"; a masked value is
 // the common integration mistake and is worth naming rather than forwarding.
 func validTaxIDDigits(s string) bool {
-	if len(s) != 11 && len(s) != 14 {
+	if !allDigits(s) {
 		return false
 	}
-	return allDigits(s)
+	switch len(s) {
+	case 11:
+		return validCPFCheckDigits(s)
+	case 14:
+		return validCNPJCheckDigits(s)
+	}
+	return false
+}
+
+// validCPFCheckDigits verifies the two check digits of a CPF (módulo 11).
+//
+// Checking the digits — not merely the width — is what turns a wrong CPF into a NAMED field
+// error instead of a round trip to the bank. Measured 15/09/2026: the syntactically fine but
+// invalid 12345678901 came back from C6 as an opaque 422 whose reason our own API discards,
+// and only the probe could show it said "cnpjCpf do grupo pagador não pertence ao Domínio".
+// The arithmetic is free; the round trip and the blind diagnosis were not.
+//
+// Repeated digits (00000000000, 11111111111, …) satisfy the módulo-11 arithmetic but are not
+// issuable CPFs, so they are rejected explicitly.
+func validCPFCheckDigits(s string) bool {
+	if allSameDigit(s) {
+		return false
+	}
+	return mod11CheckDigit(s[:9]) == int(s[9]-'0') &&
+		mod11CheckDigit(s[:10]) == int(s[10]-'0')
+}
+
+// mod11CheckDigit computes one CPF check digit over the given prefix: each digit is weighted
+// by its distance from the end (len+1 down to 2), and a remainder of 0 or 1 yields 0.
+func mod11CheckDigit(prefix string) int {
+	sum := 0
+	weight := len(prefix) + 1
+	for i := 0; i < len(prefix); i++ {
+		sum += int(prefix[i]-'0') * weight
+		weight--
+	}
+	if r := 11 - sum%11; r < 10 {
+		return r
+	}
+	return 0
+}
+
+// validCNPJCheckDigits verifies the two check digits of a CNPJ. The weights differ from the
+// CPF's: they cycle 2..9 from the right rather than descending monotonically.
+func validCNPJCheckDigits(s string) bool {
+	if allSameDigit(s) {
+		return false
+	}
+	return cnpjCheckDigit(s[:12]) == int(s[12]-'0') &&
+		cnpjCheckDigit(s[:13]) == int(s[13]-'0')
+}
+
+func cnpjCheckDigit(prefix string) int {
+	sum, weight := 0, 2
+	for i := len(prefix) - 1; i >= 0; i-- {
+		sum += int(prefix[i]-'0') * weight
+		weight++
+		if weight > 9 {
+			weight = 2
+		}
+	}
+	if r := 11 - sum%11; r < 10 {
+		return r
+	}
+	return 0
+}
+
+// allSameDigit reports whether every character is the same digit.
+func allSameDigit(s string) bool {
+	for i := 1; i < len(s); i++ {
+		if s[i] != s[0] {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // validZipDigits accepts an unmasked 8-digit CEP (contract pattern \d{8}).
