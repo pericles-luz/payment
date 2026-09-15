@@ -692,17 +692,47 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      operationId: patchBoleto
+      tags: [Boleto]
+      summary: Alterar cobrança (parcial)
+      description: >-
+        Altera **parcialmente** uma cobrança registrada: vencimento, validade, valor,
+        multa, juros e desconto. Só os campos presentes no corpo são alterados — um campo
+        ausente é preservado, e **não** é o mesmo que enviar zero (enviar `amount_cents: 0`
+        zeraria a cobrança).
+
+
+        O contrato publicado do banco expõe `PATCH /v2/bank_slips/{external_reference_id}`.
+        Até 15/09/2026 esta rota respondia `400` afirmando que o banco não suportava
+        alteração; era o verbo e o caminho que estavam errados, não a operação.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateBoletoRequest" }
+      responses:
+        "200":
+          description: Cobrança alterada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Boleto" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
     put:
       operationId: updateBoleto
       tags: [Boleto]
-      summary: Alterar boleto — NÃO suportado pelo banco
-      deprecated: true
+      summary: Alterar cobrança (alias de PATCH)
       description: >-
-        **Indisponível.** O contrato publicado do banco expõe emissão, consulta, PDF,
-        listagem e baixa — não há endpoint de alteração. Esta rota responde `400`
-        (`validation error`) em vez de simular uma alteração que o banco desconhece, o
-        que deixaria o nosso estado e o dele divergentes sobre dinheiro. Para mudar uma
-        cobrança já registrada: cancele (`deleteBoleto`) e emita outra.
+        Idêntico a `patchBoleto`. Mantido porque a operação já estava publicada sob este
+        verbo; `PATCH` é o verbo correto para uma alteração parcial e deve ser preferido em
+        integrações novas.
       parameters:
         - $ref: "#/components/parameters/PathId"
         - $ref: "#/components/parameters/IdempotencyKey"
@@ -734,6 +764,38 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/boletos/{id}/pdf:
+    get:
+      operationId: getBoletoPDF
+      tags: [Boleto]
+      summary: Baixar a cobrança em PDF
+      description: >-
+        Devolve o documento em **binário** (`application/pdf`), não em base64 dentro de
+        JSON: a URL pode ser entregue direto ao navegador, a um `<iframe>` ou a um anexo de
+        e-mail. Só o `200` é binário — erros mantêm o envelope JSON de sempre.
+
+
+        O PDF carrega dados pessoais do pagador (nome, CPF/CNPJ, endereço), por isso a
+        resposta vai com `Cache-Control: no-store`.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Documento da cobrança.
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: 'inline; filename="boleto-<id>.pdf"'
+            Cache-Control:
+              schema: { type: string }
+              description: Sempre `no-store` (o documento contém PII do pagador).
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
 
   /v1/dda/boletos:
@@ -2077,6 +2139,25 @@ components:
           type: array
           items: { $ref: "#/components/schemas/DiscountTier" }
         payer: { $ref: "#/components/schemas/Payer" }
+        payment_method:
+          type: string
+          enum: [boleto, bolepix]
+          default: boleto
+          description: >-
+            Modalidade da cobrança. `boleto` emite um boleto simples; `bolepix` emite a
+            mesma cobrança pagável **também** por QR Code PIX.
+
+
+            Ausente equivale a `boleto`: o padrão promete o menos, porque um `bolepix` que
+            não possa ser emitido chegaria ao pagador como um boleto anunciando um QR que
+            não existe.
+
+
+            `bolepix` exige que a empresa tenha uma chave PIX **aleatória (EVP)** registrada.
+            Sem ela a chamada é recusada com `400` — o banco, por conta própria, criaria a
+            cobrança em silêncio e sem QR nenhum. Consulte `GET /v1/bank-capabilities` para
+            saber se a conta autoriza a modalidade.
+          example: bolepix
         description:
           type: string
           maxLength: 100
@@ -2086,8 +2167,17 @@ components:
           example: Mensalidade agosto/2026
     UpdateBoletoRequest:
       type: object
-      required: [due_date]
-      description: Alteração de vencimento/validade/valor/multa/juros/desconto (grupo 5).
+      description: >-
+        Alteração **parcial** de vencimento/validade/valor/multa/juros/desconto (grupo 5).
+        Nenhum campo é obrigatório: só os presentes são alterados, e um campo ausente é
+        preservado. Omitir não é o mesmo que enviar zero.
+
+
+        `valid_until` exige `due_date` junto: o banco expressa a validade como um número de
+        dias **após** o vencimento, então a data-âncora precisa ser informada.
+
+
+        `currency` é obrigatória quando `amount_cents` está presente.
       properties:
         amount_cents: { type: integer, format: int64 }
         currency: { type: string, example: BRL }
@@ -2102,10 +2192,18 @@ components:
     Boleto:
       type: object
       properties:
-        boleto_id: { type: string }
-        txid: { type: string }
-        status: { type: string }
-        qr_code: { type: string, description: Payload BolePix EMV copia-e-cola. }
+        boleto_id: { type: string, description: Identificador da cobrança neste gateway. Use-o em todas as operações seguintes. }
+        txid: { type: string, description: Referência do registro no banco. }
+        status: { type: string, enum: [CREATED, PAID, CANCELED, WAITING_CONFIRMATION] }
+        payment_method:
+          type: string
+          enum: [boleto, bolepix]
+          description: Modalidade efetivamente emitida, para não ser inferida da presença do QR.
+        qr_code:
+          type: string
+          description: >-
+            Payload BolePix EMV copia-e-cola. **Ausente** numa cobrança `boleto` — o campo é
+            omitido, não devolvido vazio.
         barcode: { type: string, description: Linha digitável. }
         our_number: { type: string, description: Nosso número. }
         digitable_line: { type: string }

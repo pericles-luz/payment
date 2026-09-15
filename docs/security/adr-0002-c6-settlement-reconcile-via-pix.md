@@ -1,5 +1,12 @@
 # ADR-0002 — Reconciliação de liquidação do C6 via leitura PIX (não `/charges`)
 
+> **Superseded in part.** A liquidação de **boleto/BolePix** NÃO reconcilia pela leitura
+> PIX: um id de bank slip não é um txid de cob, e o ramo default deste ADR fazia todo boleto
+> pago dar 404 e nunca liquidar. Ver
+> [ADR-0013](adr-0013-c6-boleto-liquidacao-e-modalidade.md), que exercita a cláusula
+> residual deste documento (o portão de liquidação é reavaliado por produto). Para PIX,
+> este ADR continua valendo integralmente.
+
 - **Status:** Aceito — decisão do CTO em 2026-06-13 ([SIN-64791](/SIN/issues/SIN-64791), gate [SIN-64780](/SIN/issues/SIN-64780)).
 - **Autor:** Coder. **Decisor:** CTO.
 

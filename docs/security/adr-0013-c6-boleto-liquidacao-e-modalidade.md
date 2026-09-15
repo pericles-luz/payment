@@ -1,0 +1,187 @@
+# ADR-0013 — Liquidação de boleto reconcilia por `/v2/bank_slips`, e a modalidade (boleto | BolePix) é escolha do chamador
+
+- **Status:** Aceito — decisão de arquitetura.
+- **Data:** 15/09/2026.
+- **Contexto de contrato:** especificações oficiais do C6 baixadas do portal e versionadas
+  em `docs/compliance/c6-bolepix-oas.yaml` (Bolepix v1.1.0) e
+  `docs/compliance/c6-bankslip-v1-oas.yaml` (Boleto bancário v1.7.2).
+- **Relação com ADR anteriores:** estende [ADR-0005](adr-0005-c6-boleto-payer-port-contract.md)
+  (contrato do pagador) e exercita a cláusula residual de
+  [ADR-0002](adr-0002-c6-settlement-reconcile-via-pix.md), que manda o portão de liquidação
+  ser reavaliado por produto.
+
+## Contexto
+
+Faltava a boleto e BolePix serem **opções de cobrança**, como PIX e cartão já são. Ao abrir
+o código para isso, três defeitos apareceram — e cada um deles, sozinho, já impedia
+qualquer boleto de funcionar contra o banco real:
+
+1. **`external_reference_id` com o formato errado.** A derivação produzia até 10 caracteres
+   minúsculos, mirando `^[a-zA-Z0-9]{1,10}$` — o padrão da API **v1**. O adapter posta na
+   **v2**, que exige `^[A-Z0-9]{26}$`, exatamente 26. Toda emissão seria recusada.
+2. **`boleto_id` não fazia round-trip.** A criação devolvia ao chamador o `id` do C6, e toda
+   operação posterior deriva a referência a partir do id que recebeu — derivando, portanto,
+   de um id que nunca foi registrado. Consulta, PDF, alteração e baixa dariam 404. Passava
+   despercebido porque o stub ecoa o id que recebe.
+3. **`CancelBoleto` não podia ter sucesso.** O contrato responde `204` sem corpo; o código
+   usava `do()`, que faz `json.Unmarshal` em todo 2xx e mapeia a falha para
+   `ErrUnavailable` — uma baixa bem-sucedida reportada como indisponibilidade do provedor.
+
+Some-se a isso que os limites de tamanho eram medidos em **bytes**, não em caracteres, e
+recusavam localmente descrições legítimas em português antes de chegarem ao banco.
+
+A consequência prática é a premissa deste ADR: **nenhum boleto jamais foi registrado com
+sucesso contra o C6 real.** Não há dado legado a preservar, então a derivação e o contrato
+de porta podem mudar agora — e só agora — sem órfãos.
+
+## Decisões
+
+### 1. `external_reference_id` é uma bijeção do id local, não um digest
+
+O id do boleto é o id do pagamento: 16 bytes aleatórios em hexadecimal. 16 bytes são 128
+bits; 26 símbolos de base32 Crockford carregam 130. O alfabeto Crockford é todo `[A-Z0-9]`.
+Logo a referência é o próprio id **reencodificado**, não um resumo dele.
+
+Isso vale mais do que um hash truncado por três razões independentes:
+
+- **Idempotente e determinística entre processos**, que é o que faz o colapso de retry
+  funcionar — o contrato diz que uma referência repetida "retornará os dados da cobrança já
+  existente", e isso só vale se a derivação nunca variar.
+- **Sem colisão alguma**, por ser invertível — não uma probabilidade pequena, uma
+  impossibilidade.
+- **Reversível**, o que resolve metade do problema de mapeamento do webhook sem tabela de
+  correspondência nenhuma.
+
+A derivação passa a ser parte do contrato de fio, porque a referência é a **única** chave
+que o banco expõe para ler, alterar, cancelar e baixar uma cobrança: trocá-la em silêncio
+orfanaria todo boleto já registrado, sem endpoint de recuperação. Um vetor-ouro em teste
+existe para fazer essa troca falhar alto.
+
+### 2. A modalidade é do chamador, e `bolepix` sem chave EVP falha fechado
+
+`ports.BoletoRequest.Modality` (`boleto` | `bolepix`), com o vazio valendo `boleto`.
+
+Antes, o sub-objeto `payment_method.pix` era anexado sempre que a empresa tinha chave
+aleatória registrada. Isso não é uma escolha, é um efeito colateral da configuração — e
+tornava indistinguíveis "pediram boleto simples" e "pediram BolePix, mas a empresa está mal
+configurada". Tornar a escolha explícita é o que permite **recusar** o segundo caso.
+
+**A recusa é a parte que importa.** O banco documenta, duas vezes, que uma chave ausente ou
+inválida cria a cobrança normalmente, apenas com `payment_method.pix: null`. Não existe
+caminho de erro: se não recusarmos aqui, ninguém recusa. E o estrago não aparece para quem
+integra — aparece para quem paga, na forma de um boleto anunciando um QR que não existe,
+descoberto na hora do pagamento.
+
+O padrão é `boleto`, não `bolepix`, porque **o default deve prometer o menos**: um padrão que
+promete QR falha para toda empresa sem chave, e um padrão que não promete nada nunca mente.
+
+### 3. Liquidação de boleto reconcilia por `/v2/bank_slips`, não pela leitura PIX
+
+ADR-0002 fixou que a liquidação reconcilia pela leitura da cobrança PIX imediata. Para
+boleto isso está **errado por construção**: `BANK_SLIP`/`BANK_SLIP_PIX` caíam no ramo
+default do receptor, que lê `GET /v2/pix/cob/{txid}` — e um id de bank slip não é um txid de
+cob. O resultado era 404, e um boleto pago que nunca liquidava.
+
+Passa a existir `webhookKindBoleto`, com reconciliação por `GET /v2/bank_slips/{ref}`.
+
+**A ordem do `switch` é carga estrutural.** O caso PIX dispara com `len(note.Pix) > 0`
+sozinho, porque o webhook BACEN real não manda discriminador. Mas o QR de um BolePix é
+gerado da **mesma chave** contra a qual o webhook BACEN está registrado, então um BolePix
+pago por QR pode chegar com um array `pix`. Resolvido ali, seria reconciliado contra a
+leitura PIX — o mesmo 404, reintroduzido por uma porta lateral. O discriminador explícito e
+documentado vem **antes** da heurística.
+
+### 4. Os dois trilhos compartilham UM rótulo de dedupe
+
+`eventKey = objectID|label|status`. Dar rótulos distintos a `BANK_SLIP` e `BANK_SLIP_PIX`
+não causaria dupla liquidação de dinheiro (`MarkPaid` é idempotente), mas **publicaria dois
+`payment.paid` e dois webhooks de saída para a Conta** por um único pagamento. Uma cobrança
+BolePix só pode ser paga uma vez — o banco fecha o outro trilho —, então os dois avisos são
+a *mesma* liquidação e têm de colidir. Qual trilho pagou vai no log e na mensagem de
+liquidação, não na chave de deduplicação.
+
+### 5. `WAITING_CONFIRMATION` pede reentrega, não confirmação
+
+Status novo da v2, sem equivalente em PIX ou cartão: pagamento confirmado, **recursos ainda
+não creditados**.
+
+- Não liquida: nosso contrato com a Conta é "o dinheiro chegou". PIX liquida em `CONCLUIDA`,
+  que já é dinheiro creditado; manter o mesmo significado nos dois trilhos vale mais do que
+  algumas horas de latência.
+- Não é confirmado (`errSettlementLag`, não `errNotYetPayable`): a marca de anti-replay é
+  desfeita **e** o aviso volta. Confirmá-lo dependeria de o banco mandar um segundo aviso
+  quando o dinheiro cair — o que **não foi medido**. Se essa premissa estiver errada e
+  confirmarmos, o pagamento se perde para sempre, que é exatamente o modo de falha que este
+  código já pagou uma vez.
+
+`CANCELED` (um L na v2; `CANCELLED` na v1 legada — as duas grafias são aceitas) é terminal e
+não pago: confirmado, sem liquidar, sem reentrega.
+
+### 6. A conferência de valor do boleto é mais fraca, e isso está escrito
+
+`ChargeResult.AmountReconciled` exige igualdade estrita. Mas a leitura de cobrança única do
+Bolepix devolve `amount` (o principal registrado) e `status` — **e não devolve `payments[]`**,
+que só existe na listagem. Então, para uma cobrança liquidada, esperado e recebido são ambos
+o valor registrado, e o portão de dinheiro degenera para "o banco, relido, diz que esta
+cobrança de valor X está PAGA".
+
+É mais fraco que PIX e cartão, onde um valor recebido é de fato comparado. Aceito porque
+(a) o banco não faz baixa parcial de boleto e (b) um boleto pago em atraso credita
+legitimamente **mais** que o principal (multa + mora pro-rata-die) — igualdade estrita
+contra o valor creditado recusaria pagamento legítimo em vez de pegar fraude.
+
+**Isto é uma redução deliberada da defesa W3 e está comentada como tal no código**, não
+escondida numa atribuição. Restaurar uma comparação de verdade exige `GET /v2/bank_slips/list`
+e o array `payments[]` — follow-up registrado.
+
+### 7. Capacidade de boleto é tri-estado
+
+`ports.Capability`: `Unknown` | `Granted` | `Denied`, serializado como `null` | `true` | `false`.
+
+O nome do escopo C6 que autoriza emissão de boleto **não é conhecido**: não está na OpenAPI
+publicada (que documenta só `bearerAuth`) nem em lugar nenhum do repositório. Responder
+`false` afirmaria à empresa que a conta dela não pode emitir boleto, com base num nome que
+ninguém conferiu. `null` é a resposta honesta, e não custa nada: esta rota é de exibição,
+nunca um portão de autorização.
+
+O nome vem por configuração (`PAYMENT_C6_SCOPE_BANK_SLIP_WRITE`), vazio por padrão, a ser
+preenchido depois de lido num token real.
+
+`Bolepix` é um bit **separado** de `Boleto` porque carrega uma pré-condição que não é escopo:
+a chave EVP registrada. Uma conta pode estar perfeitamente autorizada a emitir boleto e
+ainda assim ser incapaz de emitir um BolePix.
+
+## Consequências
+
+- **Desconto escalonado (grupo 3.b) fica limitado a uma faixa.** A v2 expõe só
+  `first_discount_*`; a v1 legada é que tem `first`/`second`/`third`. O adapter já recusa
+  duas faixas com `ErrValidation`, que é a atitude certa — descartar faixa em silêncio
+  mudaria o que o pagador deve. Se a homologação exigir 3.b completo, a decisão "tudo pela
+  v2" precisa ser revista **antes** da janela.
+- **O receptor é forward-only.** A superfície proprietária não expõe DELETE, então um canal
+  registrado fica registrado. Reverter o commit do receptor **depois** de registrar devolve
+  os avisos ao ramo PIX — 404 e 500 para sempre. Reverter emissão, sim; receptor, não.
+- **Registrar um canal novo rotaciona a ref do tenant** (`PutWebhookRef` revoga as outras
+  refs ativas), então ligar `BANK_SLIP` reescreve todos os canais e um aviso em voo sob a ref
+  antiga leva 401. Janela de baixo tráfego, e `cmd/c6-webhook-sync` precisa dos dois canais
+  novos — com a varredura de renovação desligada, ele é o único que converge um tenant.
+
+## O que ainda não foi medido
+
+O registro dos serviços `BANK_SLIP`/`BANK_SLIP_PIX` no C6 **não foi ligado** por este
+trabalho, de propósito: a regra da casa é nunca mandar o PSP entregar o que ainda não
+sabemos processar, e ela não se inverte porque o receptor agora existe — ela se cumpre
+medindo primeiro. Pendente de uma janela de sandbox:
+
+1. **Qual identificador o C6 põe em `external_id`** do aviso: o `id` dele ou a nossa
+   referência. Mitigado, não resolvido: a resolução tenta a leitura local primeiro e a
+   leitura por referência depois, e falha alto se nenhuma casar — correto sob as duas
+   hipóteses, mas só uma delas é a real.
+2. **Se `WAITING_CONFIRMATION` chega mesmo como aviso**, e se há um segundo aviso quando o
+   dinheiro cai. Decide se a política da decisão 5 pode ser relaxada.
+3. **Por qual envelope chega um BolePix pago por QR** — proprietário, BACEN, ou os dois.
+   Decide se a ordenação da decisão 3 basta ou se falta dedupe entre canais.
+4. **O nome do escopo de bank slip** (`./c6-webhook-probe <tenantID> --token-only` imprime o
+   `scope` concedido no corpo bruto do token).
+5. **Se `PAID` pode ser alcançado com pagamento divergente.** Se puder, a decisão 6 deixa de
+   ser aceitável e a listagem vira bloqueante, não follow-up.
