@@ -330,7 +330,11 @@ def main():
     ap.add_argument("--software", default="Verz")
     ap.add_argument("--responsavel", default="Péricles Gomes Luz")
     ap.add_argument("--email", default="pericles.luz@gmail.com")
-    ap.add_argument("--telefone", default="(31) 98605-8910")
+    # Sem default, ao contrário dos outros cinco: este repositório é público, e um
+    # celular de pessoa não é dado de projeto. Os outros cinco são públicos por
+    # natureza (CNPJ, marca) ou já vão na autoria de todo commit.
+    ap.add_argument("--telefone",
+                    help="telefone do responsável, no formato (31) 99999-9999")
     ap.add_argument("--blocos", default=",".join(BLOCOS),
                     help="blocos a marcar, separados por vírgula")
     args = ap.parse_args()
@@ -339,6 +343,10 @@ def main():
         return verificar(args.verificar)
     if not (args.modelo and args.evidencias and args.saida):
         ap.error("--modelo, --evidencias e --saida são obrigatórios")
+    # Cobrado aqui, e não pelo argparse, para --verificar continuar rodando sozinho:
+    # conferir um documento já gravado não precisa saber telefone de ninguém.
+    if not args.telefone:
+        ap.error("--telefone é obrigatório (não tem default: ver o comentário acima)")
 
     with open(args.evidencias, encoding="utf8") as f:
         lista = json.load(f)

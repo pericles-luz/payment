@@ -89,7 +89,7 @@ func TestValidateContentAcceptsPix(t *testing.T) {
 		strings.Repeat("3", 48),                // linha digitável (arrecadação)
 		"12345678909",                          // CPF
 		"05471416000101",                       // CNPJ
-		"+5531986058910",                       // telefone
+		"+5511999999999",                       // telefone
 		"pericles@example.com",                 // e-mail
 		"123e4567-e12b-12d1-a456-426655440000", // EVP
 		"0002010414123456789012342658" + strings.Repeat("0", 40), // BR Code

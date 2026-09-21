@@ -11,13 +11,15 @@ go build -o /tmp/c6-roteiro ./cmd/c6-roteiro
 C6_CLIENT_SECRET='…' C6_PIX_KEY='…' /tmp/c6-roteiro \
   --cert /mnt/x/parceiros/LMHost/c6bank/20260921.crt \
   --key  /mnt/x/parceiros/LMHost/c6bank/20260921.key \
-  --client-id cc07c5db-c4be-4622-a216-58ed90caac62 \
+  --client-id '…' \
   --webhook-url https://payment.lmhost.com.br/webhooks/c6/<ref> \
   --out /mnt/x/parceiros/LMHost/c6bank/20260921_evidencias.json
 ```
 
 O segredo e a chave PIX vêm do ambiente, não da linha de comando — o histórico do shell
-guarda o que se digita nela.
+guarda o que se digita nela. O `client-id` fica na linha por ser o menos sensível dos
+três, mas **este repositório é público**: ele não é escrito aqui. Os três saem do cofre
+(`payment/sbx`), ou do console, ou do e-mail em que o C6 os mandou.
 
 **A janela do sandbox é seg–sex, 7h–23h BRT.** A ferramenta avisa quando você está fora
 dela, porque o que falha aí parece problema de contrato e não é.
@@ -63,7 +65,8 @@ substituem o destino de quem já a usa, e a superfície não expõe DELETE.
 python3 scripts/preencher-roteiro.py \
   --modelo "/mnt/x/parceiros/LMHost/c6bank/Roteiro de Testes - C6 Developers v3.0.docx" \
   --evidencias /mnt/x/parceiros/LMHost/c6bank/20260921_evidencias.json \
-  --saida      /mnt/x/parceiros/LMHost/c6bank/20260921_testes.docx
+  --saida      /mnt/x/parceiros/LMHost/c6bank/20260921_testes.docx \
+  --telefone   '(31) 9····-····'
 
 python3 scripts/preencher-roteiro.py --verificar \
   /mnt/x/parceiros/LMHost/c6bank/20260921_testes.docx
@@ -74,8 +77,13 @@ python3 scripts/preencher-roteiro.py --verificar \
 cláusula 2.4-iii do Termo de APIs exige.
 
 Os dados da organização têm padrão (LMHost / Verz / CNPJ 67.188.163/0001-10) e bandeiras
-para trocar: `--cnpj`, `--empresa`, `--software`, `--responsavel`, `--email`,
-`--telefone`. `--blocos` escolhe quais caixas marcar.
+para trocar: `--cnpj`, `--empresa`, `--software`, `--responsavel`, `--email`.
+`--blocos` escolhe quais caixas marcar.
+
+**`--telefone` é o único sem padrão, e é de propósito:** este repositório é público, e um
+celular de pessoa não é dado de projeto. Os outros cinco são públicos por natureza (CNPJ,
+marca) ou já viajam na autoria de todo commit. `--verificar` não o pede — conferir um
+documento já gravado não precisa saber telefone de ninguém.
 
 **Abra uma vez no Word ou LibreOffice antes de enviar.** A verificação prova a estrutura;
 ela não prova que o documento está legível para quem vai lê-lo.
