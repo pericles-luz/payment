@@ -39,7 +39,7 @@ func newServiceWebhookDouble(t *testing.T) *serviceWebhookDouble {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /oauth/token", func(w http.ResponseWriter, r *http.Request) {
-		user, _, _ := r.BasicAuth()
+		user := tokenClientID(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})

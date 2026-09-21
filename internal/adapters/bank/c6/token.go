@@ -45,8 +45,8 @@ type tokenState struct {
 
 // tokenManager issues and caches OAuth2 client_credentials access tokens per
 // tenant. Credentials are resolved from the CredentialStore at fetch time and the
-// client secret is sent only in the token request's Basic auth header — never
-// logged, never stored, never placed in a URL (threat C1/C4).
+// client secret is sent only in the token request's form body — never logged, never
+// stored, never placed in a URL (threat C1/C4).
 type tokenManager struct {
 	creds ports.CredentialStore
 	// bankID binds this token manager to a single bank's credential slot (ADR-0007
@@ -179,11 +179,35 @@ type tokenResponse struct {
 	Scope       string `json:"scope"`
 }
 
-// fetch performs the OAuth2 client_credentials grant. The secret travels only in
-// the Basic auth header. On any non-2xx the body is read solely to extract the
-// safe machine code (via mapError); its raw contents are never surfaced.
+// fetch performs the OAuth2 client_credentials grant.
+//
+// # Credencial no CORPO, não em Basic
+//
+// Até 21/09/2026 isto mandava a credencial no cabeçalho `Authorization: Basic`. O
+// contrato publicado (docs/compliance/c6-auth-oas.yaml) não menciona Basic em lugar
+// nenhum: `client_id`, `client_secret` e `grant_type` são REQUIRED no corpo
+// `application/x-www-form-urlencoded`. E não é só teoria — medido contra o sandbox no
+// mesmo dia, com o mesmo certificado e a mesma credencial:
+//
+//	Basic + grant_type no corpo   -> HTTP 500  "Condição inesperada ao processar requisição."
+//	credencial no corpo           -> HTTP 200  + o scope concedido
+//
+// Um 500 é o pior retorno possível para um erro de autenticação: não diz "credencial
+// errada", diz "o banco quebrou", e manda investigar o lado errado.
+//
+// O segredo continua fora de URL e fora de log — o corpo de um POST não é nenhum dos
+// dois. O que ele não tem é o descarte automático que um Authorization header ganha de
+// ferramentas que redigem cabeçalhos; por isso nenhuma parte deste corpo é impressa,
+// nem em erro.
+//
+// On any non-2xx the body is read solely to extract the safe machine code (via
+// mapError); its raw contents are never surfaced.
 func (m *tokenManager) fetch(ctx context.Context, cred ports.BankCredential) (cachedToken, error) {
-	form := url.Values{"grant_type": {"client_credentials"}}
+	form := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {cred.ClientID},
+		"client_secret": {cred.Secret},
+	}
 	if m.scope != "" {
 		form.Set("scope", m.scope)
 	}
@@ -194,8 +218,6 @@ func (m *tokenManager) fetch(ctx context.Context, cred ports.BankCredential) (ca
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	// Client secret is sent only here, in the Authorization header — never logged.
-	req.SetBasicAuth(cred.ClientID, cred.Secret)
 
 	resp, err := m.httpc.Do(req)
 	if err != nil {

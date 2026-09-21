@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -317,4 +319,88 @@ func TestTokenConcurrentSameTenant(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestTokenGrantUsesClientSecretPost pins HOW the credential is presented, which is a
+// thing the C6 sandbox measurably cares about: on 21/09/2026, with a valid certificate
+// and a valid credential, `Authorization: Basic` answered HTTP 500 — "Condição
+// inesperada ao processar requisição." — while the same credential in the form body
+// answered 200.
+//
+// A 500 is the worst possible answer to an authentication mistake: it says the bank
+// broke, not that we presented the credential wrong, and it sends whoever is debugging
+// to the wrong side. The published contract (docs/compliance/c6-auth-oas.yaml) requires
+// client_id, client_secret and grant_type in the body; this test is what keeps a
+// "cleanup" from moving them back into a header.
+func TestTokenGrantUsesClientSecretPost(t *testing.T) {
+	t.Parallel()
+	var (
+		mu       sync.Mutex
+		gotForm  url.Values
+		gotAuth  string
+		gotCType string
+	)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		gotForm = r.PostForm
+		gotAuth = r.Header.Get("Authorization")
+		gotCType = r.Header.Get("Content-Type")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"tok","token_type":"Bearer","expires_in":600,"scope":"pix.read"}`))
+	}))
+	defer srv.Close()
+
+	m := newTokenManager(oneTenant("t1", "client-1", "secret-1"), "c6", srv.URL, "", srv.Client(), time.Now)
+	if _, err := m.token(context.Background(), "t1"); err != nil {
+		t.Fatalf("token: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotForm.Get("grant_type") != "client_credentials" {
+		t.Fatalf("grant_type: %q", gotForm.Get("grant_type"))
+	}
+	if gotForm.Get("client_id") != "client-1" || gotForm.Get("client_secret") != "secret-1" {
+		t.Fatalf("credential must travel in the body: %v", gotForm)
+	}
+	// RFC 6749 §2.3.1: a client MUST NOT use more than one authentication method per
+	// request, so the header has to be absent, not merely redundant.
+	if gotAuth != "" {
+		t.Fatalf("no Authorization header may be sent, got %q", gotAuth)
+	}
+	if gotCType != "application/x-www-form-urlencoded" {
+		t.Fatalf("content type: %q", gotCType)
+	}
+}
+
+// An explicit scope makes the C6 token endpoint answer 400 invalid_request; omitting it
+// returns 200 with the credential's full granted scopes. The manager therefore sends
+// the parameter ONLY when one was configured — and the default is empty.
+func TestTokenOmitsScopeWhenUnset(t *testing.T) {
+	t.Parallel()
+	var (
+		mu       sync.Mutex
+		hasScope bool
+	)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		hasScope = r.PostForm.Has("scope")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"tok","token_type":"Bearer","expires_in":600}`))
+	}))
+	defer srv.Close()
+
+	m := newTokenManager(oneTenant("t1", "c", "s"), "c6", srv.URL, "", srv.Client(), time.Now)
+	if _, err := m.token(context.Background(), "t1"); err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hasScope {
+		t.Fatal("an unset scope must not be sent at all")
+	}
 }

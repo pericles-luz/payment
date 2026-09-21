@@ -53,7 +53,7 @@ func newWebhookServer(t *testing.T) *webhookServer {
 		ws.mu.Lock()
 		ws.tokenHits++
 		ws.mu.Unlock()
-		user, _, _ := r.BasicAuth()
+		user := tokenClientID(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
