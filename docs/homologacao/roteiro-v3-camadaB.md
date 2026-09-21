@@ -112,7 +112,50 @@ na evidência.
 
 | Casos | Retorno | Leitura |
 |---|---|---|
-| `C_01`–`C_03` | **401** | O produto **Checkout não está habilitado** nesta conta. O token traz `checkout.write`; o gateway valida o corpo primeiro e a habilitação depois, então todo corpo VÁLIDO dá 401 e todo corpo inválido dá 400 (medição em `internal/adapters/bank/c6/checkout.go`). Escopo concedido ≠ produto contratado. **Pedido ao gerente.** |
+| `C_01`–`C_03` | **401** | O produto **Checkout não está habilitado NA CONTA DE SANDBOX**. Em produção o cartão funciona por este mesmíssimo caminho — ver abaixo. |
+
+### Checkout: produção emite, o sandbox não
+
+Vale separar, porque "401 no checkout" se lê fácil como "o cartão está quebrado", e não
+está.
+
+O cartão em produção passa por aqui: o contador chama `POST /v1/checkout` na nossa API,
+que chama `POST /v1/checkouts/` no C6. Verificado no gateway real, não inferido — a
+SIN-69580 leu de volta uma sessão PAGA e registrou o bloco `payment.card` que ela traz.
+
+Repeti contra o sandbox o corpo **byte a byte igual ao de produção**, com
+`interest_type: BY_ISSUER`, `expiration_date_time` e `Idempotency-Key`:
+
+| requisição | resposta |
+|---|---|
+| corpo EXATO de produção | **401** |
+| `{amount:5, payment:{card:{type:CREDIT,…}}}` | **401** |
+| `{amount:5, payment:{pix:{key:"AUTO"}}}` | **401** |
+| `{amount:5}` | 400 (falta `payment`) |
+| `{amount:5, payment:{pix:{}}}` | 400 (falta `key`) |
+| `GET /v1/checkouts/generate/public-key` | 200 |
+| `GET /v1/checkouts/nao-existe` | 400 |
+
+Todo corpo VÁLIDO dá 401 e todo corpo INVÁLIDO dá 400: o gateway valida a forma
+primeiro e a habilitação depois. **Não é a requisição, é a conta** — e são duas contas
+diferentes: produção é a PERICLES GOMES LUZ LTDA (67.188.163/0001-10, certificado
+`certificado-verz`), o sandbox é a Regressivo Teste (32.159.366/0001-02).
+
+### O ponto cego que isso revelou
+
+`capabilities.go` responde `Card: has("checkout.write")`. **A conta de sandbox tem esse
+escopo concedido e mesmo assim não abre checkout.** Ou seja, o escopo não distingue
+"contratado" de "não contratado" — e é exatamente essa distinção que o
+`GET /v1/bank-capabilities` existe para fazer: é ele que decide se o dono da loja vê o
+interruptor de cartão habilitado.
+
+Uma conta nesse estado ligaria o botão, e o comprador descobriria na hora de pagar, com
+o cartão na mão. É o incidente que está contado em
+`contador/docs/manual/10-empresas.md` e que essa verificação foi escrita para evitar.
+
+Não foi mexido: trocar `Card` de bool para tri-estado (como `Boleto` já é) muda o que a
+tela da empresa mostra, e isso é decisão de produto, não consequência de uma
+homologação. **Fica como pendência.**
 
 ### Depende de o C6 consertar o sandbox
 
@@ -149,7 +192,10 @@ Cada um destes derrubava casos, e nenhum estava escrito em lugar nenhum antes:
 
 ## Pendências para a próxima janela
 
-- Pedir ao gerente: habilitar **Checkout**, e um **cartão de teste** para `C_0502`.
+- Pedir ao gerente: habilitar **Checkout na conta de SANDBOX** (produção já tem), e um
+  **cartão de teste** para `C_0502`.
+- Decidir se `BankCapabilities.Card` vira tri-estado — o escopo `checkout.write` não
+  prova que a conta abre checkout, e é ele que acende o botão de cartão da loja.
 - Pedir ao C6: o **502 do `lotecobv`** e a **CIP que não libera** alteração/baixa.
 - Combinar uma janela para rodar com `--webhook-servico` e colher `B_07`, `C_04` e as
   entregas de `C_0501`.
