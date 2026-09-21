@@ -49,8 +49,10 @@ chmod +x "${SANDBOX}/shim/systemctl" "${SANDBOX}/shim/sudo"
 # A copy of the wrapper with the fixed paths rewritten into the sandbox. We do NOT
 # edit the real script; we only relocate its three hard-coded constants.
 SUT="${SANDBOX}/payment-deploy.sandbox.sh"
+# The incoming DIRECTORY is rewritten (not the full payment-api path), so the operator-tool
+# staging paths built from the same constant land in the sandbox too.
 sed \
-  -e "s#/opt/payment/incoming/payment-api#${SANDBOX}/opt/incoming/payment-api#g" \
+  -e "s#/opt/payment/incoming#${SANDBOX}/opt/incoming#g" \
   -e "s#/opt/payment/bin#${SANDBOX}/opt/bin#g" \
   -e "s#/usr/bin/systemctl#${SANDBOX}/shim/systemctl#g" \
   "${WRAPPER}" >"${SUT}"
@@ -186,6 +188,89 @@ if run "preflight" "/dev/null"; then
 else
   bad "preflight exited non-zero ($(cat "${SANDBOX}/out.log"))"
 fi
+
+# 7. Each operator-tool verb installs ITS OWN binary and restarts NOTHING.
+#
+# The restart assertion is the important half. An operator tool is a command, not a unit;
+# if one of these verbs ever restarted payment-api, a routine tool refresh would bounce the
+# service — and that is not what the caller asked for.
+for pair in \
+  "deploy-c6-webhook-sync:c6-webhook-sync" \
+  "deploy-c6-webhook-probe:c6-webhook-probe" \
+  "deploy-db-migrate:db-migrate" \
+  "deploy-vault-reseal:vault-reseal"
+do
+  verb="${pair%%:*}"; tool="${pair##*:}"
+  reset_state
+  rm -f "${SANDBOX}/opt/bin/${tool}"
+  if run "${verb}" "${ELF_FIXTURE}"; then
+    if [ -f "${SANDBOX}/opt/bin/${tool}" ] \
+       && cmp -s "${SANDBOX}/opt/bin/${tool}" "${ELF_FIXTURE}" \
+       && ! grep -q "restart" "${RESTART_LOG}" \
+       && [ ! -f "${SANDBOX}/opt/incoming/${tool}" ] \
+       && [ ! -f "${INSTALLED}" ]; then
+      ok "${verb} installs ${tool}, restarts nothing, leaves payment-api alone"
+    else
+      bad "${verb}: wrong state (installed=$([ -f "${SANDBOX}/opt/bin/${tool}" ] && echo y || echo n) restart=$(grep -c restart "${RESTART_LOG}"))"
+    fi
+  else
+    bad "${verb} exited non-zero ($(cat "${SANDBOX}/out.log"))"
+  fi
+done
+
+# 8. The tool verbs share the service's stdin gate: empty and non-ELF are refused, so a
+#    truncated upload can never land in /opt/payment/bin as an "installed" tool.
+reset_state
+rm -f "${SANDBOX}/opt/bin/c6-webhook-sync"
+if run "deploy-c6-webhook-sync" "/dev/null"; then
+  bad "deploy-c6-webhook-sync with empty stdin should fail"
+else
+  if grep -q "empty upload on stdin" "${SANDBOX}/out.log" && [ ! -f "${SANDBOX}/opt/bin/c6-webhook-sync" ]; then
+    ok "operator-tool verb rejects empty stdin (no install)"
+  else
+    bad "operator-tool empty stdin: wrong error or tool installed"
+  fi
+fi
+
+reset_state
+rm -f "${SANDBOX}/opt/bin/c6-webhook-sync"
+if run "deploy-c6-webhook-sync" "${SANDBOX}/junk"; then
+  bad "deploy-c6-webhook-sync with non-ELF stdin should fail"
+else
+  if grep -q "not an ELF binary" "${SANDBOX}/out.log" && [ ! -f "${SANDBOX}/opt/bin/c6-webhook-sync" ]; then
+    ok "operator-tool verb rejects non-ELF upload (no install)"
+  else
+    bad "operator-tool non-ELF: wrong error or tool installed"
+  fi
+fi
+
+# 9. The allow-list is still literal: a tool name is NOT a parameter.
+#
+# This is what keeps the new verbs from becoming a path-injection surface. `deploy-tool`
+# with a name, a traversal, or an unknown tool must all be refused outright — the wrapper
+# matches whole literal verbs and builds paths from its own constants.
+for refused in \
+  "deploy-tool c6-webhook-sync" \
+  "deploy-tool ../../etc/cron.d/evil" \
+  "deploy-c6-webhook-sync/../payment-api" \
+  "deploy-../../etc/passwd" \
+  "deploy-worker" \
+  "deploy-payment-api"
+do
+  reset_state
+  rm -f "${SANDBOX}/opt/bin/c6-webhook-sync"
+  if run "${refused}" "${ELF_FIXTURE}"; then
+    bad "allow-list should refuse '${refused}'"
+  else
+    if grep -q "refused:" "${SANDBOX}/out.log" \
+       && [ ! -f "${INSTALLED}" ] \
+       && [ ! -f "${SANDBOX}/opt/bin/c6-webhook-sync" ]; then
+      ok "allow-list refuses '${refused}' (a tool name is not a parameter)"
+    else
+      bad "'${refused}': wrong error or something was installed"
+    fi
+  fi
+done
 
 echo "---"
 echo "passed: ${PASS}  failed: ${FAIL}"
