@@ -239,19 +239,53 @@ func (p *Provider) GetImmediateCharge(ctx context.Context, tenantID, txID string
 	return p.toPixResult(out, "get_pix")
 }
 
+// pixPaginacao is the pagination block every BACEN PIX list echoes back inside
+// `parametros`. It is a named type because five different list endpoints carry the
+// identical block, and five copies of an anonymous struct drift.
+type pixPaginacao struct {
+	PaginaAtual            int `json:"paginaAtual"`
+	ItensPorPagina         int `json:"itensPorPagina"`
+	QuantidadeDePaginas    int `json:"quantidadeDePaginas"`
+	QuantidadeTotalDeItens int `json:"quantidadeTotalDeItens"`
+}
+
+// pixParametros is the echoed query envelope of a BACEN PIX list. Only the pagination
+// is consumed; the echoed window and filters are ignored on purpose.
+type pixParametros struct {
+	Paginacao pixPaginacao `json:"paginacao"`
+}
+
+// toPixPage maps the wire pagination onto the port type.
+func (p pixParametros) toPixPage() ports.PixPage {
+	return ports.PixPage{
+		Page:       p.Paginacao.PaginaAtual,
+		PageSize:   p.Paginacao.ItensPorPagina,
+		TotalItems: p.Paginacao.QuantidadeTotalDeItens,
+		TotalPages: p.Paginacao.QuantidadeDePaginas,
+	}
+}
+
+// pixWindowQuery renders the mandatory inicio/fim window plus optional pagination as
+// the query every BACEN PIX list takes. The bounds are RFC3339 UTC instants.
+func pixWindowQuery(start, end time.Time, page, pageSize int) url.Values {
+	q := url.Values{}
+	q.Set("inicio", start.UTC().Format(time.RFC3339))
+	q.Set("fim", end.UTC().Format(time.RFC3339))
+	if page > 0 {
+		q.Set("paginacao.paginaAtual", strconv.Itoa(page))
+	}
+	if pageSize > 0 {
+		q.Set("paginacao.itensPorPagina", strconv.Itoa(pageSize))
+	}
+	return q
+}
+
 // pixListResponseBody is the subset of C6's immediate-charge list (GET /v2/pix/cob,
 // the BACEN /cob list) we consume: the pagination block and the cobs array. Each
 // cob reuses the single-charge wire shape so toPixResult maps it identically.
 type pixListResponseBody struct {
-	Parametros struct {
-		Paginacao struct {
-			PaginaAtual            int `json:"paginaAtual"`
-			ItensPorPagina         int `json:"itensPorPagina"`
-			QuantidadeDePaginas    int `json:"quantidadeDePaginas"`
-			QuantidadeTotalDeItens int `json:"quantidadeTotalDeItens"`
-		} `json:"paginacao"`
-	} `json:"parametros"`
-	Cobs []pixChargeResponseBody `json:"cobs"`
+	Parametros pixParametros           `json:"parametros"`
+	Cobs       []pixChargeResponseBody `json:"cobs"`
 }
 
 // ListImmediateCharges lists the immediate PIX charges created within [Start,End]
@@ -269,15 +303,7 @@ func (p *Provider) ListImmediateCharges(ctx context.Context, tenantID string, fi
 		return ports.PixChargeList{}, err
 	}
 
-	q := url.Values{}
-	q.Set("inicio", filter.Start.UTC().Format(time.RFC3339))
-	q.Set("fim", filter.End.UTC().Format(time.RFC3339))
-	if filter.Page > 0 {
-		q.Set("paginacao.paginaAtual", strconv.Itoa(filter.Page))
-	}
-	if filter.PageSize > 0 {
-		q.Set("paginacao.itensPorPagina", strconv.Itoa(filter.PageSize))
-	}
+	q := pixWindowQuery(filter.Start, filter.End, filter.Page, filter.PageSize)
 
 	endpoint := p.baseURL + pixCobPath + "?" + q.Encode()
 	httpReq, err := http.NewRequestWithContext(withTenant(ctx, tenantID), http.MethodGet, endpoint, nil)
@@ -300,12 +326,13 @@ func (p *Provider) ListImmediateCharges(ctx context.Context, tenantID string, fi
 		}
 		charges = append(charges, r)
 	}
+	page := out.Parametros.toPixPage()
 	return ports.PixChargeList{
 		Charges:    charges,
-		Page:       out.Parametros.Paginacao.PaginaAtual,
-		PageSize:   out.Parametros.Paginacao.ItensPorPagina,
-		TotalItems: out.Parametros.Paginacao.QuantidadeTotalDeItens,
-		TotalPages: out.Parametros.Paginacao.QuantidadeDePaginas,
+		Page:       page.Page,
+		PageSize:   page.PageSize,
+		TotalItems: page.TotalItems,
+		TotalPages: page.TotalPages,
 	}, nil
 }
 
@@ -441,4 +468,115 @@ func formatAmount(cents int64) string {
 		cents = -cents
 	}
 	return fmt.Sprintf("%s%d.%02d", sign, cents/100, cents%100)
+}
+
+// --- Verbos de cobrança imediata que o produto não usa (roteiro P_01_02/P_01_03) ---
+//
+// Ver o comentário de ports.PixChargeReviser antes de chamar qualquer um dos dois: o
+// txid das nossas cobranças é DERIVADO da âncora de idempotência, e é essa derivação
+// que faz um reenvio acertar a mesma cobrança em vez de cobrar duas vezes. Deixar o
+// PSP escolher o txid joga isso fora.
+
+// compile-time assertion that Provider satisfies the revision port.
+var _ ports.PixChargeReviser = (*Provider)(nil)
+
+// pixChargeReviseBody is the PATCH body (CobBodyRevisada). Every field is a pointer so
+// an absent one is OMITTED rather than sent as a zero — a `valor` of "0.00" would be a
+// revision to zero, not "leave the amount alone".
+type pixChargeReviseBody struct {
+	Calendario *pixCalendario `json:"calendario,omitempty"`
+	Devedor    *pixDevedor    `json:"devedor,omitempty"`
+	Valor      *pixValor      `json:"valor,omitempty"`
+	Chave      string         `json:"chave,omitempty"`
+}
+
+// CreateImmediateChargeAutoTxID creates an immediate PIX charge with POST /v2/pix/cob,
+// letting the PSP assign the txid (roteiro P_01_02).
+//
+// Unlike CreateImmediateCharge this is NOT idempotent by construction: there is no
+// txid to collapse a re-submit onto, so a retry creates a second charge. The caller's
+// idempotency key still travels as the Idempotency-Key header, which is the only
+// protection here — hence the key is required rather than optional.
+func (p *Provider) CreateImmediateChargeAutoTxID(ctx context.Context, tenantID string, req ports.ChargeRequest, expiresIn time.Duration) (ports.PixChargeResult, error) {
+	const op = "create_pix_auto_txid"
+	if idempotencyKey(req) == "" || req.AmountCents <= 0 {
+		return ports.PixChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+	if expiresIn <= 0 {
+		expiresIn = defaultPixExpiry
+	}
+	chave, err := p.resolveCreditorKey(ctx, tenantID, req.CreditorKey)
+	if err != nil {
+		return ports.PixChargeResult{}, err
+	}
+	payload, err := json.Marshal(pixChargeRequestBody{
+		Calendario: pixCalendario{Expiracao: int64(expiresIn / time.Second)},
+		Devedor:    buildDevedor(req),
+		Valor:      pixValor{Original: formatAmount(req.AmountCents)},
+		Chave:      chave,
+	})
+	if err != nil {
+		return ports.PixChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodPost, p.baseURL+pixCobPath, payload, idempotencyKey(req))
+	if err != nil {
+		return ports.PixChargeResult{}, err
+	}
+	var out pixChargeResponseBody
+	if err := p.do(httpReq, op, &out); err != nil {
+		return ports.PixChargeResult{}, err
+	}
+	if strings.TrimSpace(out.TxID) == "" {
+		// The PSP assigning the txid is the whole point of this verb: a 201 without
+		// one leaves the charge unaddressable, and returning it would fail later,
+		// somewhere else.
+		return ports.PixChargeResult{}, &Error{Op: op, sentinel: shared.ErrUnavailable}
+	}
+	return p.toPixResult(out, op)
+}
+
+// ReviseImmediateCharge amends a registered immediate charge with PATCH
+// /v2/pix/cob/{txid} (roteiro P_01_03). Only the fields carried by req are sent: a
+// zero amount leaves the amount alone, a non-positive expiresIn leaves the calendar
+// alone, and an empty devedor leaves the payer alone.
+//
+// It refuses a revision that would send NOTHING: an empty PATCH is either a caller bug
+// or a lost field, and answering "ok" to it would report success for a change that
+// never happened.
+func (p *Provider) ReviseImmediateCharge(ctx context.Context, tenantID, txID string, req ports.ChargeRequest, expiresIn time.Duration) (ports.PixChargeResult, error) {
+	const op = "revise_pix"
+	txID = strings.TrimSpace(txID)
+	if txID == "" || req.AmountCents < 0 {
+		return ports.PixChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+
+	body := pixChargeReviseBody{Devedor: buildDevedor(req)}
+	if expiresIn > 0 {
+		body.Calendario = &pixCalendario{Expiracao: int64(expiresIn / time.Second)}
+	}
+	if req.AmountCents > 0 {
+		body.Valor = &pixValor{Original: formatAmount(req.AmountCents)}
+	}
+	if k := strings.TrimSpace(req.CreditorKey); k != "" {
+		body.Chave = k
+	}
+	if body.Calendario == nil && body.Valor == nil && body.Devedor == nil && body.Chave == "" {
+		return ports.PixChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return ports.PixChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+	endpoint := p.baseURL + pixCobPath + "/" + url.PathEscape(txID)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodPatch, endpoint, payload, idempotencyKey(req))
+	if err != nil {
+		return ports.PixChargeResult{}, err
+	}
+	var out pixChargeResponseBody
+	if err := p.do(httpReq, op, &out); err != nil {
+		return ports.PixChargeResult{}, err
+	}
+	return p.toPixResult(out, op)
 }
