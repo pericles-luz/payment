@@ -40,6 +40,13 @@ o pagador deve. O domínio continua modelando o escalonamento completo.
 precisa ser revista **antes** da janela: a saída seria emitir boleto simples pelo contrato
 v1. Isso é uma pergunta em aberto para o C6, não um defeito a corrigir depois.
 
+> **Resolvido em 21/09/2026.** A pergunta era boa e a resposta é a que estava escrita:
+> emitir pelo contrato v1. O roteiro v3.0 cobra BOLETO e BOLEPIX em blocos SEPARADOS —
+> são dois produtos, não duas versões —, e o adapter passou a falar os dois
+> (`bankslipv1.go`). As três faixas cabem no v1 e o caso B_03 é capturado por lá. O
+> limite de uma faixa continua valendo para o BolePix, e continua sendo recusa explícita
+> em vez de descarte silencioso.
+
 ## Endpoints (multi-tenant, deny-by-default, idempotency obrigatória nos writes)
 
 | Método | Rota                  | Sucesso | Grupos      |

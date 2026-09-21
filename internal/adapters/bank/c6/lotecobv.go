@@ -24,6 +24,19 @@ import (
 // que os verbos de escrita não devolvem lote nenhum: o resultado por cobrança só
 // aparece em GetBatch.
 //
+// # O sandbox não serve esta superfície hoje
+//
+// Medido em 21/09/2026, com token válido e escopos `lotecobv.read`/`lotecobv.write`
+// concedidos: TODAS as quatro operações respondem **502 Bad Gateway** do Cloudflare,
+// persistentemente, com `"retryable": true` e `origin_bad_gateway` — o que significa que
+// a origem do banco erra, não que a requisição esteja errada. Nenhum valor de `Accept`
+// muda isso: `application/json` chega a ser recusado com 400 pedindo
+// `application/problem+json`, que por sua vez responde 406, e `*/*` volta a página de
+// erro do Cloudflare.
+//
+// O código fica porque o contrato é o compromisso e a implementação está conforme ele.
+// O que não pode acontecer é alguém gastar um dia procurando o defeito deste lado.
+//
 // # O que a alteração pode e não pode
 //
 // Alterar um lote só mantém o CONJUNTO original: não dá para acrescentar nem remover

@@ -248,10 +248,29 @@ def preencher(modelo, evidencias, saida, organizacao, blocos):
 
 def verificar(caminho):
     """Relê o documento gravado e confere o que ele tem, sem depender do Word."""
+    problemas = []
     with zipfile.ZipFile(caminho) as z:
+        # Um .docx corrompido não avisa: o Word abre com "conteúdo ilegível" e não diz o
+        # que faltou. Conferir as duas peças obrigatórias e a integridade do zip custa
+        # nada e é o que separa "gravou" de "gravou algo que abre".
+        ruim = z.testzip()
+        if ruim:
+            problemas.append(f"entrada corrompida no zip: {ruim}")
+        for obrigatoria in ("[Content_Types].xml", DOC, "_rels/.rels"):
+            if obrigatoria not in z.namelist():
+                problemas.append(f"falta a peça {obrigatoria}")
+        vazias = [n for n in z.namelist() if not n.endswith("/") and z.getinfo(n).file_size == 0]
+        if vazias:
+            problemas.append(f"peças vazias: {vazias[:5]}")
         xml = z.read(DOC).decode("utf8")
 
-    problemas = []
+    # Um XML malformado só aparece aqui — o zip fica válido e o Word é que recusa.
+    try:
+        ET.fromstring(xml.encode("utf8"))
+    except ET.ParseError as erro:
+        print("FALHA: word/document.xml malformado:", erro)
+        return 1
+
     marcadas = xml.count('<w:checked w:val="1"/>')
     if marcadas != len(BLOCOS):
         problemas.append(f"{marcadas} caixas marcadas, esperava {len(BLOCOS)}")

@@ -1108,6 +1108,18 @@ func addBankSlipRange(op string, q url.Values, r bankSlipListRange) (used bool, 
 //
 // At least one date range must be supplied: the contract requires it, and a listing
 // with no window would either be refused by the bank or return everything.
+//
+// # O sandbox ainda não serve esta rota
+//
+// Medido em 21/09/2026: `GET /v2/bank_slips/list` responde **404 not_found** no
+// sandbox, com ou sem parâmetros — e, com parâmetros, responde antes "query parameter
+// is unexpected" para os quatro que o contrato declara. O contrato publicado (Bolepix
+// 1.1.1) está à frente do que aquele ambiente expõe.
+//
+// Isso NÃO é motivo para tirar o método: o contrato é o compromisso, o sandbox é uma
+// instalação dele, e produção pode muito bem já servir a rota. O que seria errado é
+// descobrir isso de novo daqui a três meses — por isso está escrito aqui, e a evidência
+// do caso BP_06 registra o 404.
 func (p *Provider) ListBoletos(ctx context.Context, tenantID string, filter ports.BoletoListFilter) (ports.BoletoList, error) {
 	const op = "list_boletos"
 	q := url.Values{}

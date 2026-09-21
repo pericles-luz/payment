@@ -80,6 +80,11 @@ tenant nunca lê/altera a cobv de outro (credencial por-tenant, leitura tenant-s
   subitem do roteiro cobv, foi descartado em vez de portado. **Se a homologação exigir
   listar cobv**, portar `GET /v1/pix/cobv` espelhando o filtro do imediato
   (`?start&end`, janela ≤ `maxPixListRange`, paginação) é um follow-up trivial.
+
+  > **A homologação exigiu, em 21/09/2026.** O roteiro v3.0 numera a listagem de cobv
+  > como **P_02_04**, subitem próprio do bloco PIX. A decisão está revertida:
+  > `ListDueCharges` existe em `pixcobv.go` e responde 200 contra o sandbox. O
+  > raciocínio de escopo estava certo para o roteiro v2.0, que de fato não a tinha.
 - **7.8 (webhook PIX recebido)** padroniza no modelo C6-D: a notificação de liquidação
   é reconciliada pelo webhook compartilhado `/webhooks/c6/{tenantRef}` (reconcile via
   `GetCharge`), não por um endpoint de registro de URL por-chave.

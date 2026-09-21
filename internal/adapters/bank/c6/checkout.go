@@ -22,6 +22,24 @@ var _ ports.CheckoutProvider = (*Provider)(nil)
 // SIN-65804/SIN-65883).
 const checkoutPath = "/v1/checkouts"
 
+// # A conta de sandbox não tem o produto Checkout habilitado
+//
+// Medido em 21/09/2026. O token traz `checkout.read`, `checkout.write`,
+// `checkout.cancel` e `checkout.keys.read`, e mesmo assim:
+//
+//	POST /v1/checkouts/  {amount:5, payment:{card:{type:CREDIT,…}}}  → 401
+//	POST /v1/checkouts/  {amount:5, payment:{pix:{key:"AUTO"}}}      → 401
+//	POST /v1/checkouts/  {amount:5}                                  → 400 (falta payment)
+//	POST /v1/checkouts/  {amount:5, payment:{pix:{}}}                → 400 (falta key)
+//	GET  /v1/checkouts/generate/public-key                           → 200
+//	GET  /v1/checkouts/nao-existe                                    → 400
+//
+// A leitura é direta: o gateway valida o CORPO primeiro e só então a habilitação. Todo
+// corpo VÁLIDO dá 401; todo corpo inválido dá 400. Ou seja, escopo concedido não é
+// produto contratado — a mesma distinção que faz o C6 Pay responder 403 em produção.
+//
+// Habilitar o Checkout nesta conta é pedido ao gerente, não trabalho de código.
+
 // cardBody is the C6 payment.card object (schema: card). For the hosted checkout
 // flow the payer types the card on C6's page, so card_info (card_hash/token) is
 // never sent at creation — only the routing fields are.
