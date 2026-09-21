@@ -45,6 +45,17 @@ type Routers struct {
 	Boleto       ports.BoletoProvider
 	DDA          ports.DDAProvider
 	Statement    ports.StatementProvider
+
+	// Superfícies do roteiro v3.0.
+	PixChargeReviser    ports.PixChargeReviser
+	PixDueChargeReviser ports.PixDueChargeReviser
+	PixDueChargeLister  ports.PixDueChargeLister
+	PixLocation         ports.PixLocationProvider
+	PixReceived         ports.PixReceivedProvider
+	PixDueChargeBatch   ports.PixDueChargeBatchProvider
+	AcquirerStatement   ports.AcquirerStatementProvider
+	PlainBoleto         ports.PlainBoletoProvider
+	BoletoLister        ports.BoletoLister
 }
 
 // NewRouters builds the per-port routers over reg.
@@ -57,6 +68,16 @@ func NewRouters(reg *Registry) Routers {
 		Boleto:       boletoRouter{reg},
 		DDA:          ddaRouter{reg},
 		Statement:    statementRouter{reg},
+
+		PixChargeReviser:    pixChargeReviserRouter{reg},
+		PixDueChargeReviser: pixDueChargeReviserRouter{reg},
+		PixDueChargeLister:  pixDueChargeListerRouter{reg},
+		PixLocation:         pixLocationRouter{reg},
+		PixReceived:         pixReceivedRouter{reg},
+		PixDueChargeBatch:   pixDueChargeBatchRouter{reg},
+		AcquirerStatement:   acquirerStatementRouter{reg},
+		PlainBoleto:         plainBoletoRouter{reg},
+		BoletoLister:        boletoListerRouter{reg},
 	}
 }
 
@@ -272,12 +293,12 @@ func (r ddaRouter) RemovePaymentGroupItem(ctx context.Context, tenantID, groupID
 	return set.DDA.RemovePaymentGroupItem(ctx, tenantID, groupID, itemID)
 }
 
-func (r ddaRouter) SubmitPaymentGroup(ctx context.Context, tenantID, groupID, idemKey string) error {
+func (r ddaRouter) SubmitPaymentGroup(ctx context.Context, tenantID, groupID, uploaderName, idemKey string) error {
 	set, ok := r.reg.resolve(ctx)
 	if !ok || set.DDA == nil {
 		return shared.ErrUnavailable
 	}
-	return set.DDA.SubmitPaymentGroup(ctx, tenantID, groupID, idemKey)
+	return set.DDA.SubmitPaymentGroup(ctx, tenantID, groupID, uploaderName, idemKey)
 }
 
 // --- StatementProvider ---
@@ -292,4 +313,255 @@ func (r statementRouter) GetStatement(ctx context.Context, tenantID string, filt
 		return ports.Statement{}, shared.ErrUnavailable
 	}
 	return set.Statement.GetStatement(ctx, tenantID, filter)
+}
+
+// --- Superfícies acrescentadas com o roteiro v3.0 --------------------------------
+//
+// Mesmo contrato dos routers acima: resolvem o banco do contexto e falham FECHADO
+// (shared.ErrUnavailable) quando o banco resolvido não fala aquela superfície. Nunca
+// caem para outro banco — rotear a cobrança de uma empresa para o banco errado seria
+// pior do que não atender.
+
+// --- PixChargeReviser ---
+
+type pixChargeReviserRouter struct{ reg *Registry }
+
+var _ ports.PixChargeReviser = pixChargeReviserRouter{}
+
+func (r pixChargeReviserRouter) CreateImmediateChargeAutoTxID(ctx context.Context, tenantID string, req ports.ChargeRequest, expiresIn time.Duration) (ports.PixChargeResult, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixChargeReviser == nil {
+		return ports.PixChargeResult{}, shared.ErrUnavailable
+	}
+	return set.PixChargeReviser.CreateImmediateChargeAutoTxID(ctx, tenantID, req, expiresIn)
+}
+
+func (r pixChargeReviserRouter) ReviseImmediateCharge(ctx context.Context, tenantID, txID string, req ports.ChargeRequest, expiresIn time.Duration) (ports.PixChargeResult, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixChargeReviser == nil {
+		return ports.PixChargeResult{}, shared.ErrUnavailable
+	}
+	return set.PixChargeReviser.ReviseImmediateCharge(ctx, tenantID, txID, req, expiresIn)
+}
+
+// --- PixDueChargeReviser / PixDueChargeLister ---
+
+type pixDueChargeReviserRouter struct{ reg *Registry }
+
+var _ ports.PixDueChargeReviser = pixDueChargeReviserRouter{}
+
+func (r pixDueChargeReviserRouter) ReviseDueCharge(ctx context.Context, tenantID, txID string, req ports.PixDueChargeRequest) (ports.PixDueChargeResult, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixDueChargeReviser == nil {
+		return ports.PixDueChargeResult{}, shared.ErrUnavailable
+	}
+	return set.PixDueChargeReviser.ReviseDueCharge(ctx, tenantID, txID, req)
+}
+
+type pixDueChargeListerRouter struct{ reg *Registry }
+
+var _ ports.PixDueChargeLister = pixDueChargeListerRouter{}
+
+func (r pixDueChargeListerRouter) ListDueCharges(ctx context.Context, tenantID string, filter ports.PixListFilter) (ports.PixDueChargeList, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixDueChargeLister == nil {
+		return ports.PixDueChargeList{}, shared.ErrUnavailable
+	}
+	return set.PixDueChargeLister.ListDueCharges(ctx, tenantID, filter)
+}
+
+// --- PixLocationProvider ---
+
+type pixLocationRouter struct{ reg *Registry }
+
+var _ ports.PixLocationProvider = pixLocationRouter{}
+
+func (r pixLocationRouter) CreateLocation(ctx context.Context, tenantID, tipoCob string) (ports.PixLocation, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixLocation == nil {
+		return ports.PixLocation{}, shared.ErrUnavailable
+	}
+	return set.PixLocation.CreateLocation(ctx, tenantID, tipoCob)
+}
+
+func (r pixLocationRouter) ListLocations(ctx context.Context, tenantID string, filter ports.PixLocationFilter) (ports.PixLocationList, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixLocation == nil {
+		return ports.PixLocationList{}, shared.ErrUnavailable
+	}
+	return set.PixLocation.ListLocations(ctx, tenantID, filter)
+}
+
+func (r pixLocationRouter) GetLocation(ctx context.Context, tenantID string, id int64) (ports.PixLocation, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixLocation == nil {
+		return ports.PixLocation{}, shared.ErrUnavailable
+	}
+	return set.PixLocation.GetLocation(ctx, tenantID, id)
+}
+
+func (r pixLocationRouter) UnlinkLocationTxID(ctx context.Context, tenantID string, id int64) (ports.PixLocation, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixLocation == nil {
+		return ports.PixLocation{}, shared.ErrUnavailable
+	}
+	return set.PixLocation.UnlinkLocationTxID(ctx, tenantID, id)
+}
+
+// --- PixReceivedProvider ---
+
+type pixReceivedRouter struct{ reg *Registry }
+
+var _ ports.PixReceivedProvider = pixReceivedRouter{}
+
+func (r pixReceivedRouter) GetReceivedPix(ctx context.Context, tenantID, endToEndID string) (ports.ReceivedPix, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixReceived == nil {
+		return ports.ReceivedPix{}, shared.ErrUnavailable
+	}
+	return set.PixReceived.GetReceivedPix(ctx, tenantID, endToEndID)
+}
+
+func (r pixReceivedRouter) ListReceivedPix(ctx context.Context, tenantID string, filter ports.ReceivedPixFilter) (ports.ReceivedPixList, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixReceived == nil {
+		return ports.ReceivedPixList{}, shared.ErrUnavailable
+	}
+	return set.PixReceived.ListReceivedPix(ctx, tenantID, filter)
+}
+
+func (r pixReceivedRouter) RequestRefund(ctx context.Context, tenantID, endToEndID, refundID string, req ports.PixRefundRequest) (ports.PixRefund, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixReceived == nil {
+		return ports.PixRefund{}, shared.ErrUnavailable
+	}
+	return set.PixReceived.RequestRefund(ctx, tenantID, endToEndID, refundID, req)
+}
+
+func (r pixReceivedRouter) GetRefund(ctx context.Context, tenantID, endToEndID, refundID string) (ports.PixRefund, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixReceived == nil {
+		return ports.PixRefund{}, shared.ErrUnavailable
+	}
+	return set.PixReceived.GetRefund(ctx, tenantID, endToEndID, refundID)
+}
+
+// --- PixDueChargeBatchProvider ---
+
+type pixDueChargeBatchRouter struct{ reg *Registry }
+
+var _ ports.PixDueChargeBatchProvider = pixDueChargeBatchRouter{}
+
+func (r pixDueChargeBatchRouter) CreateBatch(ctx context.Context, tenantID, batchID, description string, charges []ports.PixDueChargeRequest) error {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixDueChargeBatch == nil {
+		return shared.ErrUnavailable
+	}
+	return set.PixDueChargeBatch.CreateBatch(ctx, tenantID, batchID, description, charges)
+}
+
+func (r pixDueChargeBatchRouter) ReviseBatch(ctx context.Context, tenantID, batchID, description string, charges []ports.PixDueChargeRequest) error {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixDueChargeBatch == nil {
+		return shared.ErrUnavailable
+	}
+	return set.PixDueChargeBatch.ReviseBatch(ctx, tenantID, batchID, description, charges)
+}
+
+func (r pixDueChargeBatchRouter) GetBatch(ctx context.Context, tenantID, batchID string) (ports.PixDueChargeBatch, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixDueChargeBatch == nil {
+		return ports.PixDueChargeBatch{}, shared.ErrUnavailable
+	}
+	return set.PixDueChargeBatch.GetBatch(ctx, tenantID, batchID)
+}
+
+func (r pixDueChargeBatchRouter) ListBatches(ctx context.Context, tenantID string, filter ports.PixDueChargeBatchFilter) (ports.PixDueChargeBatchList, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PixDueChargeBatch == nil {
+		return ports.PixDueChargeBatchList{}, shared.ErrUnavailable
+	}
+	return set.PixDueChargeBatch.ListBatches(ctx, tenantID, filter)
+}
+
+// --- AcquirerStatementProvider ---
+
+type acquirerStatementRouter struct{ reg *Registry }
+
+var _ ports.AcquirerStatementProvider = acquirerStatementRouter{}
+
+func (r acquirerStatementRouter) ListReceivables(ctx context.Context, tenantID string, filter ports.AcquirerStatementFilter) (ports.ReceivableList, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.AcquirerStatement == nil {
+		return ports.ReceivableList{}, shared.ErrUnavailable
+	}
+	return set.AcquirerStatement.ListReceivables(ctx, tenantID, filter)
+}
+
+func (r acquirerStatementRouter) ListCardTransactions(ctx context.Context, tenantID string, filter ports.AcquirerStatementFilter) (ports.CardTransactionList, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.AcquirerStatement == nil {
+		return ports.CardTransactionList{}, shared.ErrUnavailable
+	}
+	return set.AcquirerStatement.ListCardTransactions(ctx, tenantID, filter)
+}
+
+// --- PlainBoletoProvider ---
+
+type plainBoletoRouter struct{ reg *Registry }
+
+var _ ports.PlainBoletoProvider = plainBoletoRouter{}
+
+func (r plainBoletoRouter) CreatePlainBoleto(ctx context.Context, tenantID string, req ports.BoletoRequest) (ports.BoletoResult, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PlainBoleto == nil {
+		return ports.BoletoResult{}, shared.ErrUnavailable
+	}
+	return set.PlainBoleto.CreatePlainBoleto(ctx, tenantID, req)
+}
+
+func (r plainBoletoRouter) GetPlainBoleto(ctx context.Context, tenantID, slipID string) (ports.BoletoResult, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PlainBoleto == nil {
+		return ports.BoletoResult{}, shared.ErrUnavailable
+	}
+	return set.PlainBoleto.GetPlainBoleto(ctx, tenantID, slipID)
+}
+
+func (r plainBoletoRouter) UpdatePlainBoleto(ctx context.Context, tenantID, slipID string, patch ports.BoletoPatch) (ports.BoletoResult, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PlainBoleto == nil {
+		return ports.BoletoResult{}, shared.ErrUnavailable
+	}
+	return set.PlainBoleto.UpdatePlainBoleto(ctx, tenantID, slipID, patch)
+}
+
+func (r plainBoletoRouter) CancelPlainBoleto(ctx context.Context, tenantID, slipID string) error {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PlainBoleto == nil {
+		return shared.ErrUnavailable
+	}
+	return set.PlainBoleto.CancelPlainBoleto(ctx, tenantID, slipID)
+}
+
+func (r plainBoletoRouter) GetPlainBoletoPDF(ctx context.Context, tenantID, slipID string) (ports.BoletoDocument, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.PlainBoleto == nil {
+		return ports.BoletoDocument{}, shared.ErrUnavailable
+	}
+	return set.PlainBoleto.GetPlainBoletoPDF(ctx, tenantID, slipID)
+}
+
+// --- BoletoLister ---
+
+type boletoListerRouter struct{ reg *Registry }
+
+var _ ports.BoletoLister = boletoListerRouter{}
+
+func (r boletoListerRouter) ListBoletos(ctx context.Context, tenantID string, filter ports.BoletoListFilter) (ports.BoletoList, error) {
+	set, ok := r.reg.resolve(ctx)
+	if !ok || set.BoletoLister == nil {
+		return ports.BoletoList{}, shared.ErrUnavailable
+	}
+	return set.BoletoLister.ListBoletos(ctx, tenantID, filter)
 }

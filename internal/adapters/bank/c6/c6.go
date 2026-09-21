@@ -475,3 +475,76 @@ func (p *Provider) do(req *http.Request, op string, dst any) error {
 		return mapError(op, status, body)
 	}
 }
+
+// --- Cabeçalhos de identificação do parceiro ------------------------------------
+//
+// Dois contratos do C6 — Agendamento de Pagamentos e Transações e Recebíveis —
+// declaram `partner-software-name` e `partner-software-version`. São opcionais e
+// informativos: o banco os usa para saber qual software está chamando.
+//
+// São CONSTANTES, e não `version.Info()`, de propósito. O valor identifica o
+// SOFTWARE, não o build: mandar o SHA do commit faria o banco ver um parceiro
+// diferente a cada deploy, o que é ruído puro do lado de lá e não responde nenhuma
+// pergunta do lado de cá. O par abaixo é o mesmo que a sonda de operador já manda,
+// então o banco vê uma identidade só.
+const (
+	partnerSoftwareName    = "payment-gateway"
+	partnerSoftwareVersion = "1.0.0"
+)
+
+// setPartnerSoftware stamps the partner-identification headers on a request bound
+// for a C6 surface that declares them.
+func setPartnerSoftware(req *http.Request) {
+	req.Header.Set("partner-software-name", partnerSoftwareName)
+	req.Header.Set("partner-software-version", partnerSoftwareVersion)
+}
+
+// doRaw executes an authenticated request whose successful response is a BINARY document
+// rather than JSON, returning the bytes verbatim together with the upstream Content-Type.
+//
+// It exists because do() json.Unmarshals every 2xx body, which a PDF is not. Single-shot,
+// like its doNoContent/doStatus siblings: a document read is not a write, so it does not
+// need the request-rewind machinery the retry loop carries.
+//
+// The read is capped at limit, and a response that REACHES the cap is an error rather than
+// a truncated success. That distinction matters here in a way it does not for JSON: a
+// clipped JSON body fails to parse and is caught, while a clipped PDF is a plausible-looking
+// file that no longer opens.
+func (p *Provider) doRaw(req *http.Request, op string, limit int64) ([]byte, string, error) {
+	resp, err := p.httpc.Do(req)
+	if err != nil {
+		return nil, "", transportError(op)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// limit+1 so hitting the ceiling is detectable rather than silently truncating.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if readErr != nil {
+		return nil, "", transportError(op)
+	}
+	if resp.StatusCode/100 != 2 {
+		return nil, "", mapError(op, resp.StatusCode, body)
+	}
+	if int64(len(body)) > limit {
+		return nil, "", &Error{Op: op, StatusCode: resp.StatusCode, sentinel: shared.ErrUnavailable,
+			detail: "document exceeds the maximum size"}
+	}
+	return body, resp.Header.Get("Content-Type"), nil
+}
+
+// doNoContent executes an authenticated request that returns no body on success
+// (204 No Content: the DELETE and submit operations). It maps a non-2xx into a
+// domain error and, on a 2xx, drains and discards the body. It exists because do()
+// decodes a JSON body and would treat an empty 204 body as a malformed response.
+func (p *Provider) doNoContent(req *http.Request, op string) error {
+	resp, err := p.httpc.Do(req)
+	if err != nil {
+		return transportError(op)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if resp.StatusCode/100 != 2 {
+		return mapError(op, resp.StatusCode, body)
+	}
+	return nil
+}

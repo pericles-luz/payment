@@ -386,3 +386,108 @@ func (p *Provider) UpdateDueCharge(ctx context.Context, tenantID, txID string, r
 	}
 	return toCobvResult(out, "update_cobv")
 }
+
+// --- Revisão e listagem de cobv (roteiro P_02_02 / P_02_04) ---------------------
+
+// compile-time assertions that Provider satisfies the cobv revision and list ports.
+var (
+	_ ports.PixDueChargeReviser = (*Provider)(nil)
+	_ ports.PixDueChargeLister  = (*Provider)(nil)
+)
+
+// cobvReviseBody is the PATCH body. Every field is a pointer so an absent one is
+// OMITTED: PATCH amends, and sending a zero `valor.original` would be a revision to
+// zero rather than "leave the amount alone". That distinction is exactly why this is
+// not the same body UpdateDueCharge sends over PUT, which replaces.
+type cobvReviseBody struct {
+	Calendario *cobvCalendario `json:"calendario,omitempty"`
+	Devedor    *pixDevedor     `json:"devedor,omitempty"`
+	Valor      *cobvValor      `json:"valor,omitempty"`
+	Chave      string          `json:"chave,omitempty"`
+}
+
+// cobvListResponseBody is the list envelope: pagination plus the `cobs` array. The
+// BACEN cobv list names its array `cobs`, same as the immediate-charge list.
+type cobvListResponseBody struct {
+	Parametros pixParametros      `json:"parametros"`
+	Cobs       []cobvResponseBody `json:"cobs"`
+}
+
+// ReviseDueCharge amends a registered cobv with PATCH /v2/pix/cobv/{txid} (roteiro
+// P_02_02). Only the fields carried by req are sent.
+//
+// It refuses a revision that would send NOTHING, for the same reason the immediate
+// charge does: an empty PATCH is a lost field, and answering "ok" to it reports a
+// change that never happened.
+func (p *Provider) ReviseDueCharge(ctx context.Context, tenantID, txID string, req ports.PixDueChargeRequest) (ports.PixDueChargeResult, error) {
+	const op = "revise_cobv"
+	txID = strings.TrimSpace(txID)
+	if txID == "" || req.AmountCents < 0 {
+		return ports.PixDueChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+
+	body := cobvReviseBody{Devedor: buildCobvDevedor(req), Chave: strings.TrimSpace(req.CreditorKey)}
+	if !req.DueDate.IsZero() || req.ValidityDays > 0 {
+		cal := &cobvCalendario{ValidadeAposVencimento: req.ValidityDays}
+		if !req.DueDate.IsZero() {
+			cal.DataDeVencimento = req.DueDate.UTC().Format(cobvDateLayout)
+		}
+		body.Calendario = cal
+	}
+	// The rate blocks only make sense alongside an amount: BACEN carries multa, juros
+	// and desconto INSIDE valor, so revising a rate means sending valor.
+	if req.AmountCents > 0 {
+		full := toCobvRequestBody("", req)
+		body.Valor = &full.Valor
+	}
+	if body.Calendario == nil && body.Valor == nil && body.Devedor == nil && body.Chave == "" {
+		return ports.PixDueChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return ports.PixDueChargeResult{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+	endpoint := p.baseURL + pixCobvPath + "/" + url.PathEscape(txID)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodPatch, endpoint, payload, cobvAnchor(req))
+	if err != nil {
+		return ports.PixDueChargeResult{}, err
+	}
+	var out cobvResponseBody
+	if err := p.do(httpReq, op, &out); err != nil {
+		return ports.PixDueChargeResult{}, err
+	}
+	return toCobvResult(out, op)
+}
+
+// ListDueCharges lists the cobv charges created within [Start,End] via GET
+// /v2/pix/cobv?inicio=…&fim=… (roteiro P_02_04). The window bounds are mandatory.
+//
+// This reverses the scope decision recorded in docs/homologacao/
+// pix-cobv-checkout-camadaA.md, which left cobv listing out; the roteiro cobra it.
+// Like the single reads it is fail-secure on the money: a malformed amount in any
+// charge maps to ErrUnavailable rather than reconciling to zero.
+func (p *Provider) ListDueCharges(ctx context.Context, tenantID string, filter ports.PixListFilter) (ports.PixDueChargeList, error) {
+	const op = "list_cobv"
+	if filter.Start.IsZero() || filter.End.IsZero() {
+		return ports.PixDueChargeList{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+	q := pixWindowQuery(filter.Start, filter.End, filter.Page, filter.PageSize)
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodGet, p.baseURL+pixCobvPath+"?"+q.Encode(), nil, "")
+	if err != nil {
+		return ports.PixDueChargeList{}, err
+	}
+	var out cobvListResponseBody
+	if err := p.do(httpReq, op, &out); err != nil {
+		return ports.PixDueChargeList{}, err
+	}
+	charges := make([]ports.PixDueChargeResult, 0, len(out.Cobs))
+	for _, c := range out.Cobs {
+		r, err := toCobvResult(c, op)
+		if err != nil {
+			return ports.PixDueChargeList{}, err
+		}
+		charges = append(charges, r)
+	}
+	return ports.PixDueChargeList{Charges: charges, PixPage: out.Parametros.toPixPage()}, nil
+}

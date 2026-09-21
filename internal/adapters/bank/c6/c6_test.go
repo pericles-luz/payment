@@ -66,7 +66,7 @@ func newTestServer(t *testing.T) *testServer {
 	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
 		ts.mu.Lock()
 		ts.tokenHits++
-		user, _, _ := r.BasicAuth()
+		user := tokenClientID(r)
 		ts.lastBasicUser = user
 		h := ts.tokenHandler
 		ts.mu.Unlock()
@@ -492,4 +492,19 @@ func TestCreateChargeDoesNotFollowRedirect(t *testing.T) {
 	if ts.getHits != 0 {
 		t.Fatalf("redirect was followed: the target endpoint was reached (getHits=%d)", ts.getHits)
 	}
+}
+
+// tokenClientID reads the client_id a token request carried, the way the real C6
+// token endpoint does: from the form BODY (client_secret_post), which is what the
+// published contract requires.
+//
+// Every C6 double in this package mints "tok-<client_id>" so a test can assert which
+// tenant's credential produced the bearer. Reading it from the body rather than from
+// Basic auth is what keeps the doubles honest about the grant the adapter actually
+// performs — see the comment on tokenManager.fetch.
+func tokenClientID(r *http.Request) string {
+	if err := r.ParseForm(); err != nil {
+		return ""
+	}
+	return r.PostFormValue("client_id")
 }

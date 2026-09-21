@@ -43,6 +43,34 @@ type ProviderSet struct {
 	// WebhookDeregistrar removes those callbacks. Only the BACEN surfaces expose a
 	// delete, so a bank may register without being able to deregister.
 	WebhookDeregistrar ports.WebhookDeregistrar
+
+	// --- Superfícies acrescentadas com o roteiro v3.0 -----------------------------
+	//
+	// Todas opcionais, como as de cima: um banco que não fale uma delas deixa o campo
+	// nil e o router falha fechado com ErrUnavailable, em vez de rotear para outro
+	// banco. É o que permite o modo stub continuar subindo sem implementar nenhuma.
+
+	// PixChargeReviser revisa uma cobrança imediata já criada (PATCH /cob/{txid}).
+	PixChargeReviser ports.PixChargeReviser
+	// PixDueChargeReviser revisa uma cobrança com vencimento (PATCH /cobv/{txid}).
+	// Separado de PixDueCharge porque PATCH emenda e o PUT de lá substitui.
+	PixDueChargeReviser ports.PixDueChargeReviser
+	// PixDueChargeLister lista cobranças com vencimento por intervalo.
+	PixDueChargeLister ports.PixDueChargeLister
+	// PixLocation gerencia as locations de payload (o QR endereçável).
+	PixLocation ports.PixLocationProvider
+	// PixReceived lê os PIX recebidos e solicita devolução — a única superfície
+	// deste bloco que MOVE dinheiro.
+	PixReceived ports.PixReceivedProvider
+	// PixDueChargeBatch cria e lê lotes de cobrança com vencimento.
+	PixDueChargeBatch ports.PixDueChargeBatchProvider
+	// AcquirerStatement lê o extrato de adquirência (transações e recebíveis).
+	AcquirerStatement ports.AcquirerStatementProvider
+	// PlainBoleto é o boleto simples — produto DIFERENTE do BolePix, com até três
+	// faixas de desconto e sem perna PIX.
+	PlainBoleto ports.PlainBoletoProvider
+	// BoletoLister lista as cobranças BolePix emitidas.
+	BoletoLister ports.BoletoLister
 }
 
 // Registry maps a non-secret bank slug to its ProviderSet. It is the closed set of

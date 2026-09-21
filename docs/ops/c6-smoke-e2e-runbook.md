@@ -372,50 +372,115 @@ pós-fato deixa janela `0644`). Grant de leitura é para o **único consumidor**
 nunca para `world`/`group` amplo (defesa em profundidade: perms + ownership +
 lifetime transiente no ingress).
 
-### 8.2 Endpoints do sandbox — status (BLOQUEADO no portal, NÃO bloqueia o cert)
+### 8.2 Endpoints do sandbox — resolvido
 
-`PAYMENT_C6_BASE_URL` / `PAYMENT_C6_TOKEN_URL` do **sandbox de homologação** não
-vieram no e-mail de onboarding e o Portal do Desenvolvedor C6
-(<https://developers.c6bank.com.br/>) é **login-walled** — a referência de API,
-os hostnames de sandbox e o material do mTLS ficam atrás do login/onboarding e
-**não são alcançáveis sem credencial do portal**. Confirmação pública também não
-existe (busca aberta não retorna os hosts).
-
-> **PLACEHOLDER — preencher na obtenção dos endpoints (rotear via SIN-65805 / SIN-65344):**
+> **Esta seção dizia, até 21/09/2026, que o portal é "login-walled" e que os
+> hostnames do sandbox "não são alcançáveis sem credencial do portal". Está errado, e
+> já estava quando a §9 abaixo registrou o host.** O portal
+> (<https://developers.c6bank.com.br/>) é público: a §3 do próprio FAQ diz que
+> "qualquer pessoa pode navegar por este portal livremente… sem a necessidade de
+> cadastro", e o `c6-portal-baseline.json` diffa o sitemap dele desde 06/08/2026. As
+> OpenAPI de todos os produtos saem de `/yamls/<spec>.yaml` — só é preciso passar o
+> Cloudflare com User-Agent de navegador:
 >
+> ```sh
+> curl -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 …Chrome/140…" \
+>      -H "Referer: https://developers.c6bank.com.br/apis" \
+>      https://developers.c6bank.com.br/yamls/pix-api.yaml
 > ```
-> PAYMENT_C6_BASE_URL=https://<sandbox-base-host-do-portal>      # ex.: baseapi homologação
-> PAYMENT_C6_TOKEN_URL=https://<sandbox-token-host-do-portal>/oauth/token
-> PAYMENT_C6_SCOPE=                                   # DEIXE VAZIO — scope explícito ⇒ 400/invalid_request (§7 passo 1)
-> PAYMENT_C6_CLIENT_CERT=/etc/payment/c6/client.crt   # PEM emitido/registrado no portal
-> PAYMENT_C6_CLIENT_KEY=/etc/payment/c6/client.key
-> ```
+>
+> As nove estão versionadas em `docs/compliance/`. Enquanto esta seção dizia o
+> contrário, DTO foi adivinhado — foi assim que nasceram o `Accept: application/jose`,
+> o `loc.location` aninhado e os caminhos `/v1/dda/*` que não existem.
 
-O **plumbing do cert (entregáveis 2–3) está completo e testado** independentemente
-desses valores: assim que o portal liberar base/token URLs + o PEM do cliente,
-basta preencher as cinco vars acima e rodar a §5/§7 — nenhuma mudança de código é
-necessária.
+Valores do sandbox:
+
+```
+PAYMENT_C6_BASE_URL=https://baas-api-sandbox.c6bank.info
+PAYMENT_C6_TOKEN_URL=https://baas-api-sandbox.c6bank.info/v1/auth/
+PAYMENT_C6_SCOPE=                                   # DEIXE VAZIO — scope explícito ⇒ 400/invalid_request
+PAYMENT_C6_BILLING_SCHEME=21                        # carteira de sandbox; vazio usa 15 (produção)
+PAYMENT_C6_CLIENT_CERT=/run/payment/sbx/c6/client.crt
+PAYMENT_C6_CLIENT_KEY=/run/payment/sbx/c6/client.key
+```
 
 ## 9. Contrato REAL do C6 — descoberto ao vivo ([SIN-65856](/SIN/issues/SIN-65856))
 
 O smoke contra o sandbox real ([SIN-65804](/SIN/issues/SIN-65804)) provou mTLS+OAuth2
 mas revelou que os paths do adapter eram **placeholders** (404). Iterando ao vivo
 (mTLS + bearer) descobriu-se o contrato real abaixo. Base do sandbox:
-`https://baas-api-sandbox.c6bank.info`; token em `/v1/auth/` (Basic auth + mTLS).
-Janela: seg–sex 7h–23h BRT. Erros = **RFC7807 problem+json** (BACEN PIX:
+`https://baas-api-sandbox.c6bank.info`; token em `/v1/auth/` (**credencial no CORPO** +
+mTLS — ver 9.0). Janela: seg–sex 7h–23h BRT. Erros = **RFC7807 problem+json** (BACEN PIX:
 `https://pix.bcb.gov.br/api/v2/error/...`; C6 próprio:
 `https://developers.c6bank.com.br/v1/error/...`).
 
 | Superfície | Path real | Status |
 | --- | --- | --- |
 | PIX cob (imediata) | `PUT`/`GET /v2/pix/cob/{txid}` · lista `GET /v2/pix/cob?inicio=&fim=` | ✅ remapeado + **positivo provado (HTTP 200)** |
-| PIX cobv (com venc.) | `/v2/pix/cobv/{txid}` | ⏳ DTO real pendente (follow-up) |
-| PIX recebidos / recorrência | `/v2/pix/pix` · `/v2/pix/rec` | ⏳ follow-up |
+| PIX cobv (com venc.) | `PUT`/`PATCH`/`GET /v2/pix/cobv/{txid}` · lista `GET /v2/pix/cobv` | ✅ contrato versionado (`c6-pix-oas.yaml` 3.0.1) |
+| PIX recebidos / devolução | `GET /v2/pix/pix[/{e2eid}]` · `PUT`/`GET /v2/pix/pix/{e2eid}/devolucao/{id}` | ✅ implementado (`pixrecebidos.go`) |
+| PIX location | `POST`/`GET /v2/pix/loc` · `GET /v2/pix/loc/{id}` · `DELETE /v2/pix/loc/{id}/txid` | ✅ implementado (`pixloc.go`) |
+| PIX lote de cobv | `PUT`/`PATCH`/`GET /v2/pix/lotecobv/{id}` · lista `GET /v2/pix/lotecobv` | ✅ implementado (`lotecobv.go`); escrita responde **202**, não 201 |
+| Agendamento de Pagamentos | `/v1/schedule_payments/{decode,query,{group_id}/items,submit}` | ✅ implementado (`schedulepayments.go`); **não é `/v1/dda/*`** |
+| Boleto Bancário v1 | `POST /v1/bank_slips/` · `PUT`/`GET /{id}` · `/{id}/pdf` · `/{id}/cancel` | ✅ implementado (`bankslipv1.go`); produto SEPARADO do BolePix |
+| Transações e Recebíveis (C6 Pay) | `GET /v1/c6pay/statement/{receivables,transactions}` | ✅ implementado (`c6pay.go`); array vem em **`content`**, não no nome da spec |
 | Extrato | `GET /v1/statement?start_date=&end_date=` (yyyy-MM-dd) | ✅ params remapeados |
 | Boleto / BolePix | `POST /v2/bank_slips` | ✅ contrato oficial versionado (`docs/compliance/c6-bolepix-oas.yaml`); emissão, consulta, `PATCH`, PDF e baixa implementados |
-| Checkout | `POST /v1/checkouts` | ⏳ path descoberto; schema `payment` portal-gated (follow-up) |
+| Checkout | `POST /v1/checkouts` | ✅ contrato versionado (`c6-checkout-oas.yaml` 1.2.0); `POST /authorize` (token de cartão) NÃO implementado — ver 9.0 |
 | Webhook PIX (registro) | `PUT`/`GET /v2/pix/webhook/{chave}` (`chave` no path; corpo `{"webhookUrl":"…"}`) | ✅ implementado (`internal/adapters/bank/c6/webhook.go` + `cmd/register-webhook`) |
 | Webhook C6-próprio (boleto/checkout) | `/v1/webhooks` (req: `service`∈{BANK_SLIP,CHECKOUT,BANK_SLIP_PIX}, `url`) | ✅ os três registrados (`cmd/api`, `cmd/c6-webhook-sync`); receptor em `webhookKindBoleto` |
+
+### 9.0 Autenticação — credencial no CORPO, e o 500 intermitente
+
+**A credencial vai no corpo.** O contrato (`docs/compliance/c6-auth-oas.yaml`) declara
+`client_id`, `client_secret` e `grant_type` como `required` em
+`application/x-www-form-urlencoded`, e não menciona Basic em lugar nenhum. O adapter
+mandava Basic; funcionava por tolerância do servidor, não por contrato. Corrigido em
+`token.go`, com trava em `TestTokenGrantUsesClientSecretPost`.
+
+**O endpoint de token responde 500 de forma INTERMITENTE, e não é a forma da
+credencial.** Medido em 21/09/2026, oito tentativas de cada jeito, em sequência:
+
+```
+CORPO : 500 200 200 500 500 200 500 500
+BASIC : 200 200 500 500 500 200 500 500
+```
+
+> **Correção.** A primeira leitura desta medição — feita com UMA amostra de cada — foi
+> "Basic devolve 500, o corpo devolve 200", e chegou a ser registrada aqui e numa
+> mensagem de commit. Está errada. Uma amostra de um endpoint que falha metade das
+> vezes não mede nada; repetindo, os dois caminhos falham na mesma proporção. A troca
+> para o corpo continua certa — é o que o contrato diz —, mas o motivo não é esse.
+
+Um 500 no token não falha uma chamada: falha TODAS, porque sem bearer não há cobrança
+nem conciliação. Por isso `fetch` repete — **só em 5xx**, no máximo três vezes, com
+espera crescente. Um 400/401 é resposta sobre a credencial e não se repete: repetir não
+conserta configuração, só vira tráfego.
+
+Repetir é seguro aqui de um jeito que quase nada mais é: o FAQ do C6 (§9) diz que gerar
+um token novo **não invalida o atual**.
+
+**`expires_in` é 600**, não 300.
+
+#### Escopos concedidos (token de sandbox, 21/09/2026)
+
+```
+payloadlocationrec.write payloadlocationrec.read receivable.read checkout.read
+cobv.write schedulepayments.write cobr.read webhook.read pix.read bankslip.write
+v2.bankslip.write solicrec.write cobr.write solicrec.read statement.read
+lotecobv.write bankslip.read recpayload.read checkout.write payloadlocation.write
+v2.bankslip.pix.write schedulepayments.read lotecobv.read rec.read webhook.write
+cob.read v2.bankslip.read pix.write cob.write checkout.cancel cobv.read rec.write
+checkout.keys.read payloadlocation.read
+```
+
+Cobre os nove blocos do roteiro, inclusive `schedulepayments.*` — ou seja, **o
+Agendamento de Pagamentos ESTÁ habilitado nesta conta**, e o 404 que a ADR-0013 atribuía
+à falta do produto era caminho errado.
+
+Dois escopos do roteiro **não** vieram: `checkout.capture` e `recpayload.write`. Nenhum
+dos dois é exigido pelos casos listados; se um `PUT /checkouts/{id}/capture` ou uma
+escrita de payload de recorrência entrar em escopo, é pedido ao gerente, não código.
 
 ### 9.1 PIX cob — caminho positivo confirmado (HTTP 200)
 

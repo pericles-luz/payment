@@ -33,10 +33,15 @@ type PixService struct {
 	tenants  ports.TenantRepository
 	pricing  ports.PricingRepository
 	pix      ports.PixProvider
-	bus      ports.MessageBus
-	clock    ports.Clock
-	ids      ports.IDProvider
-	uow      ports.UnitOfWork
+	// reviser é a revisão de uma cobrança já criada (PATCH). Porta SEPARADA de pix
+	// (ISP) porque o fluxo de venda nunca revisa: o txid nasce da âncora de
+	// idempotência, e é isso que impede cobrar duas vezes. Nil deixa a operação
+	// indisponível em vez de derrubar o serviço.
+	reviser ports.PixChargeReviser
+	bus     ports.MessageBus
+	clock   ports.Clock
+	ids     ports.IDProvider
+	uow     ports.UnitOfWork
 }
 
 // NewPixService wires a PixService from the provided ports.
@@ -46,6 +51,7 @@ func NewPixService(d Deps) *PixService {
 		tenants:  d.Tenants,
 		pricing:  d.Pricing,
 		pix:      d.Pix,
+		reviser:  d.PixChargeReviser,
 		bus:      d.Bus,
 		clock:    d.Clock,
 		ids:      d.IDs,

@@ -253,8 +253,17 @@ Emissão ponta a ponta pela nossa API: **HTTP 201**. O que isso fechou:
 Não há como liquidar um boleto no sandbox do C6 a partir daqui:
 
 - o catálogo de APIs do portal não expõe **nenhum simulador** de pagamento;
-- `Agendamento de Pagamentos` (DDA) responde **404** para esta conta — ela não tem DDA, e de
-  todo modo o DDA lista boletos em que a conta é *pagadora*, não cedente;
+- `Agendamento de Pagamentos` lista boletos em que a conta é *pagadora*, não cedente, então
+  não serve para liquidar uma cobrança nossa de qualquer forma;
+
+  > **Correção, 21/09/2026.** Esta linha dizia que o Agendamento "responde 404 para esta
+  > conta — ela não tem DDA". Não era isso. O adapter chamava `/v1/dda/boletos` e
+  > `/v1/dda/payment-groups`, caminhos que não existem em contrato nenhum; o produto está
+  > em `/v1/schedule_payments/` e a página `/apis/schedule-payments` está no
+  > `c6-portal-baseline.json` desde 06/08/2026. O 404 era o caminho, não a conta. A
+  > conclusão desta seção não muda — o Agendamento continua sem servir para liquidar —,
+  > mas a razão registrada estava errada, e uma razão errada num diagnóstico custa a
+  > próxima investigação.
 - pagar o QR PIX exige um PSP pagador, que não temos.
 
 Então as medições 1, 2, 3 e 5 continuam abertas e dependem de o C6 liquidar uma cobrança de

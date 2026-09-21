@@ -619,29 +619,41 @@ func (p *Provider) GetCobR(ctx context.Context, tenantID, txID string) (ports.Co
 
 // ---- shared helpers ----
 
-// recurrenceRead performs a Recorrência read: GET with Accept: application/json, maps
-// a non-2xx into a domain error, and returns the body.
+// recurrenceRead performs a Recorrência read: GET with `Accept: */*`, maps a non-2xx
+// into a domain error, and returns the body.
 //
-// It used to send `Accept: application/jose` and refuse to trust the body unless a JWS
-// verified against a C6 JWKS. That was wrong, and provably so — C6 rejects the header
-// outright (probed against the sandbox on 28/08/2026, cmd/c6-rec-probe):
+// # Por que `*/*`, e não `application/json`
 //
-//	Accept: application/json  → 200, Content-Type: application/json
-//	Accept: application/jose  → 400 "Request Accept header '[application/jose]' does
-//	                            not match any defined response types. Must be one of:
-//	                            [application/json, application/problem+json]"
+// Porque o gateway do C6 se contradiz, e medir foi o único jeito de saber. Em
+// 21/09/2026, contra o sandbox, com o mesmo token:
 //
-// So every recurrence read was failing, and no JWKS value could have fixed it: the
-// request was refused before any signature could exist to verify. The contract agrees
-// — these reads are declared application/json, and the single JWS in the whole C6 Pix
-// Automático spec belongs to GET /rec/{recUrlAccessToken}: a PUBLIC endpoint on another
-// host (qrcode-h.c6pix.com), signed under a BACEN `jku`, fetched and validated by the
-// PAYER's PSP when it scans the QR. We are the recebedor; that document is not ours to
-// verify, and we never request it.
+//	GET /v2/pix/rec           (lista)   Accept: application/json  → 200
+//	GET /v2/pix/solicrec/{id}           Accept: application/json  → 200
+//	GET /v2/pix/rec/{idRec}   (uma)     Accept: application/json  → 400
+//	  "Request Accept header '[application/json]' does not match any defined response
+//	   types. Must be one of: [application/jose, application/problem+json]"
+//	GET /v2/pix/rec/{idRec}             Accept: application/jose         → 406
+//	GET /v2/pix/rec/{idRec}             Accept: application/problem+json → 406
+//	GET /v2/pix/rec/{idRec}             Accept: */*                      → 200, e o
+//	                                      corpo que volta é application/json
 //
-// What authenticates these reads is therefore the channel, not the payload: OAuth2
-// client_credentials over the per-tenant mTLS transport — exactly what already
-// authenticates cob, cobv, boleto and checkout.
+// Ou seja: a leitura de UMA recorrência recusa o tipo que ela devolve, exige dois tipos
+// que ela então recusa, e atende quem não exige nada. Não há valor específico correto —
+// `*/*` é a única resposta que funciona nos três endpoints, e é honesta: aceitamos o
+// que vier e decodificamos JSON.
+//
+// # O que NÃO mudou
+//
+// A correção de 28/08/2026 continua de pé: nunca pedimos `application/jose`. Aquela
+// medição foi feita na LISTA, que de fato recusa jose, e a conclusão — que não há JWS a
+// verificar aqui — não muda. O único JWS do contrato é o de
+// GET /rec/{recUrlAccessToken}: endpoint PÚBLICO noutro host (qrcode-h.c6pix.com),
+// assinado sob `jku` do BACEN, lido e validado pelo PSP DO PAGADOR quando ele escaneia
+// o QR. Somos o recebedor; aquele documento não é nosso para verificar.
+//
+// O que autentica estas leituras é o canal, não o corpo: OAuth2 client_credentials
+// sobre o transporte mTLS por tenant — o mesmo que já autentica cob, cobv, boleto e
+// checkout.
 func (p *Provider) recurrenceRead(ctx context.Context, tenantID, op, endpoint string) ([]byte, error) {
 	token, err := p.tokens.token(ctx, tenantID)
 	if err != nil {
@@ -652,7 +664,7 @@ func (p *Provider) recurrenceRead(ctx context.Context, tenantID, op, endpoint st
 		return nil, transportError(op)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", recurrenceReadAccept)
 
 	resp, err := p.httpc.Do(req)
 	if err != nil {
@@ -666,6 +678,10 @@ func (p *Provider) recurrenceRead(ctx context.Context, tenantID, op, endpoint st
 	}
 	return body, nil
 }
+
+// recurrenceReadAccept is the Accept every Recorrência read sends. See recurrenceRead
+// for the measurement that forced it to be a wildcard.
+const recurrenceReadAccept = "*/*"
 
 // decodeData unmarshals a Recorrência body that may be wrapped in the C6
 // {"data":{...}} envelope or delivered bare — writes answer with the envelope, and the

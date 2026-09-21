@@ -22,6 +22,48 @@ var _ ports.CheckoutProvider = (*Provider)(nil)
 // SIN-65804/SIN-65883).
 const checkoutPath = "/v1/checkouts"
 
+// # Produção emite; a conta de SANDBOX não
+//
+// Este mesmo caminho — `POST /v1/checkouts/`, com o corpo que `CreateCheckoutSession`
+// monta logo abaixo — é o que atende o cartão em produção hoje, ponta a ponta: o
+// contador chama `POST /v1/checkout` na nossa API, que chama isto. Está verificado no
+// gateway real, não inferido: a SIN-69580 leu de volta uma sessão PAGA e registrou o
+// bloco `payment.card` que ela devolve.
+//
+// Na conta de SANDBOX o mesmo corpo responde 401. Medido em 21/09/2026, com o corpo
+// byte a byte igual ao de produção — `interest_type: BY_ISSUER`, `expiration_date_time`
+// e `Idempotency-Key` inclusive:
+//
+//	POST /v1/checkouts/  corpo EXATO de produção                     → 401
+//	POST /v1/checkouts/  {amount:5, payment:{card:{type:CREDIT,…}}}  → 401
+//	POST /v1/checkouts/  {amount:5, payment:{pix:{key:"AUTO"}}}      → 401
+//	POST /v1/checkouts/  {amount:5}                                  → 400 (falta payment)
+//	POST /v1/checkouts/  {amount:5, payment:{pix:{}}}                → 400 (falta key)
+//	GET  /v1/checkouts/generate/public-key                           → 200
+//	GET  /v1/checkouts/nao-existe                                    → 400
+//
+// Não é a requisição, então: todo corpo VÁLIDO dá 401 e todo corpo INVÁLIDO dá 400 — o
+// gateway valida a forma primeiro e a habilitação depois. É a conta. São duas contas
+// diferentes: produção é a PERICLES GOMES LUZ LTDA (67.188.163/0001-10, certificado
+// `certificado-verz`); o sandbox é a Regressivo Teste (32.159.366/0001-02).
+//
+// Habilitar o Checkout na conta de sandbox é pedido ao gerente — e é só o bloco do
+// roteiro que depende disso, não o cartão em produção.
+//
+// # E isto encosta num ponto cego do BankCapabilities
+//
+// `capabilities.go` responde `Card: has("checkout.write")`. A conta de sandbox TEM esse
+// escopo concedido e mesmo assim não abre checkout. Ou seja, o escopo não distingue
+// "contratado" de "não contratado", e é exatamente essa distinção que o
+// `bank-capabilities` existe para fazer: é ele que decide se o dono da loja vê o
+// interruptor de cartão habilitado. Uma conta nesse estado ligaria o botão e o comprador
+// descobriria na hora de pagar — o incidente que está contado em
+// `contador/docs/manual/10-empresas.md`.
+//
+// Não foi mexido aqui porque mudar a forma de `Card` (bool → tri-estado, como Boleto)
+// muda o que a tela da empresa mostra, e isso é decisão de produto. Está registrado em
+// docs/homologacao/roteiro-v3-camadaB.md.
+
 // cardBody is the C6 payment.card object (schema: card). For the hosted checkout
 // flow the payer types the card on C6's page, so card_info (card_hash/token) is
 // never sent at creation — only the routing fields are.

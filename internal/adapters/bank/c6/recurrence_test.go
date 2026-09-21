@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,7 +83,7 @@ func newRecServer(t *testing.T) *recServer {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /oauth/token", func(w http.ResponseWriter, r *http.Request) {
-		user, _, _ := r.BasicAuth()
+		user := tokenClientID(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-` + user + `","token_type":"Bearer","expires_in":3600}`))
 	})
@@ -425,7 +426,13 @@ func TestCreateRecUpstreamError(t *testing.T) {
 // types it serves, so every recurrence read failed and no JWKS value could have helped.
 // Asserting the header — not just the parsed result — is the point: a result assertion
 // alone would pass against a double that ignores Accept.
-func TestGetRecReadsJSON(t *testing.T) {
+// TestGetRecAcceptsAnything trava o Accept que a leitura de UMA recorrência exige.
+//
+// Chamava-se TestGetRecReadsJSON e exigia `application/json` — que é exatamente o valor
+// que o C6 RECUSA neste endpoint, com 400. Medido em 21/09/2026 contra o sandbox:
+// `application/json` → 400, `application/jose` → 406, `application/problem+json` → 406,
+// `*/*` → 200 com corpo JSON. Ver recurrenceRead.
+func TestGetRecAcceptsAnything(t *testing.T) {
 	t.Parallel()
 	rs := newRecServer(t)
 	p := rs.provider(t, oneTenant("t1", "client-1", "secret-1"))
@@ -437,8 +444,8 @@ func TestGetRecReadsJSON(t *testing.T) {
 	if res.IDRec != "RR318724952026062600000000abc" || res.Status != ports.RecCriada {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if rs.lastAccept != "application/json" {
-		t.Fatalf("read must request JSON, got Accept %q", rs.lastAccept)
+	if rs.lastAccept != recurrenceReadAccept {
+		t.Fatalf("leitura deve pedir %q, veio %q", recurrenceReadAccept, rs.lastAccept)
 	}
 }
 
@@ -459,8 +466,15 @@ func TestRecurrenceReadsNeverRequestJOSE(t *testing.T) {
 			if err := call(p); err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
-			if rs.lastAccept != "application/json" {
-				t.Fatalf("%s sent Accept %q; C6 rejects anything but application/json", name, rs.lastAccept)
+			// O que se trava aqui é NÃO pedir JOSE. O valor exato é `*/*`, e o
+			// motivo está em recurrenceRead: a leitura de UMA recorrência recusa
+			// `application/json` com 400, recusa `application/jose` e
+			// `application/problem+json` com 406, e atende `*/*` — devolvendo JSON.
+			if rs.lastAccept != recurrenceReadAccept {
+				t.Fatalf("%s sent Accept %q; esperava %q", name, rs.lastAccept, recurrenceReadAccept)
+			}
+			if strings.Contains(rs.lastAccept, "jose") {
+				t.Fatalf("%s pediu JOSE; não há JWS nosso para verificar", name)
 			}
 		})
 	}
@@ -634,8 +648,8 @@ func TestGetSolicRecSignedSuccess(t *testing.T) {
 	if res.IDSolicRec != "SC318724952026062600000000xyz" || res.Status != "CRIADA" {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if rs.lastAccept != "application/json" {
-		t.Fatalf("read must request JSON, got %q", rs.lastAccept)
+	if rs.lastAccept != recurrenceReadAccept {
+		t.Fatalf("leitura deve pedir %q, veio %q", recurrenceReadAccept, rs.lastAccept)
 	}
 }
 
@@ -821,8 +835,8 @@ func TestGetCobRSignedSuccess(t *testing.T) {
 	if res.TxID != "tx-cobr-1" || res.ValorCents != 1050 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if rs.lastAccept != "application/json" {
-		t.Fatalf("read must request JSON, got %q", rs.lastAccept)
+	if rs.lastAccept != recurrenceReadAccept {
+		t.Fatalf("leitura deve pedir %q, veio %q", recurrenceReadAccept, rs.lastAccept)
 	}
 }
 
@@ -1006,8 +1020,8 @@ func TestGetRecForQRComposesJornada3(t *testing.T) {
 	if rs.lastQuery != "txid=tx-imediata" {
 		t.Fatalf("query: want txid=tx-imediata, got %q", rs.lastQuery)
 	}
-	if rs.lastAccept != "application/json" {
-		t.Fatalf("the QR read must request JSON like every other recurrence read, Accept=%q", rs.lastAccept)
+	if rs.lastAccept != recurrenceReadAccept {
+		t.Fatalf("a leitura do QR manda o mesmo Accept das outras leituras de recorrência, veio %q", rs.lastAccept)
 	}
 	if res.DadosQR.Jornada != "JORNADA_3" || res.DadosQR.PixCopiaECola == "" {
 		t.Fatalf("dadosQR: %+v", res.DadosQR)

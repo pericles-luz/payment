@@ -111,7 +111,7 @@ func (r *recProvider) RemovePaymentGroupItem(_ context.Context, _ string, _ stri
 	r.hits++
 	return nil
 }
-func (r *recProvider) SubmitPaymentGroup(_ context.Context, _ string, _ string, _ string) error {
+func (r *recProvider) SubmitPaymentGroup(_ context.Context, _ string, _ string, _ string, _ string) error {
 	r.hits++
 	return nil
 }
@@ -285,7 +285,7 @@ func TestAllRouterMethodsDispatchAndFailClosed(t *testing.T) {
 		"dda.GetGroup":    func(c context.Context) error { _, e := rt.DDA.GetPaymentGroup(c, "t", "g"); return e },
 		"dda.RemoveItems": func(c context.Context) error { return rt.DDA.RemovePaymentGroupItems(c, "t", "g", nil) },
 		"dda.RemoveItem":  func(c context.Context) error { return rt.DDA.RemovePaymentGroupItem(c, "t", "g", "i") },
-		"dda.SubmitGroup": func(c context.Context) error { return rt.DDA.SubmitPaymentGroup(c, "t", "g", "k") },
+		"dda.SubmitGroup": func(c context.Context) error { return rt.DDA.SubmitPaymentGroup(c, "t", "g", "Zé", "k") },
 		"statement.Get": func(c context.Context) error {
 			_, e := rt.Statement.GetStatement(c, "t", ports.StatementFilter{})
 			return e

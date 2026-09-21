@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Bolepix
-  version: 1.1.0
+  version: 1.1.1
   description: |-
     ## O que esta API permite?
     A API de Bolepix oferece uma solução completa para a gestão de cobranças. Com ela, é possível automatizar processos financeiros, integrar diferentes métodos de pagamento em um único fluxo e garantir maior flexibilidade e agilidade na conciliação de recebíveis.
@@ -40,7 +40,7 @@ info:
     | [Listar cobranças](bolepix#tag/api-de-bolepix/get/v2/bank_slips/list)                                   |
     | [Consultar cobrança](bolepix#tag/api-de-bolepix/get/v2/bank_slips/{external_reference_id})              |
     | [Download do PDF](bolepix#tag/api-de-bolepix/get/v2/bank_slips/{external_reference_id}/pdf)             |
-    | [Atualizar cobrança](bolepix#tag/api-de-bolepix/patch/v2/bank_slips/{external_reference_id}/update)     |
+    | [Atualizar cobrança](bolepix#tag/api-de-bolepix/patch/v2/bank_slips/{external_reference_id})     |
     | [Cancelar cobrança](bolepix#tag/api-de-bolepix/put/v2/bank_slips/{external_reference_id}/cancel)        |
 
     ## Endereços dos ambientes:

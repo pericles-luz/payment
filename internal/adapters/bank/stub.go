@@ -39,7 +39,7 @@ type StubProvider struct {
 	// re-submit resolves to the same charge (roteiro 7.5–7.7).
 	cobvCharges   map[string]ports.PixDueChargeResult
 	cobvDueByIdem map[string]string // keyed by tenantID+"\x00"+anchor -> txID
-	// ddaBoletos holds the boletos open in a tenant's DDA (roteiro 8.1), keyed by
+	// ddaBoletos holds the bonds open in a tenant's DDA (roteiro AP_02), keyed by
 	// tenantID. ddaGroups holds DDA payment groups keyed by tenantID+"\x00"+groupID;
 	// ddaGroupByIdem maps the idempotency anchor to its groupID so a re-submitted
 	// consult resolves to the same group (roteiro 8.2–8.6).

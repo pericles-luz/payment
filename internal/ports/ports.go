@@ -1407,82 +1407,120 @@ type CheckoutReconciler interface {
 }
 
 // DDABoleto is one boleto open in a client's DDA (Débito Direto Autorizado, roteiro
-// 8.1): the bank's boleto id, the scannable barcode / linha digitável, the amount in
-// cents, the due date and the beneficiary name. It is a read projection the adapter
-// transports from the bank.
+// AP_02 — the `bonds` schema of the C6 Agendamento de Pagamentos contract): the
+// payment reference, the amount in cents, the due date, whether it is overdue, and
+// the beneficiary/payer names. It is a read projection the adapter transports from
+// the bank.
+//
+// There is no id: the contract's `bonds` has none. A bond is addressed by Content,
+// which is exactly what POST /decode takes.
 type DDABoleto struct {
-	ID              string
-	Barcode         string
+	Content         string
 	AmountCents     int64
 	DueDate         time.Time
 	BeneficiaryName string
+	PayerName       string
+	BankCode        string
+	BankName        string
+	Overdue         bool
 }
 
-// DDAItem is one payment line of a DDA payment group (transport mirror of the domain
-// dda.Item): the bank's item id, the boleto barcode, the amount and due date the bank
-// resolved for it.
+// DDAItem is one payment line of a payment group (transport mirror of the domain
+// dda.Item): the bank's item id, the payment reference, the amount and due date the
+// bank resolved for it, plus the per-item state it reports. Status/ProductType are
+// carried VERBATIM from the bank (READ_DATA, SCHEDULED, …; BOLETO/PIX) — the domain
+// parses them, the transport does not translate them.
 type DDAItem struct {
-	ID          string
-	Barcode     string
-	AmountCents int64
-	DueDate     time.Time
+	ID           string
+	Content      string
+	AmountCents  int64
+	DueDate      time.Time
+	Status       string
+	ProductType  string
+	ErrorMessage string
+	Overdue      bool
 }
 
-// DDAGroup is a DDA payment group's transported state: its bank id (the txid returned
-// on create), its lifecycle status verbatim ("consultando"/"aprovado") and the items
-// currently in it. The use-case maps it onto the domain PaymentGroup to enforce the
-// transition rules before any mutation.
+// DDAGroup is a payment group's transported state: its bank id (the group_id returned
+// on create) and the items currently in it. The use-case maps it onto the domain
+// PaymentGroup to enforce the freeze rule before any mutation.
+//
+// There is no group-level Status: the C6 contract does not have one. Whether the group
+// has already been submitted is DERIVED from the item states (dda.PaymentGroup
+// .IsSubmitted).
 type DDAGroup struct {
-	ID     string
-	Status string
-	Items  []DDAItem
+	ID    string
+	Items []DDAItem
+}
+
+// DDAPayment is one payment submitted into a group for the initial consult (roteiro
+// AP_01). Content and AmountCents are the only fields the contract requires; the rest
+// are informative and shown on the bank's approval screen.
+//
+// TransactionDate is the date the payment should be executed. Zero means "today", per
+// the contract ("caso não seja informada, a data do dia é acatada").
+type DDAPayment struct {
+	Content         string
+	AmountCents     int64
+	Description     string
+	BeneficiaryName string
+	PayerName       string
+	BankCode        string
+	BankName        string
+	TransactionDate time.Time
 }
 
 // DDAGroupRequest is the input to submit a payment group for the initial consult
-// (roteiro 8.2). Barcodes are the boletos the client selects into the group; the bank
-// resolves each into an item with its amount and due date. IdempotencyKey, when
-// present, is forwarded so the PSP collapses retried/concurrent submissions into one
-// group.
+// (roteiro AP_01). Payments are the boletos/pixes the client selects into the group;
+// the bank resolves each into an item with its status. IdempotencyKey, when present,
+// is forwarded so the PSP collapses retried/concurrent submissions into one group.
 type DDAGroupRequest struct {
 	TenantID       string
-	Barcodes       []string
+	Payments       []DDAPayment
 	IdempotencyKey string
 }
 
-// DDAProvider is the output port for the DDA / agendamento de pagamentos surface
-// (roteiro grupo 8). It is kept SEPARATE from the other bank ports (ISP): a use-case
-// that schedules DDA payments must not be forced to depend on PIX/boleto/checkout
-// semantics, and those consumers must not depend on DDA. The C6 adapter implements it;
-// a stub backs it for tests. Every method carries tenantID explicitly so the
-// per-tenant credential/token isolation the adapter enforces is never bypassed — the
-// tenant is derived from the authenticated caller, never client input (threat H1/P1).
-// An id owned by another tenant is shared.ErrNotFound (no cross-tenant existence
-// oracle), never a distinct error.
+// DDAProvider is the output port for the Agendamento de Pagamentos surface (roteiro
+// grupo AP). It is kept SEPARATE from the other bank ports (ISP): a use-case that
+// schedules payments must not be forced to depend on PIX/boleto/checkout semantics,
+// and those consumers must not depend on this. The C6 adapter implements it; a stub
+// backs it for tests. Every method carries tenantID explicitly so the per-tenant
+// credential/token isolation the adapter enforces is never bypassed — the tenant is
+// derived from the authenticated caller, never client input (threat H1/P1). An id
+// owned by another tenant is shared.ErrNotFound (no cross-tenant existence oracle),
+// never a distinct error.
 type DDAProvider interface {
 	// ListOpenBoletos returns the boletos currently open in the tenant's DDA
-	// (roteiro 8.1). Pure read; never mutates state.
+	// (roteiro AP_02). Pure read; never mutates state.
 	ListOpenBoletos(ctx context.Context, tenantID string) ([]DDABoleto, error)
-	// CreatePaymentGroup submits a group of boletos (by barcode) for the initial
-	// consult (roteiro 8.2) and returns the resulting consultando group with its txid
-	// and resolved items. Idempotent on req.IdempotencyKey: a re-submit with the same
-	// (tenant, key) resolves to the same group and never creates a duplicate.
+	// CreatePaymentGroup submits a group of payments for the initial consult
+	// (roteiro AP_01) and returns the resulting group. Idempotent on
+	// req.IdempotencyKey: a re-submit with the same (tenant, key) resolves to the
+	// same group and never creates a duplicate.
+	//
+	// The bank answers this call with the group_id ALONE — no items, no statuses —
+	// so the returned group carries the id and an EMPTY item list. That is not an
+	// omission to paper over: read the group back (GetPaymentGroup) to learn the item
+	// ids and the state the bank resolved for each.
 	CreatePaymentGroup(ctx context.Context, tenantID string, req DDAGroupRequest) (DDAGroup, error)
-	// GetPaymentGroup reconciles the authoritative state (status + items) of a payment
-	// group for the tenant (roteiro 8.3, and the source of truth the use-case reads
-	// before 8.4/8.5/8.6). An unknown id within the tenant is shared.ErrNotFound.
+	// GetPaymentGroup reconciles the authoritative state (items + their statuses) of a
+	// payment group for the tenant (roteiro AP_03, and the source of truth the
+	// use-case reads before AP_04/AP_05/AP_06). An unknown id within the tenant is
+	// shared.ErrNotFound.
 	GetPaymentGroup(ctx context.Context, tenantID, groupID string) (DDAGroup, error)
-	// RemovePaymentGroupItems removes a list of items from a group (roteiro 8.4). It is
-	// tenant-scoped; an unknown group is shared.ErrNotFound. The transition legality
-	// (group not yet approved) is enforced by the domain in the use-case before this
-	// call; the adapter only applies the removal.
+	// RemovePaymentGroupItems removes a list of items from a group (roteiro AP_04). It
+	// is tenant-scoped; an unknown group is shared.ErrNotFound. The legality (group not
+	// yet submitted) is enforced by the domain in the use-case before this call; the
+	// adapter only applies the removal.
 	RemovePaymentGroupItems(ctx context.Context, tenantID, groupID string, itemIDs []string) error
-	// RemovePaymentGroupItem removes a single item from a group (roteiro 8.5). Same
+	// RemovePaymentGroupItem removes a single item from a group (roteiro AP_05). Same
 	// tenant-scoping and not-found semantics as RemovePaymentGroupItems.
 	RemovePaymentGroupItem(ctx context.Context, tenantID, groupID, itemID string) error
-	// SubmitPaymentGroup submits a consulting group for approval (roteiro 8.6). idemKey
-	// (when present) is forwarded so a retried submit collapses to one effect.
+	// SubmitPaymentGroup submits a group for approval (roteiro AP_06). uploaderName is
+	// the operator shown on the bank's approval screen and is REQUIRED by the contract.
+	// idemKey (when present) is forwarded so a retried submit collapses to one effect.
 	// Tenant-scoped; an unknown group is shared.ErrNotFound.
-	SubmitPaymentGroup(ctx context.Context, tenantID, groupID, idemKey string) error
+	SubmitPaymentGroup(ctx context.Context, tenantID, groupID, uploaderName, idemKey string) error
 }
 
 // StatementEntry is one posted line of an account statement (extrato, roteiro

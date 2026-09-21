@@ -621,19 +621,21 @@ func loadTenantMaterial(ctx context.Context, cfg config.Config, tenantID string)
 // service uses. On failure the raw body IS printed — that is the diagnostic value.
 func fetchToken(ctx context.Context, httpc *http.Client, cfg config.Config, cred ports.BankCredential) (string, error) {
 	// RFC 6749 allows the client credentials either in the Authorization header
-	// (client_secret_basic) or in the form body (client_secret_post). The adapter sends
-	// Basic; the published C6 contract documents all three fields IN THE BODY. Production
-	// accepts Basic, so the difference never surfaced. Both are tried here, in that order,
-	// and the winner is reported — a 401 alone cannot tell "wrong secret" from "wrong
-	// client-authentication method".
+	// (client_secret_basic) or in the form body (client_secret_post). The published C6
+	// contract documents all three fields IN THE BODY, and that is what the adapter now
+	// sends — measured 21/09/2026 against the sandbox, Basic answered HTTP 500 and the
+	// body answered 200. Production HAS accepted Basic historically, so both are still
+	// tried and the winner reported: a failure alone cannot tell "wrong secret" from
+	// "wrong client-authentication method", and knowing which environment accepts which
+	// is exactly what this probe is for.
 	attempts := []struct {
 		name  string
 		build func(url.Values, *http.Request)
 	}{
-		{"client_secret_basic (o que o adapter manda hoje)", func(_ url.Values, r *http.Request) {
+		{"client_secret_post (o que o contrato documenta e o adapter manda)", nil},
+		{"client_secret_basic (o que o adapter mandava até 21/09/2026)", func(_ url.Values, r *http.Request) {
 			r.SetBasicAuth(cred.ClientID, cred.Secret)
 		}},
-		{"client_secret_post (o que o contrato documenta)", nil},
 	}
 	var lastErr error
 	for _, a := range attempts {

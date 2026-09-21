@@ -69,10 +69,24 @@ tags:
     description: Sessão de checkout hospedado (venda online).
   - name: Boleto
     description: Boletos BolePix com multa/juros/desconto.
+  - name: Boleto simples
+    description: >-
+      Boleto SIMPLES (`/v1/bank-slips`), produto **diferente** do BolePix ainda que
+      os dois se chamem "boleto": aceita até TRÊS faixas de desconto (o BolePix
+      expõe uma só) e não emite QR. Ele é a superfície crua do banco — emite, lê,
+      altera, baixa e renderiza — e **não cria cobrança no razão deste gateway**,
+      então não liquida sozinho pelo webhook. Quem precisa de liquidação usa
+      `/v1/boletos`.
   - name: DDA
     description: Consulta e pagamento de boletos no DDA / agendamento.
   - name: Extrato
     description: Extrato da conta por período.
+  - name: Adquirência
+    description: >-
+      Extrato do adquirente: as TRANSAÇÕES de cartão autorizadas e os RECEBÍVEIS em
+      que elas se liquidam. Não são o mesmo dinheiro — o recebível é a parcela
+      LÍQUIDA que o adquirente paga em data futura, já descontados MDR e tarifa,
+      enquanto a cobrança liquida no bruto.
   - name: Cobranças
     description: Cobrança genérica (compat).
   - name: Sistema
@@ -231,9 +245,56 @@ paths:
               schema: { $ref: "#/components/schemas/PixCharge" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
         "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      operationId: revisePix
+      tags: [PIX]
+      summary: Revisar cobrança PIX imediata
+      description: >-
+        Manda só o que muda; o PSP incrementa a `revisao` da cobrança. É operação de
+        DINHEIRO — mudar o valor de uma cobrança que o pagador já tem na mão muda o que
+        ele vai pagar. Uma revisão que não mudaria nada é recusada (`400`), porque
+        responder "ok" a ela relataria uma alteração que não aconteceu.
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RevisePixRequest" }
+      responses:
+        "200":
+          description: Cobrança revisada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixCharge" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/pix/cobv:
+    get:
+      operationId: listCobV
+      tags: [PIX]
+      summary: Listar cobranças cobv por janela
+      parameters:
+        - $ref: "#/components/parameters/QueryPixStart"
+        - $ref: "#/components/parameters/QueryPixEnd"
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryPageSize"
+      responses:
+        "200":
+          description: Página de cobranças com vencimento.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobVList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
     post:
       operationId: createCobV
       tags: [PIX]
@@ -294,6 +355,296 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
         "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      operationId: reviseCobV
+      tags: [PIX]
+      summary: Revisar cobrança cobv
+      description: >-
+        **Não é o PUT acima, e a diferença é dinheiro.** O PUT manda o conjunto
+        COMPLETO de parâmetros e substitui; o PATCH manda só o que mudou. Trocar um
+        pelo outro apaga em silêncio o que foi omitido — a multa que o pagador já
+        aceitou, o desconto prometido.
+      parameters:
+        - $ref: "#/components/parameters/PathTxid"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CobVRequest" }
+      responses:
+        "200":
+          description: Cobrança cobv revisada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CobV" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/pix/loc:
+    post:
+      operationId: createPixLoc
+      tags: [PIX]
+      summary: Criar location de payload
+      description: >-
+        Uma location existe INDEPENDENTEMENTE da cobrança: é isso que permite imprimir
+        um QR antes de a cobrança que vai ser servida por ele existir.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePixLocationRequest" }
+      responses:
+        "201":
+          description: Location criada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixLocation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    get:
+      operationId: listPixLoc
+      tags: [PIX]
+      summary: Listar locations por janela
+      parameters:
+        - $ref: "#/components/parameters/QueryPixStart"
+        - $ref: "#/components/parameters/QueryPixEnd"
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryPageSize"
+        - name: tipo_cob
+          in: query
+          schema: { type: string, enum: [cob, cobv] }
+        - name: txid_present
+          in: query
+          description: >-
+            Ausente é "não filtre por isto", que é diferente de `false` ("só as sem
+            cobrança vinculada").
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: Página de locations.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixLocationList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/pix/loc/{id}:
+    get:
+      operationId: getPixLoc
+      tags: [PIX]
+      summary: Consultar location
+      parameters:
+        - $ref: "#/components/parameters/PathLocRecID"
+      responses:
+        "200":
+          description: Location, incluindo a cobrança vinculada.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixLocation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/pix/loc/{id}/txid:
+    delete:
+      operationId: unlinkPixLocTxid
+      tags: [PIX]
+      summary: Desvincular a cobrança de uma location
+      description: >-
+        **Não cancela nada.** O status da cobrança fica como está; ela só deixa de ser
+        servida por aquele QR. Quem quer cancelar usa o caminho da cobrança.
+      parameters:
+        - $ref: "#/components/parameters/PathLocRecID"
+      responses:
+        "200":
+          description: Location sem cobrança vinculada (`txid` omitido).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixLocation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/pix/received:
+    get:
+      operationId: listReceivedPix
+      tags: [PIX]
+      summary: Listar PIX recebidos por janela
+      parameters:
+        - $ref: "#/components/parameters/QueryPixStart"
+        - $ref: "#/components/parameters/QueryPixEnd"
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryPageSize"
+        - name: txid
+          in: query
+          schema: { type: string }
+        - name: txid_present
+          in: query
+          schema: { type: boolean }
+        - name: refund_present
+          in: query
+          schema: { type: boolean }
+        - name: payer_tax_id
+          in: query
+          description: CPF (11 dígitos) ou CNPJ (14) do pagador, sem máscara.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Página de PIX creditados.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReceivedPixList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/pix/received/{e2eid}:
+    get:
+      operationId: getReceivedPix
+      tags: [PIX]
+      summary: Consultar um PIX recebido
+      parameters:
+        - $ref: "#/components/parameters/PathE2EID"
+      responses:
+        "200":
+          description: PIX creditado.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReceivedPix" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/pix/received/{e2eid}/refunds/{refundID}:
+    put:
+      operationId: requestPixRefund
+      tags: [PIX]
+      summary: Solicitar devolução de um PIX recebido
+      description: >-
+        O `refundID` é **de quem chama** e está no caminho: o par
+        (`e2eid`, `refundID`) endereça sempre a mesma devolução, então um reenvio não
+        devolve duas vezes. É por isso que esta rota não pede `Idempotency-Key` — o
+        próprio endereço já é a chave. O valor é obrigatório: não existe "devolve tudo"
+        por omissão, porque devolver a mais é tão errado quanto devolver a menos.
+      parameters:
+        - $ref: "#/components/parameters/PathE2EID"
+        - $ref: "#/components/parameters/PathRefundID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PixRefundRequest" }
+      responses:
+        "201":
+          description: >-
+            Devolução ACEITA pelo PSP. O status pode continuar `EM_PROCESSAMENTO`:
+            só a leitura diz se o dinheiro saiu.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixRefund" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    get:
+      operationId: getPixRefund
+      tags: [PIX]
+      summary: Consultar uma devolução
+      parameters:
+        - $ref: "#/components/parameters/PathE2EID"
+        - $ref: "#/components/parameters/PathRefundID"
+      responses:
+        "200":
+          description: Estado autoritativo da devolução.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixRefund" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/pix/lotecobv:
+    get:
+      operationId: listPixBatches
+      tags: [PIX]
+      summary: Listar lotes de cobrança com vencimento
+      parameters:
+        - $ref: "#/components/parameters/QueryPixStart"
+        - $ref: "#/components/parameters/QueryPixEnd"
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryPageSize"
+      responses:
+        "200":
+          description: Página de lotes.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixBatchList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/pix/lotecobv/{id}:
+    put:
+      operationId: createPixBatch
+      tags: [PIX]
+      summary: Registrar um lote de cobranças com vencimento
+      description: >-
+        Até 200 cobranças sob um id de lote escolhido por quem chama. Cada cobrança
+        carrega o SEU `txid`, e é por ele que o resultado dela volta na leitura.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PixBatchRequest" }
+      responses:
+        "202":
+          description: >-
+            **Aceito, não criado.** O PSP processa o lote depois, e por isso não há
+            corpo: o resultado por cobrança só sai de `GET /v1/pix/lotecobv/{id}`.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    patch:
+      operationId: revisePixBatch
+      tags: [PIX]
+      summary: Revisar cobranças dentro de um lote
+      description: >-
+        A revisão só pode MANTER o conjunto original de cobranças: acrescentar ou
+        remover uma não é revisão, e o PSP recusa.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PixBatchRequest" }
+      responses:
+        "202": { description: Revisão aceita; leia o lote para o resultado por cobrança. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    get:
+      operationId: getPixBatch
+      tags: [PIX]
+      summary: Consultar um lote, cobrança a cobrança
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Lote com o resultado do registro de cada cobrança.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PixBatch" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/pix/locrec:
     post:
@@ -655,6 +1006,41 @@ paths:
         "500": { $ref: "#/components/responses/InternalError" }
 
   /v1/boletos:
+    get:
+      operationId: listBoletos
+      tags: [Boleto]
+      summary: Listar cobranças BolePix por janela
+      description: >-
+        Ao menos UM intervalo é obrigatório — `payment_date`, `due_date` ou
+        `credit_date` —, cada um com as **duas** pontas e no máximo 60 dias. São
+        perguntas diferentes ("o que foi pago", "o que vence", "o que cai na conta")
+        e o banco as responde separadamente. Intervalo meio-aberto é `400`: o banco
+        responderia alguma coisa, e não seria a janela que se quis.
+      parameters:
+        - { name: payment_date_from, in: query, schema: { type: string, format: date } }
+        - { name: payment_date_to, in: query, schema: { type: string, format: date } }
+        - { name: due_date_from, in: query, schema: { type: string, format: date } }
+        - { name: due_date_to, in: query, schema: { type: string, format: date } }
+        - { name: credit_date_from, in: query, schema: { type: string, format: date } }
+        - { name: credit_date_to, in: query, schema: { type: string, format: date } }
+        - name: status
+          in: query
+          schema: { type: string, enum: [CREATED, PAID, CANCELED, WAITING_CONFIRMATION] }
+        - name: external_reference_id
+          in: query
+          description: Estreita para uma cobrança pela referência de quem emitiu.
+          schema: { type: string }
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryPageSize"
+      responses:
+        "200":
+          description: Página de cobranças BolePix.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BoletoList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
     post:
       operationId: createBoleto
       tags: [Boleto]
@@ -894,9 +1280,14 @@ paths:
       parameters:
         - $ref: "#/components/parameters/PathId"
         - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitDDAGroupRequest" }
       responses:
         "204":
-          description: Grupo submetido (reenviar um grupo já aprovado retorna 204).
+          description: Grupo submetido (reenviar um grupo já submetido retorna 204).
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1185,6 +1576,155 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { $ref: "#/components/responses/InternalError" }
+
+  # ---------------------------------------------------------------------------
+  # Boleto SIMPLES (bankslip v1). Produto DIFERENTE do BolePix de /v1/boletos:
+  # até três faixas de desconto, sem QR, e sem cobrança no razão deste gateway —
+  # um boleto emitido aqui NÃO liquida sozinho pelo webhook.
+  # ---------------------------------------------------------------------------
+  /v1/bank-slips:
+    post:
+      operationId: createPlainBoleto
+      tags: [Boleto simples]
+      summary: Emitir boleto simples
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePlainBoletoRequest" }
+      responses:
+        "201":
+          description: Boleto simples emitido.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Boleto" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/bank-slips/{id}:
+    get:
+      operationId: getPlainBoleto
+      tags: [Boleto simples]
+      summary: Consultar boleto simples
+      description: O `{id}` é o id FORTE do banco, devolvido na emissão — não a referência externa.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Boleto simples.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Boleto" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    patch:
+      operationId: updatePlainBoleto
+      tags: [Boleto simples]
+      summary: Alterar boleto simples
+      description: >-
+        Alteração **parcial**: um campo ausente quer dizer "deixa como está", nunca
+        "zera". Tocar em QUALQUER encargo exige declarar o quadro completo de encargos,
+        porque o banco substitui o objeto inteiro em vez de mesclar nele — deixar um de
+        fora o apagaria, mudando em silêncio o que o pagador deve.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdatePlainBoletoRequest" }
+      responses:
+        "200":
+          description: Boleto simples alterado.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Boleto" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    delete:
+      operationId: cancelPlainBoleto
+      tags: [Boleto simples]
+      summary: Dar baixa num boleto simples
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "204": { description: Baixa aceita. O contrato do banco responde sem corpo; leia de volta se o novo status importa. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/bank-slips/{id}/pdf:
+    get:
+      operationId: getPlainBoletoPDF
+      tags: [Boleto simples]
+      summary: Renderizar o boleto simples para o pagador
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: >-
+            Documento do boleto. Carrega PII do pagador, então sai com
+            `Cache-Control: no-store` e `X-Content-Type-Options: nosniff`.
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  # ---------------------------------------------------------------------------
+  # Extrato de adquirência (C6 Pay). Produto com habilitação à parte: a conta que
+  # não o tem responde 503 nesta superfície.
+  # ---------------------------------------------------------------------------
+  /v1/acquirer/receivables:
+    get:
+      operationId: listReceivables
+      tags: [Adquirência]
+      summary: Listar recebíveis
+      description: >-
+        Recebível **não** é transação: é a parcela LÍQUIDA que o adquirente vai pagar,
+        em data futura, já descontados MDR e tarifa. As cobranças deste gateway liquidam
+        no BRUTO, e é nessa diferença que uma conciliação deixa de fechar. `fee` e
+        `discount` chegam NEGATIVOS e assim ficam — inverter o sinal esconderia a
+        direção do dinheiro.
+      parameters:
+        - $ref: "#/components/parameters/QueryAcqStart"
+        - $ref: "#/components/parameters/QueryAcqEnd"
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryPageSize"
+      responses:
+        "200":
+          description: Página de recebíveis.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReceivableList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/acquirer/transactions:
+    get:
+      operationId: listCardTransactions
+      tags: [Adquirência]
+      summary: Listar transações de cartão
+      parameters:
+        - $ref: "#/components/parameters/QueryAcqStart"
+        - $ref: "#/components/parameters/QueryAcqEnd"
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryPageSize"
+      responses:
+        "200":
+          description: Página de autorizações e cancelamentos.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CardTransactionList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
 
   # ---------------------------------------------------------------------------
   # Plano administrativo /admin/* (interno). adminAuth; mutações exigem papel
@@ -1527,6 +2067,10 @@ components:
       name: txid
       in: path
       required: true
+      description: >-
+        Identificador da cobrança. Os sub-recursos literais de `/v1/pix` (`cobv`,
+        `loc`, `received`, `lotecobv` e os do PIX Automático) **não** são txid válido:
+        pedi-los aqui responde `405`, nunca uma ida ao PSP.
       schema: { type: string }
     PathIDRec:
       name: idRec
@@ -1540,6 +2084,55 @@ components:
       required: true
       description: Identificador da location de payload (inteiro atribuído pelo PSP).
       schema: { type: integer, format: int64 }
+    PathE2EID:
+      name: e2eid
+      in: path
+      required: true
+      description: Identificador fim-a-fim do PIX (o que viaja nas mensagens PACS).
+      schema: { type: string }
+    PathRefundID:
+      name: refundID
+      in: path
+      required: true
+      description: >-
+        Identificador da devolução, escolhido por QUEM CHAMA. É ele que torna a
+        operação idempotente no PSP: o mesmo par (`e2eid`, `refundID`) endereça
+        sempre a mesma devolução. Um id aleatório por tentativa desfaz essa garantia.
+      schema: { type: string, minLength: 1 }
+    QueryPixStart:
+      name: start
+      in: query
+      required: true
+      description: Início da janela (RFC3339).
+      schema: { type: string, format: date-time }
+    QueryPixEnd:
+      name: end
+      in: query
+      required: true
+      description: Fim da janela (RFC3339). Máximo de 30 dias a partir de `start`.
+      schema: { type: string, format: date-time }
+    QueryAcqStart:
+      name: start_date
+      in: query
+      required: true
+      description: Início da janela (YYYY-MM-DD).
+      schema: { type: string, format: date }
+    QueryAcqEnd:
+      name: end_date
+      in: query
+      description: >-
+        Fim da janela (YYYY-MM-DD), no máximo 60 dias após `start_date`. Ausente é
+        "o mesmo dia de `start_date`" — o padrão do próprio adquirente, repetido aqui
+        para a omissão não virar uma escolha deste gateway.
+      schema: { type: string, format: date }
+    QueryPage:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 0 }
+    QueryPageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 0 }
     PathTenantID:
       name: tenantID
       in: path
@@ -1617,6 +2210,28 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: "recurrence unavailable" }
+    MethodNotAllowed:
+      description: >-
+        O caminho existe mas não aceita este método. `Allow` lista os que aceita.
+        Vale em especial para os sub-recursos de `/v1/pix` (`cobv`, `loc`,
+        `received`, `lotecobv`): eles **não** são endereçáveis como um `txid`.
+      headers:
+        Allow:
+          schema: { type: string }
+          description: Métodos aceitos neste caminho.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "method not allowed" }
+    Unavailable:
+      description: >-
+        O banco resolvido para esta empresa-cliente não fala esta superfície, ou o
+        produto não está habilitado na conta dele. Falha FECHADA de propósito: é
+        melhor do que rotear para um banco que a implementa por acaso.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "service unavailable" }
     TooManyRequests:
       description: Rate limit excedido (burst 20, 10 req/s por empresa). Faça backoff.
     InternalError:
@@ -2118,6 +2733,334 @@ components:
         name: { type: string }
         tax_id: { type: string, description: CPF/CNPJ. }
         address: { $ref: "#/components/schemas/Address" }
+    PixPage:
+      type: object
+      properties:
+        page: { type: integer }
+        page_size: { type: integer }
+        total_items: { type: integer }
+        total_pages: { type: integer }
+
+    RevisePixRequest:
+      type: object
+      description: >-
+        Só o que vier é enviado: valor ausente deixa o valor como está, expiração
+        ausente deixa o calendário como está. Uma revisão que não mudaria nada é `400`.
+      properties:
+        amount_cents: { type: integer, format: int64 }
+        expires_in_seconds: { type: integer }
+        devedor: { $ref: "#/components/schemas/Devedor" }
+        creditor_key: { type: string }
+        bank: { type: string, description: Seleciona qual banco configurado atende (multi-banco). }
+    CobVList:
+      allOf:
+        - $ref: "#/components/schemas/PixPage"
+        - type: object
+          properties:
+            charges:
+              type: array
+              items: { $ref: "#/components/schemas/CobV" }
+
+    CreatePixLocationRequest:
+      type: object
+      required: [tipo_cob]
+      properties:
+        tipo_cob:
+          type: string
+          enum: [cob, cobv]
+          description: Que tipo de cobrança esta location pode carregar.
+        bank: { type: string }
+    PixLocation:
+      type: object
+      description: >-
+        Location de payload — o QR endereçável que o PSP serve. Existe
+        INDEPENDENTEMENTE da cobrança, e é isso que permite imprimir um QR antes de a
+        cobrança que será servida por ele existir.
+      properties:
+        id: { type: integer, format: int64 }
+        location: { type: string, description: URI que o app do pagador busca. }
+        tipo_cob: { type: string, enum: [cob, cobv] }
+        txid:
+          type: string
+          description: >-
+            Cobrança vinculada. **Omitido** quando não há nenhuma — que é o estado em
+            que o desvinculamento deixa a location.
+        created_at: { type: string, format: date-time }
+    PixLocationList:
+      allOf:
+        - $ref: "#/components/schemas/PixPage"
+        - type: object
+          properties:
+            locations:
+              type: array
+              items: { $ref: "#/components/schemas/PixLocation" }
+
+    PixRefundRequest:
+      type: object
+      required: [amount_cents]
+      properties:
+        amount_cents:
+          type: integer
+          format: int64
+          description: >-
+            Obrigatório e explícito. Não existe "devolve tudo" por omissão, e a soma
+            das devoluções não pode passar o PIX.
+        nature:
+          type: string
+          enum: [ORIGINAL, RETIRADA, MED_OPERACIONAL, MED_FRAUDE]
+          description: Omitido é `ORIGINAL`, que é o que o contrato do BACEN assume.
+        description: { type: string, maxLength: 140, description: Exibida ao pagador. }
+        bank: { type: string }
+    PixRefund:
+      type: object
+      properties:
+        id: { type: string }
+        return_id: { type: string }
+        amount_cents: { type: integer, format: int64 }
+        nature: { type: string, enum: [ORIGINAL, RETIRADA, MED_OPERACIONAL, MED_FRAUDE] }
+        description: { type: string }
+        status:
+          type: string
+          description: >-
+            Vocabulário do PSP, verbatim. A criação responde que o pedido foi ACEITO;
+            `EM_PROCESSAMENTO` quer dizer que o dinheiro ainda não saiu.
+          enum: [EM_PROCESSAMENTO, DEVOLVIDO, NAO_REALIZADO]
+        reason: { type: string, description: Único lugar onde um `NAO_REALIZADO` diz por quê. }
+        requested_at: { type: string, format: date-time }
+        settled_at: { type: string, format: date-time }
+    ReceivedPix:
+      type: object
+      description: >-
+        Um PIX creditado na conta. **Não traz a identidade do pagador**: o objeto do
+        PSP carrega CPF/CNPJ e nome de quem pagou, e não transportá-los é como eles
+        nunca chegam a log, erro ou resposta (ADR-0008).
+      properties:
+        end_to_end_id: { type: string }
+        txid:
+          type: string
+          description: >-
+            Cobrança que o originou. **Vazio** num PIX pago contra chave estática — a
+            conciliação tem de lidar com isso em vez de supor que há cobrança.
+        amount_cents: { type: integer, format: int64 }
+        creditor_key: { type: string }
+        received_at: { type: string, format: date-time }
+        payer_info: { type: string, description: Mensagem livre que o PAGADOR escolheu mandar. }
+        refunds:
+          type: array
+          items: { $ref: "#/components/schemas/PixRefund" }
+    ReceivedPixList:
+      allOf:
+        - $ref: "#/components/schemas/PixPage"
+        - type: object
+          properties:
+            received:
+              type: array
+              items: { $ref: "#/components/schemas/ReceivedPix" }
+
+    PixBatchCharge:
+      allOf:
+        - type: object
+          required: [txid]
+          properties:
+            txid:
+              type: string
+              description: >-
+                Explícito **só aqui**. Numa cobv avulsa o txid é derivado da âncora de
+                idempotência; num lote o PSP endereça cada cobrança pelo txid do corpo,
+                e é por ele que o resultado dela volta.
+        - $ref: "#/components/schemas/CobVRequest"
+    PixBatchRequest:
+      type: object
+      required: [description, charges]
+      properties:
+        description: { type: string }
+        charges:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: { $ref: "#/components/schemas/PixBatchCharge" }
+        bank: { type: string }
+    PixBatchItem:
+      type: object
+      properties:
+        txid: { type: string }
+        status:
+          type: string
+          description: >-
+            Estado do REGISTRO, não do pagamento: `CRIADA` quer dizer que o PSP aceitou
+            a cobrança, não que alguém pagou.
+          enum: [EM_PROCESSAMENTO, CRIADA, NEGADA]
+        problem: { type: string, description: Motivo de uma `NEGADA` — o único lugar onde ele sobrevive. }
+        created_at: { type: string, format: date-time }
+    PixBatch:
+      type: object
+      properties:
+        id: { type: string }
+        description: { type: string }
+        created_at: { type: string, format: date-time }
+        charges:
+          type: array
+          items: { $ref: "#/components/schemas/PixBatchItem" }
+    PixBatchList:
+      allOf:
+        - $ref: "#/components/schemas/PixPage"
+        - type: object
+          properties:
+            batches:
+              type: array
+              items: { $ref: "#/components/schemas/PixBatch" }
+
+    BoletoList:
+      type: object
+      properties:
+        boletos:
+          type: array
+          items: { $ref: "#/components/schemas/Boleto" }
+        page: { type: integer }
+        page_size: { type: integer }
+        total_items: { type: integer }
+        total_pages: { type: integer }
+
+    PlainBoletoPayer:
+      type: object
+      description: >-
+        Sacado do boleto simples. O endereço aqui tem rua e NÚMERO separados, e não tem
+        bairro — é a forma deste produto, diferente da do BolePix.
+      required: [name, tax_id]
+      properties:
+        name: { type: string }
+        tax_id: { type: string, description: "CPF/CNPJ, apenas dígitos." }
+        street: { type: string }
+        number: { type: integer }
+        city: { type: string }
+        state: { type: string, description: "UF, 2 letras." }
+        zip_code: { type: string }
+    CreatePlainBoletoRequest:
+      type: object
+      required: [slip_id, amount_cents, currency, due_date, payer]
+      properties:
+        slip_id:
+          type: string
+          description: >-
+            Identificador de quem chama. É dele que nasce a referência externa que o
+            banco guarda, de forma determinística: reenviar o mesmo id endereça a mesma
+            referência em vez de emitir um segundo boleto.
+        amount_cents: { type: integer, format: int64 }
+        currency: { type: string, example: BRL }
+        due_date: { type: string, format: date-time }
+        fine_bps:
+          type: integer
+          format: int64
+          description: Multa percentual. Mutuamente exclusiva com `fine_fixed_cents` — o banco carrega UM valor com UM tipo.
+        fine_fixed_cents: { type: integer, format: int64 }
+        monthly_interest_bps: { type: integer, format: int64 }
+        discounts:
+          type: array
+          maxItems: 3
+          description: >-
+            Até TRÊS faixas, em prazos ESTRITAMENTE decrescentes e todas na mesma forma
+            (todas percentuais ou todas em valor). Misturar as formas é `400`: o banco
+            não recusa de forma clara — ele aplica o tipo errado a alguma faixa, e o
+            pagador paga a diferença.
+          items: { $ref: "#/components/schemas/DiscountTier" }
+        payer: { $ref: "#/components/schemas/PlainBoletoPayer" }
+        description: { type: string }
+        bank: { type: string }
+    UpdatePlainBoletoRequest:
+      type: object
+      description: >-
+        Campo ausente é "deixa como está". Um patch que não tocaria em nada é `400`.
+      properties:
+        amount_cents: { type: integer, format: int64 }
+        due_date: { type: string, format: date-time }
+        fine_bps: { type: integer, format: int64 }
+        fine_fixed_cents: { type: integer, format: int64 }
+        monthly_interest_bps: { type: integer, format: int64 }
+        discounts:
+          type: array
+          maxItems: 3
+          items: { $ref: "#/components/schemas/DiscountTier" }
+        bank: { type: string }
+
+    AcquirerPage:
+      type: object
+      properties:
+        page: { type: integer }
+        last_page: { type: integer }
+        items:
+          type: integer
+          description: >-
+            Contagem DESTA página, não um total geral. Lê-la como total subdeclara um
+            extrato paginado.
+    Receivable:
+      type: object
+      description: Parcela do líquido que o adquirente deve ao lojista.
+      properties:
+        receivable_id: { type: string }
+        transaction_id: { type: string }
+        local_reference: { type: string }
+        brand_name: { type: string }
+        payment_type: { type: string }
+        type: { type: string }
+        status: { type: string }
+        origin: { type: string }
+        installment: { type: integer }
+        installments: { type: integer }
+        interest_type: { type: string }
+        gross_amount_cents: { type: integer, format: int64 }
+        fee_cents: { type: integer, format: int64, description: "Dedução, NEGATIVA." }
+        discount_cents: { type: integer, format: int64, description: "Dedução, NEGATIVA." }
+        net_amount_cents: { type: integer, format: int64, description: O que cai na conta do lojista. }
+        mdr:
+          type: integer
+          format: int64
+          description: >-
+            Vem do adquirente escalado por 100. O contrato NÃO diz se é percentual ou
+            valor, e o exemplo serve para os dois — por isso é transportado sem
+            interpretação, e nada neste gateway o usa para calcular.
+        expected_date: { type: string, format: date }
+        payment_date: { type: string, format: date }
+        transaction_time: { type: string, format: date-time }
+    ReceivableList:
+      allOf:
+        - $ref: "#/components/schemas/AcquirerPage"
+        - type: object
+          properties:
+            receivables:
+              type: array
+              items: { $ref: "#/components/schemas/Receivable" }
+    CardTransaction:
+      type: object
+      description: >-
+        Autorização no adquirente. **Sem nome do portador e sem PAN mascarado**: os
+        dois vêm na resposta do banco, e não carregá-los é como eles nunca chegam a
+        log, erro ou linha gravada (ADR-0008).
+      properties:
+        id: { type: string }
+        local_reference: { type: string }
+        authorization_code: { type: string }
+        authorizer_reference: { type: string }
+        brand_name: { type: string }
+        payment_type: { type: string }
+        status: { type: string }
+        origin: { type: string }
+        card_entry_mode: { type: string }
+        installments: { type: integer }
+        interest_type: { type: string }
+        currency_code: { type: string }
+        terminal_id: { type: string }
+        fraud_analysis: { type: string }
+        amount_cents: { type: integer, format: int64 }
+        occurred_at: { type: string, format: date-time }
+    CardTransactionList:
+      allOf:
+        - $ref: "#/components/schemas/AcquirerPage"
+        - type: object
+          properties:
+            transactions:
+              type: array
+              items: { $ref: "#/components/schemas/CardTransaction" }
+
     DiscountTier:
       type: object
       description: Faixa de desconto por antecipação; informe exatamente um de bps ou fixed_cents.
@@ -2219,12 +3162,18 @@ components:
 
     DDABoleto:
       type: object
+      description: >-
+        Título aberto no DDA da empresa. Não tem id: o título é endereçado pelo
+        `content`, que é o que a criação do grupo recebe.
       properties:
-        id: { type: string }
-        barcode: { type: string, description: Linha digitável. }
+        content: { type: string, description: "Linha digitável, chave PIX ou BR Code." }
         amount_cents: { type: integer, format: int64 }
         due_date: { type: string, format: date-time }
         beneficiary_name: { type: string }
+        payer_name: { type: string }
+        bank_code: { type: string }
+        bank_name: { type: string }
+        overdue: { type: boolean }
     DDABoletoList:
       type: object
       properties:
@@ -2235,24 +3184,57 @@ components:
       type: object
       properties:
         id: { type: string }
-        barcode: { type: string, description: Linha digitável. }
+        content: { type: string, description: "Linha digitável, chave PIX ou BR Code." }
         amount_cents: { type: integer, format: int64 }
-        due_date: { type: string, format: date-time }
+        due_date:
+          type: string
+          format: date-time
+          description: Vazio num pagamento que não tem vencimento (PIX).
+        status:
+          type: string
+          description: >-
+            Estado do item no banco, verbatim. READ_DATA (cadastrado), DECODE_ERROR,
+            ERROR, SCHEDULED (agendado), PROCESSING, PROCESSED (pago),
+            SCHEDULING_CANCELLED. O grupo está congelado quando QUALQUER item saiu
+            de READ_DATA/DECODE_ERROR/ERROR.
+          enum: [READ_DATA, DECODE_ERROR, ERROR, SCHEDULED, PROCESSING, PROCESSED, SCHEDULING_CANCELLED]
+        product_type:
+          type: string
+          description: Vazio enquanto o banco não resolveu o pagamento.
+          enum: ["", BOLETO, PIX]
+        error_message: { type: string }
+        overdue: { type: boolean }
+    DDAPayment:
+      type: object
+      required: [content, amount_cents]
+      properties:
+        content: { type: string, description: "Linha digitável, chave PIX ou BR Code." }
+        amount_cents: { type: integer, format: int64 }
+        description: { type: string, maxLength: 100, description: Exibido na tela de aprovação do banco. }
+        beneficiary_name: { type: string }
+        payer_name: { type: string }
+        bank_code: { type: string }
+        bank_name: { type: string }
+        transaction_date:
+          type: string
+          format: date
+          description: YYYY-MM-DD. Vazio agenda para hoje.
     CreateDDAGroupRequest:
       type: object
-      required: [barcodes]
+      required: [payments]
       properties:
-        barcodes:
+        payments:
           type: array
-          items: { type: string, description: Linha digitável. }
+          maxItems: 200
+          items: { $ref: "#/components/schemas/DDAPayment" }
+        bank: { type: string, description: Banco configurado que agenda este grupo. }
     DDAGroup:
       type: object
+      description: >-
+        Resposta da criação. Carrega o identificador e mais nada: o banco responde a
+        submissão só com o group_id. Os itens aparecem na leitura do grupo.
       properties:
         txid: { type: string, description: Identificador do grupo para operações seguintes. }
-        status: { type: string }
-        items:
-          type: array
-          items: { $ref: "#/components/schemas/DDAItem" }
     DDAItemList:
       type: object
       properties:
@@ -2266,6 +3248,13 @@ components:
         item_ids:
           type: array
           items: { type: string }
+    SubmitDDAGroupRequest:
+      type: object
+      required: [uploader_name]
+      properties:
+        uploader_name:
+          type: string
+          description: Operador exibido na tela de aprovação do banco. Obrigatório.
 
     StatementEntry:
       type: object

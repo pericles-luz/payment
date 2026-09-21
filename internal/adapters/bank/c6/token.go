@@ -45,8 +45,8 @@ type tokenState struct {
 
 // tokenManager issues and caches OAuth2 client_credentials access tokens per
 // tenant. Credentials are resolved from the CredentialStore at fetch time and the
-// client secret is sent only in the token request's Basic auth header — never
-// logged, never stored, never placed in a URL (threat C1/C4).
+// client secret is sent only in the token request's form body — never logged, never
+// stored, never placed in a URL (threat C1/C4).
 type tokenManager struct {
 	creds ports.CredentialStore
 	// bankID binds this token manager to a single bank's credential slot (ADR-0007
@@ -58,6 +58,9 @@ type tokenManager struct {
 	httpc    *http.Client
 	now      func() time.Time
 	skew     time.Duration
+	// sleep espaça as retentativas do 5xx. Injetável para os testes não dormirem de
+	// verdade; o padrão respeita o cancelamento do contexto.
+	sleep sleepFunc
 
 	mu      sync.Mutex
 	entries map[string]*tokenState
@@ -72,6 +75,7 @@ func newTokenManager(creds ports.CredentialStore, bankID, tokenURL, scope string
 		httpc:    httpc,
 		now:      now,
 		skew:     defaultRefreshSkew,
+		sleep:    realSleep,
 		entries:  make(map[string]*tokenState),
 	}
 }
@@ -179,44 +183,97 @@ type tokenResponse struct {
 	Scope       string `json:"scope"`
 }
 
-// fetch performs the OAuth2 client_credentials grant. The secret travels only in
-// the Basic auth header. On any non-2xx the body is read solely to extract the
-// safe machine code (via mapError); its raw contents are never surfaced.
+// fetch performs the OAuth2 client_credentials grant.
+//
+// # Credencial no CORPO, não em Basic
+//
+// Até 21/09/2026 isto mandava a credencial no cabeçalho `Authorization: Basic`. O
+// contrato publicado (docs/compliance/c6-auth-oas.yaml) não menciona Basic em lugar
+// nenhum: `client_id`, `client_secret` e `grant_type` são REQUIRED no corpo
+// `application/x-www-form-urlencoded`. Basic funcionava por tolerância do servidor, não
+// por contrato, e o que não está no contrato pode sumir sem aviso.
+//
+// O segredo continua fora de URL e fora de log — o corpo de um POST não é nenhum dos
+// dois. O que ele não tem é o descarte automático que um Authorization header ganha de
+// ferramentas que redigem cabeçalhos; por isso nenhuma parte deste corpo é impressa,
+// nem em erro.
+//
+// # Por que há retentativa aqui, e só aqui
+//
+// O endpoint de token do sandbox devolve 500 de forma INTERMITENTE. Medido em
+// 21/09/2026, dezesseis tentativas alternando as duas formas de apresentar a
+// credencial: 3/8 de sucesso com a credencial no corpo, 3/8 com Basic. Não é a forma —
+// é o endpoint.
+//
+// Um 500 no token não falha uma chamada, falha TODAS: sem bearer não há cobrança, não
+// há leitura, não há conciliação. E repetir é seguro de um jeito que quase nada mais
+// aqui é: o FAQ do C6 (§9) diz que gerar um token novo NÃO invalida o atual, então uma
+// retentativa não pode derrubar quem já está usando um. Por isso o limite é pequeno e o
+// espaçamento cresce: o objetivo é atravessar um soluço, não martelar um banco caído.
+//
+// On any non-2xx the body is read solely to extract the safe machine code (via
+// mapError); its raw contents are never surfaced.
 func (m *tokenManager) fetch(ctx context.Context, cred ports.BankCredential) (cachedToken, error) {
-	form := url.Values{"grant_type": {"client_credentials"}}
+	form := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {cred.ClientID},
+		"client_secret": {cred.Secret},
+	}
 	if m.scope != "" {
 		form.Set("scope", m.scope)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.tokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return cachedToken{}, transportError("token")
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	// Client secret is sent only here, in the Authorization header — never logged.
-	req.SetBasicAuth(cred.ClientID, cred.Secret)
+	encoded := form.Encode()
+	var ultimo error
+	for tentativa := 0; ; tentativa++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.tokenURL, strings.NewReader(encoded))
+		if err != nil {
+			return cachedToken{}, transportError("token")
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
 
-	resp, err := m.httpc.Do(req)
-	if err != nil {
-		return cachedToken{}, transportError("token")
-	}
-	defer func() { _ = resp.Body.Close() }()
+		resp, err := m.httpc.Do(req)
+		if err != nil {
+			// Uma falha de transporte NÃO é repetida: manter a postura de tiro único
+			// do adapter. O que se repete aqui é só o 5xx observado do endpoint.
+			return cachedToken{}, transportError("token")
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+		status := resp.StatusCode
+		_ = resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if resp.StatusCode/100 != 2 {
-		return cachedToken{}, mapError("token", resp.StatusCode, body)
-	}
+		if status/100 == 2 {
+			var tr tokenResponse
+			if err := json.Unmarshal(body, &tr); err != nil || tr.AccessToken == "" {
+				// A 2xx without a usable token is an upstream contract violation.
+				return cachedToken{}, &Error{Op: "token", StatusCode: status, sentinel: shared.ErrUnavailable}
+			}
+			ttl := time.Duration(tr.ExpiresIn) * time.Second
+			if ttl <= 0 {
+				ttl = fallbackTokenTTL
+			}
+			return cachedToken{accessToken: tr.AccessToken, expiresAt: m.now().Add(ttl), scope: tr.Scope}, nil
+		}
 
-	var tr tokenResponse
-	if err := json.Unmarshal(body, &tr); err != nil || tr.AccessToken == "" {
-		// A 2xx without a usable token is an upstream contract violation.
-		return cachedToken{}, &Error{Op: "token", StatusCode: resp.StatusCode, sentinel: shared.ErrUnavailable}
+		ultimo = mapError("token", status, body)
+		// Só 5xx. Um 400/401 é resposta sobre a CREDENCIAL, e repeti-la não a conserta
+		// — só transforma um erro de configuração em tráfego.
+		if status/100 != 5 || tentativa >= tokenMaxRetries {
+			return cachedToken{}, ultimo
+		}
+		if err := m.sleep(ctx, tokenRetryBackoff(tentativa)); err != nil {
+			return cachedToken{}, ultimo
+		}
 	}
+}
 
-	ttl := time.Duration(tr.ExpiresIn) * time.Second
-	if ttl <= 0 {
-		ttl = fallbackTokenTTL
-	}
-	return cachedToken{accessToken: tr.AccessToken, expiresAt: m.now().Add(ttl), scope: tr.Scope}, nil
+// tokenMaxRetries bounds the retries on a 5xx from the token endpoint. Three extra
+// attempts turn the ~40% success rate measured on the sandbox into ~95%, and still stop
+// well short of hammering an endpoint that is genuinely down.
+const tokenMaxRetries = 3
+
+// tokenRetryBackoff spaces the retries: 250ms, 500ms, 1s.
+func tokenRetryBackoff(tentativa int) time.Duration {
+	return 250 * time.Millisecond << tentativa
 }

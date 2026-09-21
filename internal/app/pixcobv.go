@@ -35,6 +35,11 @@ type PixDueChargeService struct {
 	clock    ports.Clock
 	ids      ports.IDProvider
 	uow      ports.UnitOfWork
+	// reviser emenda uma cobrança registrada (PATCH), e lister as lista por intervalo.
+	// Portas separadas (ISP): PATCH emenda e o PUT de UpdateDueCharge substitui — usar
+	// um no lugar do outro apaga os campos omitidos, e isso é dinheiro.
+	reviser ports.PixDueChargeReviser
+	lister  ports.PixDueChargeLister
 }
 
 // NewPixDueChargeService wires a PixDueChargeService from the provided ports.
@@ -48,6 +53,8 @@ func NewPixDueChargeService(d Deps) *PixDueChargeService {
 		clock:    d.Clock,
 		ids:      d.IDs,
 		uow:      resolveUoW(d),
+		reviser:  d.PixDueChargeReviser,
+		lister:   d.PixDueChargeLister,
 	}
 }
 

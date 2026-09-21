@@ -30,21 +30,40 @@ func newDDAHarness(t *testing.T) (*app.DDAService, *harness, string) {
 
 func ddaBarcode(seed byte) string { return strings.Repeat(string('0'+seed%10), 44) }
 
-func ddaCreateInput(tenantID, key string, barcodes ...string) app.CreateGroupInput {
-	return app.CreateGroupInput{TenantID: tenantID, Barcodes: barcodes, IdempotencyKey: key}
+func ddaCreateInput(tenantID, key string, contents ...string) app.CreateGroupInput {
+	payments := make([]ports.DDAPayment, len(contents))
+	for i, c := range contents {
+		payments[i] = ports.DDAPayment{Content: c, AmountCents: int64(i+1) * 100}
+	}
+	return app.CreateGroupInput{TenantID: tenantID, Payments: payments, IdempotencyKey: key}
+}
+
+// ddaItemIDs reads a group's item ids back from the provider. The create answers with
+// the id alone — like the bank — so nothing else knows them.
+func ddaItemIDs(t *testing.T, svc *app.DDAService, tenantID, groupID string) []string {
+	t.Helper()
+	items, err := svc.GetPaymentGroupItems(context.Background(), tenantID, groupID)
+	if err != nil {
+		t.Fatalf("GetPaymentGroupItems: %v", err)
+	}
+	ids := make([]string, len(items))
+	for i, it := range items {
+		ids[i] = it.ID
+	}
+	return ids
 }
 
 func TestDDAListOpenBoletos(t *testing.T) {
 	t.Parallel()
 	svc, h, tenantID := newDDAHarness(t)
 	h.bank.SeedDDABoletos(tenantID, []ports.DDABoleto{
-		{ID: "b1", Barcode: ddaBarcode(1), AmountCents: 1000, DueDate: time.Now().Add(48 * time.Hour), BeneficiaryName: "Acme"},
+		{Content: ddaBarcode(1), AmountCents: 1000, DueDate: time.Now().Add(48 * time.Hour), BeneficiaryName: "Acme"},
 	})
 	got, err := svc.ListOpenBoletos(context.Background(), tenantID)
 	if err != nil {
 		t.Fatalf("ListOpenBoletos: %v", err)
 	}
-	if len(got) != 1 || got[0].ID != "b1" {
+	if len(got) != 1 || got[0].Content != ddaBarcode(1) {
 		t.Fatalf("unexpected boletos: %+v", got)
 	}
 	// Unknown tenant → error (resolve tenant fails).
@@ -61,17 +80,30 @@ func TestDDACreatePaymentGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreatePaymentGroup: %v", err)
 	}
-	if g.ID == "" || g.Status != "consultando" || len(g.Items) != 2 {
+	// The create answers with the id alone: no items, no status.
+	if g.ID == "" || len(g.Items) != 0 {
 		t.Fatalf("unexpected group: %+v", g)
 	}
 
+	// A PIX key is a legitimate payment reference — the API schedules "boletos e
+	// pixes" — and the old barcode-only validation refused every one of them.
+	if _, err := svc.CreatePaymentGroup(context.Background(), ddaCreateInput(tenantID, "kpix", "pericles@example.com")); err != nil {
+		t.Fatalf("PIX key must be accepted as content: %v", err)
+	}
+
+	tooLong := app.CreateGroupInput{
+		TenantID: tenantID, IdempotencyKey: "k",
+		Payments: []ports.DDAPayment{{Content: ddaBarcode(1), AmountCents: 100, Description: strings.Repeat("x", 101)}},
+	}
 	bad := []struct {
 		name string
 		in   app.CreateGroupInput
 	}{
 		{"empty_idem", ddaCreateInput(tenantID, "", ddaBarcode(1))},
-		{"empty_barcodes", ddaCreateInput(tenantID, "k")},
-		{"invalid_barcode", ddaCreateInput(tenantID, "k", "not-a-barcode")},
+		{"empty_payments", ddaCreateInput(tenantID, "k")},
+		{"invalid_content", ddaCreateInput(tenantID, "k", "not-a-barcode")},
+		{"zero_amount", app.CreateGroupInput{TenantID: tenantID, IdempotencyKey: "k", Payments: []ports.DDAPayment{{Content: ddaBarcode(1)}}}},
+		{"description_too_long", tooLong},
 	}
 	for _, tc := range bad {
 		if _, err := svc.CreatePaymentGroup(context.Background(), tc.in); !errors.Is(err, shared.ErrValidation) {
@@ -79,13 +111,13 @@ func TestDDACreatePaymentGroup(t *testing.T) {
 		}
 	}
 
-	// Too many barcodes → validation.
+	// Too many payments → validation.
 	many := make([]string, 201)
 	for i := range many {
 		many[i] = ddaBarcode(byte(i))
 	}
 	if _, err := svc.CreatePaymentGroup(context.Background(), ddaCreateInput(tenantID, "k", many...)); !errors.Is(err, shared.ErrValidation) {
-		t.Fatalf("too many barcodes: want validation, got %v", err)
+		t.Fatalf("too many payments: want validation, got %v", err)
 	}
 }
 
@@ -118,7 +150,8 @@ func TestDDARemovePaymentGroupItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	ids := []string{g.Items[0].ID, g.Items[1].ID}
+	all := ddaItemIDs(t, svc, tenantID, g.ID)
+	ids := []string{all[0], all[1]}
 	if err := svc.RemovePaymentGroupItems(context.Background(), tenantID, g.ID, ids); err != nil {
 		t.Fatalf("RemovePaymentGroupItems: %v", err)
 	}
@@ -143,7 +176,7 @@ func TestDDARemovePaymentGroupItem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := svc.RemovePaymentGroupItem(context.Background(), tenantID, g.ID, g.Items[0].ID); err != nil {
+	if err := svc.RemovePaymentGroupItem(context.Background(), tenantID, g.ID, ddaItemIDs(t, svc, tenantID, g.ID)[0]); err != nil {
 		t.Fatalf("RemovePaymentGroupItem: %v", err)
 	}
 	if err := svc.RemovePaymentGroupItem(context.Background(), tenantID, g.ID, "  "); !errors.Is(err, shared.ErrValidation) {
@@ -162,23 +195,28 @@ func TestDDASubmitPaymentGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	ids := ddaItemIDs(t, svc, tenantID, g.ID)
 	// Missing idempotency key → validation, before any state read.
-	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, g.ID, ""); !errors.Is(err, shared.ErrValidation) {
+	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, g.ID, "Zé", ""); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("empty idem: want validation, got %v", err)
 	}
-	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, g.ID, "s1"); err != nil {
+	// uploader_name is required by the contract, and checked before any state read.
+	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, g.ID, " ", "s1"); !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("empty uploader: want validation, got %v", err)
+	}
+	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, g.ID, "Zé", "s1"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	// Re-submitting an already-approved group is an idempotent no-op (success).
-	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, g.ID, "s1"); err != nil {
+	// Re-submitting an already-submitted group is an idempotent no-op (success).
+	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, g.ID, "Zé", "s1"); err != nil {
 		t.Fatalf("idempotent re-submit: %v", err)
 	}
-	// After approval the group is frozen: trimming → invalid transition.
-	if err := svc.RemovePaymentGroupItems(context.Background(), tenantID, g.ID, []string{g.Items[0].ID}); !errors.Is(err, shared.ErrInvalidTransition) {
-		t.Fatalf("trim after approval: want invalid-transition, got %v", err)
+	// Once submitted the group is frozen: trimming → invalid transition.
+	if err := svc.RemovePaymentGroupItems(context.Background(), tenantID, g.ID, ids); !errors.Is(err, shared.ErrInvalidTransition) {
+		t.Fatalf("trim after submit: want invalid-transition, got %v", err)
 	}
 	// Unknown group → not found.
-	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, "missing", "s2"); !errors.Is(err, shared.ErrNotFound) {
+	if err := svc.SubmitPaymentGroup(context.Background(), tenantID, "missing", "Zé", "s2"); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("unknown group: want not-found, got %v", err)
 	}
 }

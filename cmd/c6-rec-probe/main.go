@@ -247,10 +247,15 @@ func loadTenantMaterial(ctx context.Context, cfg config.Config, tenantID string)
 	return cred, cert, nil
 }
 
-// fetchToken replicates the adapter's client_credentials grant: the secret travels only
-// in the Basic auth header and is never printed.
+// fetchToken replicates the adapter's client_credentials grant: the credential travels
+// in the form body (client_secret_post), which is what the published C6 contract
+// documents, and is never printed. See token.go for why this is not Basic.
 func fetchToken(ctx context.Context, httpc *http.Client, cfg config.Config, cred ports.BankCredential) (string, error) {
-	form := url.Values{"grant_type": {"client_credentials"}}
+	form := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {cred.ClientID},
+		"client_secret": {cred.Secret},
+	}
 	if cfg.C6.Scope != "" {
 		form.Set("scope", cfg.C6.Scope)
 	}
@@ -260,7 +265,6 @@ func fetchToken(ctx context.Context, httpc *http.Client, cfg config.Config, cred
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	req.SetBasicAuth(cred.ClientID, cred.Secret)
 
 	resp, err := httpc.Do(req)
 	if err != nil {
