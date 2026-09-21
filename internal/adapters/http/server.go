@@ -18,11 +18,25 @@ import (
 // driving adapter. It is constructed once at startup and is safe for concurrent
 // use.
 type Server struct {
-	charges   *app.ChargeService
-	pix       *app.PixService
-	pixCobV   *app.PixDueChargeService
-	checkout  *app.CheckoutService
-	boleto    *app.BoletoService
+	charges  *app.ChargeService
+	pix      *app.PixService
+	pixCobV  *app.PixDueChargeService
+	checkout *app.CheckoutService
+	boleto   *app.BoletoService
+	// plainBoleto backs /v1/bank-slips — o boleto SIMPLES (bankslip v1), produto
+	// distinto do BolePix que vive em /v1/boletos. Nil deixa as rotas registradas e
+	// indisponíveis (503), nunca em pânico.
+	plainBoleto *app.PlainBoletoService
+	// pixLoc, pixReceived e pixBatch cobrem as superfícies do PIX que o BACEN
+	// especifica e que não tínhamos: location de payload, PIX recebido/devolução e
+	// lote de cobranças com vencimento.
+	pixLoc      *app.PixLocationService
+	pixReceived *app.PixReceivedService
+	pixBatch    *app.PixBatchService
+	// acquirer backs /v1/acquirer/* — extrato do C6 Pay (recebíveis e transações de
+	// cartão). Produto com habilitação à parte: em produção a conta sem ele responde
+	// 403, e é por isso que ele é opcional.
+	acquirer  *app.AcquirerStatementService
 	dda       *app.DDAService
 	statement *app.StatementService
 	// recurrence backs the PIX Automático tenant routes (/v1/pix/rec, /solicrec, /cobr,
@@ -134,6 +148,18 @@ type Config struct {
 	// deployments/tests that do not serve the boleto surface — the routes are then
 	// registered but never exercised.
 	Boleto *app.BoletoService
+	// PlainBoleto backs the plain bank-slip tenant routes (/v1/bank-slips, roteiro
+	// bloco BOLETO). É um produto DIFERENTE do BolePix, e não do mesmo contrato: ele
+	// aceita três faixas de desconto e não emite QR. Pode ser nil.
+	PlainBoleto *app.PlainBoletoService
+	// PixLocation, PixReceived e PixBatch servem as rotas /v1/pix/loc, /v1/pix/received
+	// e /v1/pix/lotecobv. Podem ser nil — as rotas ficam registradas e indisponíveis.
+	PixLocation *app.PixLocationService
+	PixReceived *app.PixReceivedService
+	PixBatch    *app.PixBatchService
+	// Acquirer serve /v1/acquirer/{receivables,transactions} (extrato do C6 Pay).
+	// Pode ser nil.
+	Acquirer *app.AcquirerStatementService
 	// DDA backs the DDA / agendamento-de-pagamentos tenant routes (/v1/dda, roteiro
 	// grupo 8). It may be nil for deployments/tests that do not serve the DDA surface —
 	// the routes are then registered but never exercised.
@@ -261,6 +287,11 @@ func NewServer(c Config) *Server {
 		pixCobV:                c.PixCobV,
 		checkout:               c.Checkout,
 		boleto:                 c.Boleto,
+		plainBoleto:            c.PlainBoleto,
+		pixLoc:                 c.PixLocation,
+		pixReceived:            c.PixReceived,
+		pixBatch:               c.PixBatch,
+		acquirer:               c.Acquirer,
 		dda:                    c.DDA,
 		statement:              c.Statement,
 		recurrence:             c.Recurrence,
@@ -438,9 +469,36 @@ func (s *Server) Router() http.Handler {
 			// apart from a txid. Create generates the txid server-side (like immediate pix);
 			// get/update address it. Settlement notification (7.8) is reconciled through the
 			// shared C6 webhook (/webhooks/c6/{tenantRef}, C6-D), not a per-charge endpoint.
+			r.Get("/pix/cobv", s.handleListPixCobV)
 			r.Post("/pix/cobv", s.handleCreatePixCobV)
 			r.Get("/pix/cobv/{txid}", s.handleGetPixCobV)
 			r.Put("/pix/cobv/{txid}", s.handleUpdatePixCobV)
+			// PATCH é a revisão do BACEN: manda só o que muda e o PSP incrementa `revisao`.
+			// PUT continua sendo a substituição, que é outra operação — quem manda o
+			// documento inteiro no PATCH apaga o que omitiu.
+			r.Patch("/pix/cobv/{txid}", s.handleRevisePixCobV)
+			// Location de payload (loc): o endereço onde o QR busca a cobrança. Vive
+			// separado da cobrança porque um loc pode ser desvinculado do txid e reusado —
+			// é o que permite trocar a cobrança por trás de um QR já impresso. Os segmentos
+			// literais entram ANTES do "/pix/{txid}" abaixo.
+			r.Post("/pix/loc", s.handleCreatePixLoc)
+			r.Get("/pix/loc", s.handleListPixLoc)
+			r.Get("/pix/loc/{id}", s.handleGetPixLoc)
+			r.Delete("/pix/loc/{id}/txid", s.handleUnlinkPixLoc)
+			// PIX recebidos e devoluções. Leitura e devolução trazem dado do PAGADOR: a
+			// view não carrega o que a ADR-0008 mantém fora do nosso lado, e o corpo do 2xx
+			// não vai a log.
+			r.Get("/pix/received", s.handleListReceivedPix)
+			r.Get("/pix/received/{e2eid}", s.handleGetReceivedPix)
+			r.Put("/pix/received/{e2eid}/refunds/{refundID}", s.handleRequestRefund)
+			r.Get("/pix/received/{e2eid}/refunds/{refundID}", s.handleGetRefund)
+			// Lote de cobranças com vencimento (lotecobv): cria ou revisa até 200 cobv numa
+			// requisição, com UM id de lote. PUT cria o lote inteiro, PATCH revisa só as
+			// cobranças enviadas.
+			r.Get("/pix/lotecobv", s.handleListPixBatches)
+			r.Put("/pix/lotecobv/{id}", s.handleCreatePixBatch)
+			r.Patch("/pix/lotecobv/{id}", s.handleRevisePixBatch)
+			r.Get("/pix/lotecobv/{id}", s.handleGetPixBatch)
 			// PIX Automático / recorrência (Jornada 3 — QR composto: cobrança imediata +
 			// autorização da recorrência). Dark-shipped behind PAYMENT_PIX_RECURRENCE: with
 			// the flag off none of these routes exists, so rollback is a config flip.
@@ -469,6 +527,10 @@ func (s *Server) Router() http.Handler {
 				r.Post("/pix/cobr/{txid}/retentativa/{data}", s.handleRetryCobR)
 			}
 			r.Get("/pix/{txid}", s.handleGetPix)
+			// Revisão da cobrança imediata (PATCH /cob/{txid} do BACEN). Não há PUT aqui:
+			// criar continua sendo POST /v1/pix, que deriva o txid da âncora de
+			// idempotência — é o que impede cobrar duas vezes pelo mesmo pedido.
+			r.Patch("/pix/{txid}", s.handleRevisePix)
 			// Unified hosted checkout — open a session (roteiro 9.a–9.c), reconcile it
 			// (grupo 10, GET) and cancel it (grupo 11, DELETE). The status webhook (grupo
 			// 12) reuses the shared /webhooks/c6/{tenantRef} handler below.
@@ -487,6 +549,18 @@ func (s *Server) Router() http.Handler {
 			// updateBoleto operation keeps working for existing callers.
 			r.Patch("/boletos/{id}", s.handleUpdateBoleto)
 			r.Put("/boletos/{id}", s.handleUpdateBoleto)
+			// Listagem das cobranças BolePix por janela. Registrada com o literal "/boletos"
+			// — não colide com "/boletos/{id}" porque o chi casa profundidade primeiro.
+			r.Get("/boletos", s.handleListBoletos)
+			// Boleto SIMPLES (bankslip v1) — produto distinto do BolePix acima, com caminho
+			// próprio para que os dois não se confundam num relatório. Ele não cria cobrança
+			// no nosso razão: é a superfície crua do banco, e quem precisa de liquidação usa
+			// /v1/boletos. Ver app.PlainBoletoService.
+			r.Post("/bank-slips", s.handleCreatePlainBoleto)
+			r.Get("/bank-slips/{id}", s.handleGetPlainBoleto)
+			r.Patch("/bank-slips/{id}", s.handleUpdatePlainBoleto)
+			r.Delete("/bank-slips/{id}", s.handleCancelPlainBoleto)
+			r.Get("/bank-slips/{id}/pdf", s.handleGetPlainBoletoPDF)
 			// DDA / agendamento de pagamentos (roteiro grupo 8): list the boletos open in
 			// the tenant's DDA (8.1), submit a payment group for the initial consult (8.2),
 			// read its items (8.3), trim items as a list (8.4) or one at a time (8.5) and
@@ -504,6 +578,12 @@ func (s *Server) Router() http.Handler {
 			// The tenant is derived from the credential, never the query — no parameter
 			// selects which tenant's extrato is read (threat H1/P1).
 			r.Get("/statement", s.handleGetStatement)
+			// Extrato de adquirência (C6 Pay): transações de cartão autorizadas e os
+			// recebíveis que delas decorrem. Recebível NÃO é transação — é a parcela
+			// LÍQUIDA que o adquirente paga em data futura, já descontados MDR e tarifa,
+			// enquanto o nosso razão liquida no bruto.
+			r.Get("/acquirer/receivables", s.handleListReceivables)
+			r.Get("/acquirer/transactions", s.handleListCardTransactions)
 
 			// Capacidades do banco por tenant (SIN-69368). Deliberadamente FORA da flag de
 			// intake self-serve: aquela flag protege ESCRITAS de segredo, e esta é uma

@@ -74,8 +74,34 @@ type Deps struct {
 	// from RecReader for the same ISP reason the readers are separate — a deployment can
 	// speak the mandate surface without the QR journeys. Nil leaves those operations
 	// unavailable rather than panicking.
-	SolicRecs   ports.SolicRecProvider
-	LocRecs     ports.LocRecProvider
+	SolicRecs ports.SolicRecProvider
+	LocRecs   ports.LocRecProvider
+	// --- Superfícies acrescentadas com o roteiro v3.0 -----------------------------
+	//
+	// Todas opcionais e todas segregadas (ISP): cada serviço depende só do que usa, e
+	// um campo nil deixa a operação indisponível (503) em vez de derrubar o serviço
+	// inteiro — é o que permite o modo stub subir sem implementar nenhuma delas.
+
+	// PixChargeReviser revisa uma cobrança imediata já criada.
+	PixChargeReviser ports.PixChargeReviser
+	// PixDueChargeReviser emenda uma cobrança com vencimento; PixDueChargeLister as
+	// lista por intervalo.
+	PixDueChargeReviser ports.PixDueChargeReviser
+	PixDueChargeLister  ports.PixDueChargeLister
+	// PixLocation gerencia as locations de payload (o QR endereçável, que existe
+	// independentemente da cobrança).
+	PixLocation ports.PixLocationProvider
+	// PixReceived lê os PIX recebidos e solicita devolução.
+	PixReceived ports.PixReceivedProvider
+	// PixDueChargeBatch cria e lê lotes de cobrança com vencimento.
+	PixDueChargeBatch ports.PixDueChargeBatchProvider
+	// AcquirerStatement lê o extrato de adquirência (transações e recebíveis).
+	AcquirerStatement ports.AcquirerStatementProvider
+	// PlainBoleto é o boleto simples — produto diferente do BolePix.
+	PlainBoleto ports.PlainBoletoProvider
+	// BoletoLister lista as cobranças BolePix emitidas.
+	BoletoLister ports.BoletoLister
+
 	Credentials ports.CredentialStore
 	// CredWriter is the admin-plane write path for per-tenant bank credentials.
 	// Kept separate from Credentials (the reader) so each service depends only on

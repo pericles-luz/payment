@@ -324,6 +324,32 @@ curl -X POST "$BASE/v1/pix/cobv" \
 `201 Created` retorna `txid`, `qr_code` e a janela de vencimento. Alterar
 (`updateCobV`, `PUT /v1/pix/cobv/{txid}`) usa o mesmo corpo.
 
+**`PUT` e `PATCH` não são a mesma coisa, e a diferença é dinheiro.** O `PUT`
+(`updateCobV`) manda o conjunto COMPLETO de parâmetros e substitui; o `PATCH`
+(`reviseCobV`) manda só o que mudou. Mandar um corpo parcial no `PUT` apaga em
+silêncio o que foi omitido — a multa que o pagador já aceitou, o desconto prometido.
+
+```bash
+# Só o vencimento muda; multa, juros e desconto ficam como estão.
+curl -X PATCH "$BASE/v1/pix/cobv/TX123" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: cobv-fatura-2026-09-prorroga" \
+  -H "Content-Type: application/json" \
+  -d '{ "due_date": "2026-09-20T00:00:00-03:00" }'
+```
+
+Listar por janela (`listCobV`): `start` e `end` em RFC3339, no máximo 30 dias.
+
+```bash
+curl "$BASE/v1/pix/cobv?start=2026-09-01T00:00:00Z&end=2026-09-30T00:00:00Z" \
+  -H "Authorization: Bearer <TENANT_TOKEN>"
+```
+
+A cobrança **imediata** tem o mesmo par: `PATCH /v1/pix/{txid}` (`revisePix`) revisa
+o que já existe. Não há "criar deixando o PSP escolher o txid": o nosso `txid` nasce da
+âncora de idempotência, e é essa derivação que faz um reenvio acertar a mesma cobrança
+em vez de cobrar o comprador duas vezes.
+
 ### 4.4 Boleto BolePix (`createBoleto` / `getBoleto` / `updateBoleto` / `deleteBoleto`)
 
 ```bash
@@ -343,6 +369,17 @@ curl -X POST "$BASE/v1/boletos" \
 `201 Created` traz `boleto_id`, `barcode`/`digitable_line`, `qr_code` (BolePix) e
 `our_number`. Alteração de vencimento/valor/multa (`updateBoleto`, `PUT`) e
 baixa/cancelamento (`deleteBoleto`, `DELETE`) endereçam por `boleto_id`.
+
+Listar o que foi emitido (`listBoletos`, `GET /v1/boletos`) exige **ao menos um**
+intervalo — `payment_date`, `due_date` ou `credit_date` —, cada um com as **duas**
+pontas e no máximo 60 dias. São perguntas diferentes ("o que foi pago", "o que vence",
+"o que cai na conta") e o banco as responde separadamente; meio intervalo responde
+`400`, porque o banco responderia alguma coisa e não seria a janela que se quis.
+
+```bash
+curl "$BASE/v1/boletos?due_date_from=2026-09-01&due_date_to=2026-09-30&status=PAID" \
+  -H "Authorization: Bearer <TENANT_TOKEN>"
+```
 
 ---
 
@@ -608,6 +645,191 @@ Um grupo de outra empresa-cliente responde `404` (nunca oráculo cross-tenant).
 
 ---
 
+## 5.1 Superfícies BACEN do PIX: location, recebidos, devolução e lote
+
+Quatro coisas que a cobrança (`cob`/`cobv`) não cobre. Nenhuma delas é faturada: preço
+por rota é decisão comercial, e ligar bilhetagem numa rota nova sem alguém decidir o
+preço criaria fatura silenciosa para todo integrador.
+
+### 5.1.1 Location de payload (`createPixLoc`, `getPixLoc`, `unlinkPixLocTxid`)
+
+A location é o QR endereçável que o PSP serve, e existe **independentemente** da
+cobrança. É isso que permite imprimir um QR antes de a cobrança que será servida por ele
+existir — e trocar a cobrança por trás de um QR já impresso.
+
+```bash
+curl -X POST "$BASE/v1/pix/loc" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" -H "Content-Type: application/json" \
+  -d '{ "tipo_cob": "cobv" }'
+# → {"id": 108, "location": "pix.example.com/qr/v2/...", "tipo_cob": "cobv"}
+
+# Desvincular a cobrança do QR:
+curl -X DELETE "$BASE/v1/pix/loc/108/txid" -H "Authorization: Bearer <TENANT_TOKEN>"
+```
+
+O desvinculamento **não cancela nada**: o status da cobrança fica como está, ela só
+deixa de ser servida por aquele QR. Quem quer cancelar usa o caminho da cobrança. Na
+resposta o campo `txid` some, em vez de voltar vazio, para ninguém ler `""` como um txid.
+
+### 5.1.2 PIX recebidos (`listReceivedPix`, `getReceivedPix`)
+
+```bash
+curl "$BASE/v1/pix/received?start=2026-09-01T00:00:00Z&end=2026-09-30T00:00:00Z&refund_present=true" \
+  -H "Authorization: Bearer <TENANT_TOKEN>"
+```
+
+Duas coisas para não tropeçar:
+
+- **`txid` é vazio num PIX pago contra chave estática.** A conciliação tem de lidar com
+  isso em vez de supor que há cobrança por trás.
+- **A resposta não traz a identidade do pagador.** O objeto do PSP carrega CPF/CNPJ e
+  nome de quem pagou; nós não os transportamos, e é assim que eles nunca chegam a log,
+  erro ou resposta (ADR-0008). `payer_info` é a mensagem livre que o próprio pagador
+  escolheu mandar.
+
+Os filtros booleanos (`txid_present`, `refund_present`) ausentes querem dizer "não filtre
+por isto" — que é diferente de `false`.
+
+### 5.1.3 Devolução (`requestPixRefund`, `getPixRefund`)
+
+```bash
+curl -X PUT "$BASE/v1/pix/received/E1234.../refunds/dev-pedido-771" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" -H "Content-Type: application/json" \
+  -d '{ "amount_cents": 1500, "nature": "ORIGINAL", "description": "devolução parcial" }'
+```
+
+**O `refundID` está no caminho e é seu.** O par (`e2eid`, `refundID`) endereça sempre a
+mesma devolução, então um reenvio não devolve duas vezes — por isso esta rota não pede
+`Idempotency-Key`: o próprio endereço já é a chave. Gerar um id aleatório por tentativa
+desfaz exatamente essa garantia.
+
+O valor é obrigatório: não existe "devolve tudo" por omissão, porque devolver a mais é
+tão errado quanto devolver a menos.
+
+O `201` diz que o PSP **aceitou** o pedido. Se o dinheiro saiu, quem responde é a
+leitura: o status pode continuar `EM_PROCESSAMENTO` depois do aceite, e um
+`NAO_REALIZADO` só explica o porquê no campo `reason`.
+
+### 5.1.4 Lote de cobranças com vencimento (`createPixBatch`, `getPixBatch`)
+
+Até 200 cobv sob um id de lote escolhido por você.
+
+```bash
+curl -X PUT "$BASE/v1/pix/lotecobv/mensalidades-2026-09" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: lote-mensalidades-2026-09" \
+  -H "Content-Type: application/json" \
+  -d '{ "description": "Mensalidades setembro",
+        "charges": [ { "txid": "TXALUNO001", "amount_cents": 15000, "currency": "BRL",
+                       "due_date": "2026-09-10T00:00:00-03:00", "validity_days": 30,
+                       "fine_bps": 200, "monthly_interest_bps": 100,
+                       "creditor_key": "escola@pix.example",
+                       "devedor": { "tax_id": "12345678901", "name": "Maria",
+                                    "street": "Rua A, 10", "city": "SP",
+                                    "state": "SP", "zip_code": "01000000" } } ] }'
+```
+
+**Responde `202`, sem corpo — não `201`.** O PSP aceita o lote e o processa depois: as
+cobranças ainda não existem, e tratar o aceite como "as cobranças estão registradas" é a
+forma de errar aqui. O resultado de cada uma só sai da leitura:
+
+```bash
+curl "$BASE/v1/pix/lotecobv/mensalidades-2026-09" -H "Authorization: Bearer <TENANT_TOKEN>"
+# → {"charges": [{"txid":"TXALUNO001","status":"CRIADA"},
+#                {"txid":"TXALUNO002","status":"NEGADA","problem":"..."}]}
+```
+
+O `txid` é explícito **só no lote**: numa cobv avulsa ele é derivado da âncora de
+idempotência, mas aqui o PSP endereça cada cobrança pelo txid do corpo, e é por ele que o
+resultado dela volta. Uma cobrança sem txid derruba o lote inteiro, porque ela sumiria em
+silêncio.
+
+`PATCH` no mesmo caminho revisa cobranças do lote, e só pode **manter** o conjunto
+original: acrescentar ou remover uma não é revisão, e o PSP recusa.
+
+---
+
+## 5.2 Boleto simples (`/v1/bank-slips`) — não é o BolePix
+
+São **dois produtos**, ainda que os dois se chamem "boleto". O boleto simples aceita até
+**três** faixas de desconto (o BolePix expõe uma só), a multa e os juros têm forma
+própria, o endereço do pagador tem rua e número separados, a referência externa cabe em
+10 caracteres em vez de 26 — e ele **não emite QR**.
+
+> **Ele não cria cobrança no razão deste gateway.** É a superfície crua do banco: emite,
+> lê, altera, baixa e renderiza. Um boleto emitido por `/v1/bank-slips` **não liquida
+> sozinho** pelo webhook de liquidação. Quem precisa de liquidação usa `/v1/boletos`.
+
+```bash
+curl -X POST "$BASE/v1/bank-slips" \
+  -H "Authorization: Bearer <TENANT_TOKEN>" \
+  -H "Idempotency-Key: slip-pedido-771" \
+  -H "Content-Type: application/json" \
+  -d '{ "slip_id": "pedido-771", "amount_cents": 25000, "currency": "BRL",
+        "due_date": "2026-10-15T00:00:00-03:00",
+        "fine_bps": 200, "monthly_interest_bps": 100,
+        "discounts": [ { "days_before_due": 10, "bps": 500 },
+                       { "days_before_due": 5,  "bps": 300 },
+                       { "days_before_due": 1,  "bps": 100 } ],
+        "payer": { "name": "Cliente XPTO", "tax_id": "12345678000199",
+                   "street": "Rua A", "number": 100,
+                   "city": "SP", "state": "SP", "zip_code": "01000000" } }'
+```
+
+O escalonamento tem regra própria, conferida antes de ir ao banco: no máximo três faixas,
+em prazos **estritamente decrescentes**, e todas na mesma forma (todas percentuais ou
+todas em valor). Misturar as formas é `400` — o banco não recusa de forma clara, ele
+aplica o tipo errado a alguma faixa, e o pagador paga a diferença. Multa percentual e
+multa fixa também são mutuamente exclusivas.
+
+`GET`, `PATCH` e `DELETE` em `/v1/bank-slips/{id}` endereçam pelo id **forte do banco**,
+devolvido na emissão — não pelo `slip_id` que você mandou. O `PATCH` é parcial: campo
+ausente é "deixa como está", nunca "zera". Tocar em **qualquer** encargo exige declarar o
+quadro completo de encargos, porque o banco substitui o objeto inteiro em vez de mesclar
+nele — deixar um de fora o apagaria, mudando em silêncio o que o pagador deve.
+
+`GET /v1/bank-slips/{id}/pdf` renderiza o documento. Ele carrega PII do pagador, então
+sai com `Cache-Control: no-store`: nenhum intermediário pode guardá-lo em cache.
+
+---
+
+## 5.3 Extrato de adquirência (`/v1/acquirer/*`)
+
+Duas leituras sobre a mesma janela, e **não são o mesmo dinheiro**:
+
+| rota | o que é |
+|---|---|
+| `GET /v1/acquirer/transactions` | a autorização: o BRUTO, de uma vez |
+| `GET /v1/acquirer/receivables` | a parcela LÍQUIDA que o adquirente paga, em data futura |
+
+```bash
+curl "$BASE/v1/acquirer/receivables?start_date=2026-09-01&end_date=2026-09-30" \
+  -H "Authorization: Bearer <TENANT_TOKEN>"
+```
+
+R$ 30,00 autorizados chegam à conta como R$ 28,39, já descontados MDR e tarifa por venda.
+As cobranças deste gateway liquidam no **bruto**; a conta do lojista recebe o **líquido**.
+É nessa diferença que uma conciliação deixa de fechar, e por isso as duas leituras existem
+separadas em vez de uma só.
+
+Três detalhes de leitura:
+
+- **`fee_cents` e `discount_cents` chegam negativos e assim ficam.** São deduções;
+  inverter o sinal esconderia a direção do dinheiro.
+- **`items` é a contagem DESTA página**, não um total geral. Lê-lo como total subdeclara
+  um extrato paginado — use `last_page` para saber quando parar.
+- **`mdr` vem escalado por 100 e é transportado sem interpretação.** O contrato do
+  adquirente não diz se é percentual ou valor, e o exemplo dele serve para os dois; nada
+  aqui o usa para calcular nada, e você também não deveria sem confirmar com o banco.
+
+`end_date` ausente é "o mesmo dia de `start_date`", que é o padrão do próprio adquirente.
+Janela máxima de 60 dias.
+
+O C6 Pay é produto com **habilitação à parte**: a conta que não o tem responde `503` nesta
+superfície (e, em produção, `403` do lado do banco).
+
+---
+
 ## 6. Reconciliação: extrato e webhook de liquidação
 
 ### 6.1 Extrato por período (`getStatement`)
@@ -839,6 +1061,7 @@ replay devolve `409` **sem** reexibir o segredo (display-once).
 | `413` | Corpo acima do limite (1 MiB no `/v1`; 64 KiB no webhook) |
 | `429` | Rate limit — faça backoff (respeite `Retry-After` quando presente) |
 | `500` | Erro interno transitório |
+| `503` | O banco desta empresa-cliente não fala esta superfície, ou o produto não está habilitado na conta dele. Falha FECHADA de propósito — é melhor do que rotear para um banco que a implementa por acaso |
 
 ### 9.4 Rate limiting
 

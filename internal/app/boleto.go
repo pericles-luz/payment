@@ -39,6 +39,9 @@ type BoletoService struct {
 	clock    ports.Clock
 	ids      ports.IDProvider
 	uow      ports.UnitOfWork
+	// lister lista as cobranças emitidas. Porta separada (ISP): o caminho de
+	// liquidação concilia UMA cobrança e não tem uso para uma listagem.
+	lister ports.BoletoLister
 }
 
 // NewBoletoService wires a BoletoService from the provided ports.
@@ -52,6 +55,7 @@ func NewBoletoService(d Deps) *BoletoService {
 		clock:    d.Clock,
 		ids:      d.IDs,
 		uow:      resolveUoW(d),
+		lister:   d.BoletoLister,
 	}
 }
 

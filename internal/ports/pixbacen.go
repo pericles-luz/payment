@@ -16,11 +16,16 @@ import (
 // imediata não deve passar a depender de semântica de devolução, e quem devolve um
 // PIX não deve depender de QR code.
 //
-// Nenhuma delas tem, hoje, caso de uso nem rota HTTP, e isso é deliberado. Elas
-// existem porque o roteiro de homologação do C6 as cobra e porque o adapter precisa
-// falá-las de verdade para a evidência ser real. Inventar um caso de uso e uma rota
-// que nada consome seria superfície de ataque sem dono. Quando um fluxo de produto
-// precisar de uma delas, ela ganha caso de uso então — a porta já está aqui.
+// Elas nasceram sem caso de uso nem rota, só para o adapter falar o que o roteiro de
+// homologação do C6 cobra. Hoje todas têm rota (`PixLocationService`,
+// `PixReceivedService`, `PixBatchService`, e os verbos de revisão dentro de
+// `PixService`/`PixDueChargeService`), e o roteador de banco responde 503 para o banco
+// que não as implementa.
+//
+// Uma coisa NÃO subiu junto, de propósito: `CreateImmediateChargeAutoTxID`. O txid das
+// nossas cobranças nasce da âncora de idempotência, e é essa derivação que faz um
+// reenvio acertar a mesma cobrança em vez de cobrar o comprador duas vezes. Deixar o
+// PSP escolher o txid jogaria isso fora — ela existe porque o roteiro cobra o verbo.
 //
 // Todo método carrega tenantID explicitamente, como as outras portas de banco, para
 // que o isolamento por tenant que o adapter aplica nunca seja contornado (ameaça

@@ -151,34 +151,46 @@ func run() error {
 	})
 
 	deps := app.Deps{
-		Payments:           store,
-		Tenants:            store,
-		Pricing:            store,
-		Ledger:             store,
-		Processed:          store,
-		Recs:               store,
-		CobRs:              store,
-		Bus:                inmemory.NewBus(),
-		Bank:               routers.Bank,
-		Pix:                routers.Pix,
-		PixDueCharge:       routers.PixDueCharge,
-		Checkout:           routers.Checkout,
-		Boleto:             routers.Boleto,
-		DDA:                routers.DDA,
-		Statement:          routers.Statement,
-		RecReader:          recReader,
-		CobRReader:         cobrReader,
-		SolicRecs:          solicRecWriter,
-		LocRecs:            locRecWriter,
-		OutboundAttributor: outboundAttributor,
-		Credentials:        creds,
-		CredWriter:         creds,
-		Sharing:            creds,
-		CertWriter:         certs,
-		CredInvalidator:    credInvalidator,
-		Audit:              store,
-		Clock:              system.Clock{},
-		IDs:                system.IDProvider{},
+		Payments:     store,
+		Tenants:      store,
+		Pricing:      store,
+		Ledger:       store,
+		Processed:    store,
+		Recs:         store,
+		CobRs:        store,
+		Bus:          inmemory.NewBus(),
+		Bank:         routers.Bank,
+		Pix:          routers.Pix,
+		PixDueCharge: routers.PixDueCharge,
+		Checkout:     routers.Checkout,
+		Boleto:       routers.Boleto,
+		DDA:          routers.DDA,
+		Statement:    routers.Statement,
+		// Superfícies do roteiro v3.0. Cada uma é um porto próprio: o roteador falha
+		// fechado (503) quando o banco resolvido não fala aquela superfície, em vez de
+		// fingir que um banco a suporta porque outro suporta.
+		PixChargeReviser:    routers.PixChargeReviser,
+		PixDueChargeReviser: routers.PixDueChargeReviser,
+		PixDueChargeLister:  routers.PixDueChargeLister,
+		PixLocation:         routers.PixLocation,
+		PixReceived:         routers.PixReceived,
+		PixDueChargeBatch:   routers.PixDueChargeBatch,
+		AcquirerStatement:   routers.AcquirerStatement,
+		PlainBoleto:         routers.PlainBoleto,
+		BoletoLister:        routers.BoletoLister,
+		RecReader:           recReader,
+		CobRReader:          cobrReader,
+		SolicRecs:           solicRecWriter,
+		LocRecs:             locRecWriter,
+		OutboundAttributor:  outboundAttributor,
+		Credentials:         creds,
+		CredWriter:          creds,
+		Sharing:             creds,
+		CertWriter:          certs,
+		CredInvalidator:     credInvalidator,
+		Audit:               store,
+		Clock:               system.Clock{},
+		IDs:                 system.IDProvider{},
 		// Transactional boundary for the multi-write use-cases (charge creation,
 		// webhook settlement) — required for financial integrity (SIN-64719).
 		UoW: store,
@@ -400,6 +412,14 @@ func run() error {
 		Boleto:    app.NewBoletoService(deps),
 		DDA:       app.NewDDAService(deps),
 		Statement: app.NewStatementService(deps),
+		// Superfícies do roteiro v3.0. Construídas sempre: cada serviço recusa por conta
+		// própria quando o porto correspondente é nil, e o roteador de banco responde 503
+		// quando o banco do tenant não fala aquela superfície.
+		PlainBoleto: app.NewPlainBoletoService(deps),
+		PixLocation: app.NewPixLocationService(deps),
+		PixReceived: app.NewPixReceivedService(deps),
+		PixBatch:    app.NewPixBatchService(deps),
+		Acquirer:    app.NewAcquirerStatementService(deps),
 		// PIX Automático (recorrência). The service is wired unconditionally so the
 		// recurrence WEBHOOK path can keep recording reconciled mandates; the flag below
 		// decides only whether the tenant-facing routes exist.
@@ -746,6 +766,36 @@ func buildProviderSet(generic ports.BankProvider, raw ports.PixProvider) bank.Pr
 	}
 	if v, ok := raw.(ports.StatementProvider); ok {
 		set.Statement = v
+	}
+	// Superfícies do roteiro v3.0. Mesma regra das de cima: o banco que não implementa
+	// a interface deixa o campo nil, e o roteador responde 503 para aquela superfície —
+	// em vez de o stub ganhar de graça um produto que ele não tem.
+	if v, ok := raw.(ports.PixChargeReviser); ok {
+		set.PixChargeReviser = v
+	}
+	if v, ok := raw.(ports.PixDueChargeReviser); ok {
+		set.PixDueChargeReviser = v
+	}
+	if v, ok := raw.(ports.PixDueChargeLister); ok {
+		set.PixDueChargeLister = v
+	}
+	if v, ok := raw.(ports.PixLocationProvider); ok {
+		set.PixLocation = v
+	}
+	if v, ok := raw.(ports.PixReceivedProvider); ok {
+		set.PixReceived = v
+	}
+	if v, ok := raw.(ports.PixDueChargeBatchProvider); ok {
+		set.PixDueChargeBatch = v
+	}
+	if v, ok := raw.(ports.AcquirerStatementProvider); ok {
+		set.AcquirerStatement = v
+	}
+	if v, ok := raw.(ports.PlainBoletoProvider); ok {
+		set.PlainBoleto = v
+	}
+	if v, ok := raw.(ports.BoletoLister); ok {
+		set.BoletoLister = v
 	}
 	if v, ok := generic.(ports.CredentialInvalidator); ok {
 		set.CredInvalidator = v
