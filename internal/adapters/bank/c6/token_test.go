@@ -146,6 +146,8 @@ func TestTokenFetchErrors(t *testing.T) {
 				_, _ = w.Write([]byte(`{"error":"e"}`))
 			}
 			p := ts.provider(t, oneTenant("t1", "c", "s"))
+			// O 503 é repetido (é 5xx); sem isto o teste dorme de verdade.
+			p.tokens.sleep = semDormir
 			if _, err := p.tokens.token(context.Background(), "t1"); !errors.Is(err, tc.want) {
 				t.Fatalf("status %d: want %v, got %v", tc.status, tc.want, err)
 			}
@@ -402,5 +404,102 @@ func TestTokenOmitsScopeWhenUnset(t *testing.T) {
 	defer mu.Unlock()
 	if hasScope {
 		t.Fatal("an unset scope must not be sent at all")
+	}
+}
+
+// semDormir substitui a espera entre retentativas para os testes não dormirem.
+func semDormir(context.Context, time.Duration) error { return nil }
+
+// TestTokenRetriesServerError trava o comportamento que o sandbox do C6 exigiu: o
+// endpoint de token devolve 500 de forma INTERMITENTE.
+//
+// Medido em 21/09/2026, dezesseis tentativas alternando as duas formas de apresentar a
+// credencial: 3/8 de sucesso com ela no corpo, 3/8 com Basic. Não é a forma, é o
+// endpoint — e um 500 no token não falha uma chamada, falha todas, porque sem bearer
+// não há cobrança nem conciliação.
+//
+// Repetir é seguro de um jeito que quase nada mais aqui é: o FAQ do C6 (§9) diz que
+// gerar um token novo NÃO invalida o atual.
+func TestTokenRetriesServerError(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var chamadas int
+	ts := newTestServer(t)
+	ts.tokenHandler = func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		chamadas++
+		n := chamadas
+		mu.Unlock()
+		if n <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"title":"Condição inesperada ao processar requisição."}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"tok","token_type":"Bearer","expires_in":600}`))
+	}
+	p := ts.provider(t, oneTenant("t1", "c", "s"))
+	p.tokens.sleep = semDormir
+
+	if _, err := p.tokens.token(context.Background(), "t1"); err != nil {
+		t.Fatalf("dois 500 seguidos devem ser atravessados: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if chamadas != 3 {
+		t.Fatalf("esperava 3 tentativas, houve %d", chamadas)
+	}
+}
+
+// A retentativa é LIMITADA: um endpoint realmente caído não vira tráfego infinito.
+func TestTokenRetryIsBounded(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var chamadas int
+	ts := newTestServer(t)
+	ts.tokenHandler = func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		chamadas++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"title":"erro"}`))
+	}
+	p := ts.provider(t, oneTenant("t1", "c", "s"))
+	p.tokens.sleep = semDormir
+
+	if _, err := p.tokens.token(context.Background(), "t1"); err == nil {
+		t.Fatal("500 persistente tem de falhar")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := tokenMaxRetries + 1; chamadas != want {
+		t.Fatalf("esperava %d tentativas, houve %d", want, chamadas)
+	}
+}
+
+// Um 401 é resposta sobre a CREDENCIAL. Repeti-la não a conserta — só transforma um
+// erro de configuração em tráfego contra o banco.
+func TestTokenDoesNotRetryClientError(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var chamadas int
+	ts := newTestServer(t)
+	ts.tokenHandler = func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		chamadas++
+		mu.Unlock()
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"invalid_client"}`))
+	}
+	p := ts.provider(t, oneTenant("t1", "c", "s"))
+	p.tokens.sleep = semDormir
+
+	if _, err := p.tokens.token(context.Background(), "t1"); !errors.Is(err, shared.ErrUnauthorized) {
+		t.Fatalf("esperava ErrUnauthorized, veio %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if chamadas != 1 {
+		t.Fatalf("401 não se repete; houve %d tentativas", chamadas)
 	}
 }

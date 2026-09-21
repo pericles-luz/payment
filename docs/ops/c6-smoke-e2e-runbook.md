@@ -430,25 +430,35 @@ mTLS — ver 9.0). Janela: seg–sex 7h–23h BRT. Erros = **RFC7807 problem+jso
 | Webhook PIX (registro) | `PUT`/`GET /v2/pix/webhook/{chave}` (`chave` no path; corpo `{"webhookUrl":"…"}`) | ✅ implementado (`internal/adapters/bank/c6/webhook.go` + `cmd/register-webhook`) |
 | Webhook C6-próprio (boleto/checkout) | `/v1/webhooks` (req: `service`∈{BANK_SLIP,CHECKOUT,BANK_SLIP_PIX}, `url`) | ✅ os três registrados (`cmd/api`, `cmd/c6-webhook-sync`); receptor em `webhookKindBoleto` |
 
-### 9.0 Autenticação — a credencial vai no CORPO (medido 21/09/2026)
+### 9.0 Autenticação — credencial no CORPO, e o 500 intermitente
 
-Com o certificado e a credencial de sandbox emitidos em 21/09/2026, contra
-`POST /v1/auth/`:
+**A credencial vai no corpo.** O contrato (`docs/compliance/c6-auth-oas.yaml`) declara
+`client_id`, `client_secret` e `grant_type` como `required` em
+`application/x-www-form-urlencoded`, e não menciona Basic em lugar nenhum. O adapter
+mandava Basic; funcionava por tolerância do servidor, não por contrato. Corrigido em
+`token.go`, com trava em `TestTokenGrantUsesClientSecretPost`.
 
-| como a credencial foi apresentada | resposta |
-| --- | --- |
-| `Authorization: Basic` + `grant_type` no corpo | **HTTP 500** `internal_server_error` — "Condição inesperada ao processar requisição." |
-| `client_id` + `client_secret` + `grant_type` no corpo | **HTTP 200** + `scope` concedido |
+**O endpoint de token responde 500 de forma INTERMITENTE, e não é a forma da
+credencial.** Medido em 21/09/2026, oito tentativas de cada jeito, em sequência:
 
-O contrato (`docs/compliance/c6-auth-oas.yaml`) sempre disse corpo: os três campos são
-`required` em `application/x-www-form-urlencoded`, e Basic não aparece nele. O adapter
-mandava Basic — **produção aceita**, sandbox não aceita mais. Corrigido em `token.go`,
-com trava em `TestTokenGrantUsesClientSecretPost`.
+```
+CORPO : 500 200 200 500 500 200 500 500
+BASIC : 200 200 500 500 500 200 500 500
+```
 
-Um 500 é o pior retorno possível para isso: diz "o banco quebrou", não "você apresentou
-a credencial errada", e manda investigar o lado errado. Se depois do deploy o token de
-PRODUÇÃO falhar, rode `c6-webhook-probe <tenant> --token-only` — ele tenta as duas
-formas e diz qual passou.
+> **Correção.** A primeira leitura desta medição — feita com UMA amostra de cada — foi
+> "Basic devolve 500, o corpo devolve 200", e chegou a ser registrada aqui e numa
+> mensagem de commit. Está errada. Uma amostra de um endpoint que falha metade das
+> vezes não mede nada; repetindo, os dois caminhos falham na mesma proporção. A troca
+> para o corpo continua certa — é o que o contrato diz —, mas o motivo não é esse.
+
+Um 500 no token não falha uma chamada: falha TODAS, porque sem bearer não há cobrança
+nem conciliação. Por isso `fetch` repete — **só em 5xx**, no máximo três vezes, com
+espera crescente. Um 400/401 é resposta sobre a credencial e não se repete: repetir não
+conserta configuração, só vira tráfego.
+
+Repetir é seguro aqui de um jeito que quase nada mais é: o FAQ do C6 (§9) diz que gerar
+um token novo **não invalida o atual**.
 
 **`expires_in` é 600**, não 300.
 
