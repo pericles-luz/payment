@@ -70,6 +70,10 @@ func run() error {
 		secret   = flag.String("client-secret", os.Getenv("C6_CLIENT_SECRET"), "client_secret (prefira C6_CLIENT_SECRET)")
 		pixKey   = flag.String("pix-key", os.Getenv("C6_PIX_KEY"), "chave PIX do recebedor (prefira C6_PIX_KEY)")
 		webhook  = flag.String("webhook-url", "", "URL HTTPS de webhook a registrar (vazio pula os casos de webhook)")
+		barcode  = flag.String("boleto-barcode", "",
+			"linha digitável de um boleto REAL a incluir no lote do agendamento. Vazio usa a do "+
+				"boleto que B_01 emitir. Serve para refazer só o bloco AP (--only AP --merge) sem "+
+				"reemitir o boleto e desencontrar a evidência de B_01 da de B_05")
 		base     = flag.String("base", sandboxBase, "base da API")
 		tokenURL = flag.String("token-url", sandboxTokenURL, "endpoint do token")
 		out      = flag.String("out", "evidencias.json", "arquivo de saída")
@@ -110,13 +114,14 @@ func run() error {
 
 	ctx := context.Background()
 	r := &runner{
-		httpc:      httpc,
-		base:       strings.TrimRight(*base, "/"),
-		pixKey:     *pixKey,
-		webhook:    *webhook,
-		filtro:     *only,
-		servico:    *servico,
-		evidencias: map[string]evidencia{},
+		httpc:         httpc,
+		base:          strings.TrimRight(*base, "/"),
+		pixKey:        *pixKey,
+		webhook:       *webhook,
+		filtro:        *only,
+		servico:       *servico,
+		boletoBarcode: strings.TrimSpace(*barcode),
+		evidencias:    map[string]evidencia{},
 	}
 	if *merge {
 		if err := r.carregar(*out); err != nil {
@@ -132,8 +137,10 @@ func run() error {
 		return err
 	}
 
-	r.rodarAgendamento(ctx)
+	// BOLETO antes de AGENDAMENTO, fora da ordem do documento: o lote do agendamento
+	// leva uma linha digitável, e quem a produz é B_01.
 	r.rodarBoleto(ctx)
+	r.rodarAgendamento(ctx)
 	r.rodarCheckout(ctx)
 	r.rodarExtrato(ctx)
 	r.rodarPix(ctx)

@@ -59,31 +59,59 @@ func (r *runner) rodarAgendamento(ctx context.Context) {
 	const base = "/v1/schedule_payments"
 	partner := opcoes{partner: true}
 
-	// AP_01 envia TRÊS pagamentos porque os casos seguintes consomem itens: AP_04
-	// remove uma lista, AP_05 remove um, e AP_06 precisa de lote não vazio para
-	// submeter.
-	pagamentos := map[string]any{"items": []any{
-		map[string]any{
-			"content": r.pixKey, "amount": valorNum,
-			"description": "Roteiro AP item 1", "payer_name": nomePagador,
+	// AP_02 roda ANTES de AP_01, fora da ordem do documento, e por um motivo que é o
+	// próprio assunto do bloco: o que o DDA lista é o que vai para dentro do grupo. O
+	// roteiro até diz que não é obrigatório consultar antes de agendar, mas capturar o
+	// agendamento de um título que veio do DDA é evidência de OUTRA qualidade do que
+	// agendar um que a gente mesmo inventou.
+	var doDDA []map[string]any
+	if resp := r.chamar(ctx, "AP_02", http.MethodGet, base+"/query", nil, partner); resp != nil {
+		doDDA = titulosDoDDA(resp)
+	}
+
+	// O lote leva TRÊS pagamentos porque os casos seguintes consomem itens: AP_04
+	// remove uma lista, AP_05 remove um, e AP_06 precisa de lote não vazio.
+	//
+	// A composição é deliberadamente MISTA — boleto e PIX —, que é o que a API faz
+	// ("agendar pagamentos de boletos e pixes") e o que um lote só de chaves PIX não
+	// mostrava: na corrida anterior os três itens voltaram `product_type: PIX` e a
+	// perna de boleto do produto ficou sem nenhuma evidência.
+	itens := []any{}
+	for _, t := range doDDA {
+		if len(itens) == 2 {
+			break
+		}
+		itens = append(itens, t)
+	}
+	if len(itens) == 0 && r.boletoBarcode != "" {
+		// DDA vazio: usa a linha digitável de um boleto que ESTA conta emitiu (bloco B).
+		// Não é o mesmo que um título do DDA — é o mais perto que dá para chegar sem
+		// alguém de fora emitir contra a gente. Ver a nota de AP_02.
+		itens = append(itens, map[string]any{
+			"content": r.boletoBarcode, "amount": valorNum,
+			"description": "Roteiro AP boleto", "payer_name": nomePagador,
 			"transaction_date": hoje(),
-		},
-		// Valores DISTINTOS de propósito: dois itens com a mesma referência e o mesmo
-		// valor fazem o banco marcar o segundo com "WARN! This item is duplicated".
-		map[string]any{"content": r.pixKey, "amount": valorNum + 1, "description": "Roteiro AP item 2"},
-		map[string]any{"content": r.pixKey, "amount": valorNum + 2, "description": "Roteiro AP item 3"},
-	}}
-	if resp := r.chamar(ctx, "AP_01", http.MethodPost, base+"/decode", pagamentos, partner); resp != nil {
+		})
+	}
+	// Completa com PIX até três. Valores DISTINTOS de propósito: dois itens com a mesma
+	// referência e o mesmo valor fazem o banco marcar o segundo com "WARN! This item is
+	// duplicated".
+	for i := len(itens); i < 3; i++ {
+		itens = append(itens, map[string]any{
+			"content": r.pixKey, "amount": valorNum + float64(i),
+			"description": fmt.Sprintf("Roteiro AP pix %d", i+1),
+		})
+	}
+
+	if resp := r.chamar(ctx, "AP_01", http.MethodPost, base+"/decode",
+		map[string]any{"items": itens}, partner); resp != nil {
 		r.groupID = resp.texto("group_id")
 	}
 
-	r.chamar(ctx, "AP_02", http.MethodGet, base+"/query", nil, partner)
-
 	if r.groupID == "" {
-		r.nota("AP_03", "sem group_id de AP_01, não há grupo para ler")
-		r.nota("AP_04", "sem group_id de AP_01")
-		r.nota("AP_05", "sem group_id de AP_01")
-		r.nota("AP_06", "sem group_id de AP_01")
+		for _, c := range []string{"AP_03", "AP_04", "AP_05", "AP_06"} {
+			r.nota(c, "sem group_id de AP_01, não há grupo para operar")
+		}
 		return
 	}
 
@@ -93,19 +121,24 @@ func (r *runner) rodarAgendamento(ctx context.Context) {
 	// AP_06 capturáveis.
 	esperandoDecode := partner
 	esperandoDecode.repetirEnquanto = decodificando
+	var itensLidos []itemDoGrupo
 	if resp := r.chamar(ctx, "AP_03", http.MethodGet, base+"/"+r.groupID+"/items", nil, esperandoDecode); resp != nil {
-		r.itemIDs = idsDosItens(resp)
+		itensLidos = itensDoGrupo(resp)
 	}
 
-	// O corpo do DELETE em lote é um ARRAY puro de {id}, não um objeto com uma lista.
-	if len(r.itemIDs) > 0 {
-		corpo := []any{map[string]any{"id": r.itemIDs[0]}}
+	// AP_04 remove, de preferência, o item que o banco NÃO conseguiu decodificar — é o
+	// uso real da operação ("note que houve equívoco no envio, remova"), e deixa o lote
+	// submetível. Sem nenhum assim, remove o primeiro.
+	ordem := ordemDeRemocao(itensLidos)
+	if len(ordem) > 0 {
+		// O corpo do DELETE em lote é um ARRAY puro de {id}, não um objeto com lista.
+		corpo := []any{map[string]any{"id": ordem[0]}}
 		r.chamar(ctx, "AP_04", http.MethodDelete, base+"/"+r.groupID+"/items", corpo, partner)
 	} else {
 		r.nota("AP_04", "AP_03 não devolveu item algum para remover")
 	}
-	if len(r.itemIDs) > 1 {
-		r.chamar(ctx, "AP_05", http.MethodDelete, base+"/"+r.groupID+"/items/"+r.itemIDs[1], nil, partner)
+	if len(ordem) > 1 {
+		r.chamar(ctx, "AP_05", http.MethodDelete, base+"/"+r.groupID+"/items/"+ordem[1], nil, partner)
 	} else {
 		r.nota("AP_05", "AP_03 não devolveu um segundo item para remover")
 	}
@@ -116,24 +149,77 @@ func (r *runner) rodarAgendamento(ctx context.Context) {
 	}, esperandoDecode)
 }
 
+// titulosDoDDA converte os títulos abertos no DDA em itens de pagamento.
+//
+// O DDA lista boletos em que a conta é PAGADORA, e o `content` de cada um é o que o
+// decode recebe — é essa a ponte entre consultar e agendar.
+func titulosDoDDA(resp *resposta) []map[string]any {
+	itens, _ := resp.Mapa["items"].([]any)
+	var out []map[string]any
+	for _, it := range itens {
+		m, _ := it.(map[string]any)
+		content, _ := m["content"].(string)
+		valor, ok := m["amount"].(float64)
+		if content == "" || !ok || valor <= 0 {
+			continue
+		}
+		pagamento := map[string]any{
+			"content": content, "amount": valor,
+			"description": "Roteiro AP título do DDA",
+		}
+		for _, campo := range []string{"beneficiary_name", "payer_name", "bank_code", "bank_name"} {
+			if v, _ := m[campo].(string); v != "" {
+				pagamento[campo] = v
+			}
+		}
+		out = append(out, pagamento)
+	}
+	return out
+}
+
+// itemDoGrupo é o que a leitura do grupo diz de cada pagamento.
+type itemDoGrupo struct {
+	id     string
+	status string
+}
+
+// itensDoGrupo extrai id e status dos itens de um grupo.
+func itensDoGrupo(resp *resposta) []itemDoGrupo {
+	itens, _ := resp.Mapa["items"].([]any)
+	var out []itemDoGrupo
+	for _, it := range itens {
+		m, _ := it.(map[string]any)
+		id, _ := m["id"].(string)
+		if id == "" {
+			continue
+		}
+		st, _ := m["status"].(string)
+		out = append(out, itemDoGrupo{id: id, status: st})
+	}
+	return out
+}
+
+// ordemDeRemocao põe na frente os itens que o banco não conseguiu decodificar.
+//
+// Remover o item quebrado é o que a operação existe para fazer, e é também o que deixa
+// o lote submetível — um item em DECODE_ERROR é o candidato óbvio a sair.
+func ordemDeRemocao(itens []itemDoGrupo) []string {
+	var ruins, resto []string
+	for _, it := range itens {
+		if it.status == "DECODE_ERROR" || it.status == "ERROR" {
+			ruins = append(ruins, it.id)
+			continue
+		}
+		resto = append(resto, it.id)
+	}
+	return append(ruins, resto...)
+}
+
 // decodificando reconhece a resposta "ainda estou decodificando este lote", que é
 // temporária e merece nova leitura — ao contrário de qualquer outro 422, que é
 // afirmação sobre o conteúdo enviado e não muda sozinho.
 func decodificando(resp *resposta) bool {
 	return resp.Status == 422 && strings.Contains(resp.Body, "processo de decodifica")
-}
-
-// idsDosItens extrai os ids dos itens de um grupo.
-func idsDosItens(resp *resposta) []string {
-	itens, _ := resp.Mapa["items"].([]any)
-	var out []string
-	for _, it := range itens {
-		m, _ := it.(map[string]any)
-		if id, _ := m["id"].(string); id != "" {
-			out = append(out, id)
-		}
-	}
-	return out
 }
 
 // --- BOLETO BANCÁRIO v1 (B) ------------------------------------------------------
@@ -161,6 +247,12 @@ func (r *runner) rodarBoleto(ctx context.Context) {
 	}
 	if resp := r.chamar(ctx, "B_01", http.MethodPost, base+"/", b1, partner); resp != nil {
 		r.slipV1ID = resp.texto("id")
+		// Guardado para o bloco de agendamento: sem um título do DDA, é a linha
+		// digitável mais próxima de um caso real que dá para ter. Uma passada por
+		// --boleto-barcode tem precedência.
+		if r.boletoBarcode == "" {
+			r.boletoBarcode = resp.texto("bar_code")
+		}
 	}
 
 	// B_02 — juros e multa VARIÁVEIS: o contrato admite valor fixo ("V") ou percentual

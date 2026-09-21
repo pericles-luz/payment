@@ -36,6 +36,20 @@ processamento do banco.
 bloco falhou por forma errada de requisição: corrigir e refazer os nove custaria a
 janela inteira.
 
+### Refazer o bloco do agendamento
+
+```sh
+… --only AP --merge --boleto-barcode <linha digitável de um boleto real>
+```
+
+O lote de AP_01 leva um boleto e duas chaves PIX, para o bloco exercitar as duas pernas
+do produto. A linha digitável vem de `--boleto-barcode`; sem ela, da que `B_01` emitir —
+e passar a bandeira é o que permite refazer só o AP sem reemitir o boleto e desencontrar
+a evidência de `B_01` da de `B_05`.
+
+Quando o DDA tiver títulos, a ferramenta os prefere automaticamente e a bandeira deixa de
+ser necessária.
+
 ### `--webhook-servico`
 
 Desligado por padrão, e é para deixar assim salvo em janela combinada. O webhook PIX é

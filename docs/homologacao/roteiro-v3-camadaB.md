@@ -60,6 +60,49 @@ também** — o mesmo que a ADR-0013 dava como indisponível nesta conta. O PIX 
 lote de cobv (quatro casos); o resto passou, inclusive **devolução de um PIX recebido de
 verdade** (P_05_01/03/04), que o sandbox autoconfirmou.
 
+## DDA: habilitado, e ainda assim vazio
+
+A conta foi habilitada para DDA em 21/09/2026 e `GET /v1/schedule_payments/query`
+responde **200 com `{"items":[]}`**. Não é falta de habilitação, e não é defeito: é o
+que o DDA é.
+
+**O DDA lista boletos em que a conta é PAGADORA**, não os que ela emite. Para aparecer
+algo ali, alguém de fora precisa emitir um boleto contra o CNPJ **32.159.366/0001-02**
+(o emitente desta conta, confirmado pelo `recebedor` que o PIX Automático devolve).
+
+**E não dá para nos auto-abastecer.** Emitir um boleto com o nosso próprio CNPJ como
+sacado é recusado na origem:
+
+    POST /v1/bank_slips/  payer.tax_id = 32159366000102
+    → 400 "[BoletoClient]: CPF/CNPJ do sacado e emitente devem ser diferentes"
+
+Com o CNPJ do certificado (57.798.242/0001-90, que é outra entidade) a emissão passa —
+mas aí o pagador é ele, não nós, e o título não entra no nosso DDA.
+
+**O que dá para capturar sem isso**, e é o que a corrida captura: o lote de AP_01 leva
+uma composição MISTA — a linha digitável de um boleto real que esta conta emitiu, mais
+duas chaves PIX. AP_03 mostra o banco resolvendo os dois tipos separadamente:
+
+| item | `product_type` | `status` | `error_message` |
+|---|---|---|---|
+| linha digitável | `BOLETO` | `DECODE_ERROR` | `Boleto not registered` |
+| chave PIX | `PIX` | `READ_DATA` | — |
+| chave PIX | `PIX` | `READ_DATA` | — |
+
+O `Boleto not registered` é a MESMA parede de B_04/B_08/BP_02/BP_05: no sandbox o
+boleto emitido nunca chega ao registro da CIP, então nem ele próprio se deixa agendar.
+
+AP_04 então remove justamente o item que o banco não decodificou — que é para isso que a
+operação existe —, AP_05 remove um PIX, e AP_06 submete o resto: **204**.
+
+> A corrida anterior mandava três chaves PIX e os três itens voltavam `product_type:
+> PIX`. O bloco passava 6/6 sem nunca ter exercitado a perna de boleto do produto. Vale
+> como aviso: "6/6" não quer dizer "o produto inteiro foi exercitado".
+
+**Para fechar o DDA de verdade**, é preciso que o C6 (ou outro participante do sandbox)
+registre um boleto contra 32.159.366/0001-02. Aí `--only AP --merge` recaptura o bloco
+usando os títulos que vierem — a ferramenta já prefere os do DDA quando existem.
+
 ## O que ficou sem 2xx, e por quê
 
 Nenhum dos itens abaixo é defeito do nosso lado. Todos têm a resposta do banco gravada

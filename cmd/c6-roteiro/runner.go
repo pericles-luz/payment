@@ -65,22 +65,22 @@ type runner struct {
 	ultima     time.Time
 
 	// Identificadores encadeados entre os casos.
-	groupID     string
-	itemIDs     []string
-	slipV1ID    string
-	slipAlterar string
-	slipBaixar  string
-	checkout    string
-	cobTxID     string
-	cobvTxID    string
-	loteID      string
-	locID       string
-	e2eID       string
-	devID       string
-	bolepixID   string
-	idRec       string
-	idSolic     string
-	locRecID    string
+	groupID       string
+	slipV1ID      string
+	slipAlterar   string
+	boletoBarcode string
+	slipBaixar    string
+	checkout      string
+	cobTxID       string
+	cobvTxID      string
+	loteID        string
+	locID         string
+	e2eID         string
+	devID         string
+	bolepixID     string
+	idRec         string
+	idSolic       string
+	locRecID      string
 }
 
 // registrar records one case's evidence. A case that is recorded twice is a bug in the
