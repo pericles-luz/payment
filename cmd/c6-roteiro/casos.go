@@ -690,7 +690,15 @@ func aguardandoCIP(resp *resposta) bool {
 // Cada caso opera uma cobrança DIFERENTE: alterar e baixar a mesma faria a segunda
 // esperar a primeira, somando as duas esperas.
 func (r *runner) finalizar(ctx context.Context) {
-	naCIP := opcoes{partner: true, repetirEnquanto: aguardandoCIP}
+	// Duas tentativas, não seis.
+	//
+	// Medido em 21/09/2026: um boleto emitido QUARENTA MINUTOS antes continuava
+	// recusando a alteração com a mesma mensagem. No sandbox a requisição à CIP não
+	// parece se resolver — nem em minutos, nem na mesma sessão. Insistir não muda o
+	// resultado; só queima a janela e o limite de 60 chamadas por minuto. Duas
+	// tentativas provam que não foi pressa, e a evidência guarda a recusa do banco,
+	// que se explica sozinha.
+	naCIP := opcoes{partner: true, repetirEnquanto: aguardandoCIP, maxRepeticoes: 1}
 
 	if r.slipAlterar == "" {
 		r.nota("B_04", "B_02 não devolveu id; não há boleto para alterar")

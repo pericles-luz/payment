@@ -142,6 +142,9 @@ type opcoes struct {
 	// webhook de recorrência. O adapter já trata isso desde a SIN-69580
 	// (webhook_accept_test.go); esta ferramenta precisava tratar também.
 	accept string
+	// maxRepeticoes sobrescreve o limite de retentativas deste caso. Zero usa o
+	// padrão.
+	maxRepeticoes int
 	// repetirEnquanto pede nova tentativa enquanto devolver true.
 	//
 	// É para resposta TEMPORÁRIA — o 502 do edge, e o 422 "ainda estou decodificando"
@@ -298,7 +301,11 @@ func (r *runner) chamar(ctx context.Context, caso, metodo, caminho string, corpo
 		out.Mapa = nil
 		_ = json.Unmarshal(body, &out.Mapa)
 
-		if tentativa >= maxRepeticoes || !repetir(out) {
+		limite := opt.maxRepeticoes
+		if limite <= 0 {
+			limite = maxRepeticoes
+		}
+		if tentativa >= limite || !repetir(out) {
 			break
 		}
 		fmt.Fprintf(os.Stderr, "%-10s %-6s %-3d %s (temporário, nova tentativa)\n", caso, metodo, out.Status, caminho)
