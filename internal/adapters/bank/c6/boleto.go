@@ -1061,3 +1061,111 @@ func decodeBase64PDFEnvelope(body []byte) ([]byte, bool) {
 	}
 	return nil, false
 }
+
+// --- Listagem de cobranças BolePix (roteiro BP_06) ------------------------------
+
+// compile-time assertion that Provider satisfies the listing port.
+var _ ports.BoletoLister = (*Provider)(nil)
+
+// bankSlipListMaxWindowDays is the widest date range the listing accepts.
+const bankSlipListMaxWindowDays = 60
+
+// bankSlipListResponseBody is the listing envelope. The array is `content` — the same
+// name the C6 Pay extract uses, and NOT the resource name a reader might expect.
+type bankSlipListResponseBody struct {
+	Content       []bankSlipResponseBody `json:"content"`
+	TotalElements int                    `json:"total_elements"`
+	TotalPages    int                    `json:"total_pages"`
+	Page          int                    `json:"page"`
+	Size          int                    `json:"size"`
+}
+
+// bankSlipListRange is one named date range of the listing query.
+type bankSlipListRange struct {
+	name     string
+	from, to time.Time
+}
+
+// addBankSlipRange validates and renders one range into the query. A half-open range
+// (one bound set) is refused rather than sent: the bank would answer something, and it
+// would not be the window the caller meant.
+func addBankSlipRange(op string, q url.Values, r bankSlipListRange) (used bool, err error) {
+	if r.from.IsZero() && r.to.IsZero() {
+		return false, nil
+	}
+	if r.from.IsZero() || r.to.IsZero() || r.to.Before(r.from) {
+		return false, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+	if r.to.Sub(r.from) > bankSlipListMaxWindowDays*24*time.Hour {
+		return false, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+	q.Set(r.name+"_from", r.from.UTC().Format(dueDateLayout))
+	q.Set(r.name+"_to", r.to.UTC().Format(dueDateLayout))
+	return true, nil
+}
+
+// ListBoletos lists the BolePix charges issued by the tenant (roteiro BP_06).
+//
+// At least one date range must be supplied: the contract requires it, and a listing
+// with no window would either be refused by the bank or return everything.
+func (p *Provider) ListBoletos(ctx context.Context, tenantID string, filter ports.BoletoListFilter) (ports.BoletoList, error) {
+	const op = "list_boletos"
+	q := url.Values{}
+	ranges := []bankSlipListRange{
+		{"payment_date", filter.PaymentDateFrom, filter.PaymentDateTo},
+		{"due_date", filter.DueDateFrom, filter.DueDateTo},
+		{"credit_date", filter.CreditDateFrom, filter.CreditDateTo},
+	}
+	any := false
+	for _, r := range ranges {
+		used, err := addBankSlipRange(op, q, r)
+		if err != nil {
+			return ports.BoletoList{}, err
+		}
+		any = any || used
+	}
+	if !any {
+		return ports.BoletoList{}, &Error{Op: op, sentinel: shared.ErrValidation}
+	}
+	if s := strings.TrimSpace(filter.Status); s != "" {
+		q.Set("status", s)
+	}
+	if ref := strings.TrimSpace(filter.ExternalReferenceID); ref != "" {
+		if !validExternalReference(ref) {
+			return ports.BoletoList{}, &Error{Op: op, sentinel: shared.ErrValidation}
+		}
+		q.Set("external_reference_id", ref)
+	}
+	// Page is zero-based on this endpoint, so a zero is a legitimate value and is
+	// always sent rather than treated as "unset".
+	if filter.Page >= 0 {
+		q.Set("page", strconv.Itoa(filter.Page))
+	}
+	if filter.PageSize > 0 {
+		q.Set("size", strconv.Itoa(filter.PageSize))
+	}
+
+	endpoint := p.baseURL + bankSlipsPath + "/list?" + q.Encode()
+	httpReq, err := p.authedJSONRequest(ctx, tenantID, op, http.MethodGet, endpoint, nil, "")
+	if err != nil {
+		return ports.BoletoList{}, err
+	}
+	setPartnerSoftware(httpReq)
+	var out bankSlipListResponseBody
+	if err := p.do(httpReq, op, &out); err != nil {
+		return ports.BoletoList{}, err
+	}
+	boletos := make([]ports.BoletoResult, len(out.Content))
+	for i, b := range out.Content {
+		// The local boleto id is not recoverable from a listing row in general, so the
+		// result carries the bank's own identifiers and leaves BoletoID to the caller.
+		boletos[i] = toBankSlipResult("", b)
+	}
+	return ports.BoletoList{
+		Boletos:    boletos,
+		Page:       out.Page,
+		PageSize:   out.Size,
+		TotalItems: out.TotalElements,
+		TotalPages: out.TotalPages,
+	}, nil
+}
