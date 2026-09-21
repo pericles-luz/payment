@@ -39,6 +39,27 @@ Os 34 escopos do token cobrem os nove blocos do roteiro — inclusive
 `schedulepayments.*`. Faltam `checkout.capture` e `recpayload.write`, nenhum exigido
 pelos casos listados. Lista completa na §9.0 do `docs/ops/c6-smoke-e2e-runbook.md`.
 
+## Resultado
+
+**54 dos 70 casos responderam 2xx.** Por bloco:
+
+| bloco | casos | 2xx |
+|---|---|---|
+| AUTENTICAÇÃO | 1 | 1 |
+| AGENDAMENTO DE PAGAMENTOS | 6 | 6 |
+| BOLETO | 8 | 5 |
+| CHECKOUT | 6 | 0 |
+| EXTRATO | 1 | 1 |
+| PIX | 18 | 14 |
+| TRANSAÇÕES E RECEBÍVEIS | 2 | 2 |
+| PIX AUTOMÁTICO | 16 | 16 |
+| BOLEPIX | 7 | 4 |
+
+O bloco de **PIX Automático fechou inteiro**, as quatro jornadas, e o **Agendamento
+também** — o mesmo que a ADR-0013 dava como indisponível nesta conta. O PIX perdeu só o
+lote de cobv (quatro casos); o resto passou, inclusive **devolução de um PIX recebido de
+verdade** (P_05_01/03/04), que o sandbox autoconfirmou.
+
 ## O que ficou sem 2xx, e por quê
 
 Nenhum dos itens abaixo é defeito do nosso lado. Todos têm a resposta do banco gravada
