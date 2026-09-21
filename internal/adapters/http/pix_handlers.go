@@ -108,13 +108,48 @@ func (s *Server) handleCreatePix(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetPix(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
-	txID := chi.URLParam(r, "txid")
+	txID, ok := s.txidFromPath(w, r)
+	if !ok {
+		return
+	}
 	qr, err := s.pix.GetImmediateCharge(r.Context(), tenantID, txID)
 	if err != nil {
 		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toPixChargeView(qr, qr.ExpectedAmountCents))
+}
+
+// txidFromPath lê o `{txid}` de `/v1/pix/{txid}`, recusando o valor que é, na
+// verdade, um sub-recurso literal irmão — "cobv", "loc", "received", "lotecobv" e os
+// do PIX Automático.
+//
+// # Por que isso não se resolve sozinho
+//
+// O chi casa segmento estático ANTES de curinga, então `GET /v1/pix/cobv` cai na
+// listagem e não no curinga — a ordem em que as rotas são registradas não importa, e
+// quem escreveu o contrário aqui estava enganado.
+//
+// O que ele NÃO faz é parar. Quando encontra o nó estático "cobv" e vê que ele não
+// trata aquele MÉTODO, o chi segue procurando e casa o curinga irmão. Então
+// `PATCH /v1/pix/cobv` não responde 405: vira "revise a cobrança cujo txid é a
+// palavra cobv", gasta uma ida ao PSP e volta um erro que não explica nada. O mesmo
+// vale para `GET /v1/pix/rec` com o PIX Automático desligado.
+//
+// A resposta certa é 405 com `Allow`, que é o que o próprio chi emitiria se tivesse
+// parado ali — e os métodos vêm da árvore de rotas (Server.pixSubresources), não de
+// uma lista escrita à mão que o próximo `/v1/pix/<coisa>` deixaria desatualizada.
+func (s *Server) txidFromPath(w http.ResponseWriter, r *http.Request) (string, bool) {
+	txID := chi.URLParam(r, "txid")
+	metodos, reservado := s.pixSubresources[txID]
+	if !reservado {
+		return txID, true
+	}
+	for _, m := range metodos {
+		w.Header().Add("Allow", m)
+	}
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	return "", false
 }
 
 // pixListView is the JSON page returned by GET /v1/pix.

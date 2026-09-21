@@ -245,6 +245,7 @@ paths:
               schema: { $ref: "#/components/schemas/PixCharge" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
         "500": { $ref: "#/components/responses/InternalError" }
     patch:
       operationId: revisePix
@@ -272,6 +273,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/pix/cobv:
@@ -2065,6 +2067,10 @@ components:
       name: txid
       in: path
       required: true
+      description: >-
+        Identificador da cobrança. Os sub-recursos literais de `/v1/pix` (`cobv`,
+        `loc`, `received`, `lotecobv` e os do PIX Automático) **não** são txid válido:
+        pedi-los aqui responde `405`, nunca uma ida ao PSP.
       schema: { type: string }
     PathIDRec:
       name: idRec
@@ -2204,6 +2210,19 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: "recurrence unavailable" }
+    MethodNotAllowed:
+      description: >-
+        O caminho existe mas não aceita este método. `Allow` lista os que aceita.
+        Vale em especial para os sub-recursos de `/v1/pix` (`cobv`, `loc`,
+        `received`, `lotecobv`): eles **não** são endereçáveis como um `txid`.
+      headers:
+        Allow:
+          schema: { type: string }
+          description: Métodos aceitos neste caminho.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "method not allowed" }
     Unavailable:
       description: >-
         O banco resolvido para esta empresa-cliente não fala esta superfície, ou o

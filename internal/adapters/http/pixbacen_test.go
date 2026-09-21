@@ -3,9 +3,14 @@ package http_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 
 	"github.com/ia-dev-sindireceita/payment/internal/adapters/bank"
 	httpadapter "github.com/ia-dev-sindireceita/payment/internal/adapters/http"
@@ -112,6 +117,13 @@ func (b *bacenBank) ListBatches(context.Context, string, ports.PixDueChargeBatch
 // newBacenFixture sobe o Router com as superfícies novas ligadas e DOIS tenants, para
 // o isolamento entre eles poder ser exercitado.
 func newBacenFixture(t *testing.T) (http.Handler, *bacenBank) {
+	return newBacenFixtureRec(t, false)
+}
+
+// newBacenFixtureRec permite ligar o PIX Automático, que acrescenta quatro
+// sub-recursos literais a /v1/pix — e é justamente o caso em que a flag DESLIGADA
+// tira "rec" e companhia da árvore.
+func newBacenFixtureRec(t *testing.T, recorrencia bool) (http.Handler, *bacenBank) {
 	t.Helper()
 	store := persistence.NewStore()
 	creds := secret.NewStore(nil)
@@ -121,6 +133,8 @@ func newBacenFixture(t *testing.T) (http.Handler, *bacenBank) {
 		Payments: store, Tenants: store, Pricing: store, Ledger: store,
 		Processed: store, Bus: inmemory.NewBus(), Bank: stub,
 		Pix: stub, PixDueCharge: stub, Boleto: stub,
+		Recs: store, CobRs: store, RecReader: stub, CobRReader: stub,
+		SolicRecs: stub, LocRecs: stub,
 		PixChargeReviser: fake, PixDueChargeReviser: fake, PixDueChargeLister: fake,
 		PixLocation: fake, PixReceived: fake, PixDueChargeBatch: fake,
 		Credentials: creds, UoW: store,
@@ -140,16 +154,18 @@ func newBacenFixture(t *testing.T) (http.Handler, *bacenBank) {
 	auth := httpadapter.NewStaticTokenAuth(
 		map[string]string{tenantToken: idA, tenantTokenB: idB}, []string{adminToken}, nil)
 	srv := httpadapter.NewServer(httpadapter.Config{
-		Charges:     app.NewChargeService(deps),
-		Pix:         app.NewPixService(deps),
-		PixCobV:     app.NewPixDueChargeService(deps),
-		PixLocation: app.NewPixLocationService(deps),
-		PixReceived: app.NewPixReceivedService(deps),
-		PixBatch:    app.NewPixBatchService(deps),
-		Admin:       admin,
-		Webhooks:    app.NewWebhookService(deps),
-		TenantAuth:  auth,
-		AdminAuth:   auth,
+		Charges:       app.NewChargeService(deps),
+		Pix:           app.NewPixService(deps),
+		PixCobV:       app.NewPixDueChargeService(deps),
+		Recurrence:    app.NewRecurrenceService(deps),
+		PixRecurrence: recorrencia,
+		PixLocation:   app.NewPixLocationService(deps),
+		PixReceived:   app.NewPixReceivedService(deps),
+		PixBatch:      app.NewPixBatchService(deps),
+		Admin:         admin,
+		Webhooks:      app.NewWebhookService(deps),
+		TenantAuth:    auth,
+		AdminAuth:     auth,
 	})
 	return srv.Router(), fake
 }
@@ -160,24 +176,124 @@ func janelaQS() string {
 	return "?start=" + start.Format(time.RFC3339) + "&end=" + start.Add(24*time.Hour).Format(time.RFC3339)
 }
 
-// O segmento literal tem de vencer o {txid}: sem isso o chi engoliria "cobv", "loc",
-// "received" e "lotecobv" como se fossem identificadores de cobrança, e a rota nova
-// nunca seria alcançada. É a armadilha que a ordem de registro em server.go evita, e
-// este teste é quem a prende.
-func TestPixLiteralSegmentsBeatTxID(t *testing.T) {
+// Nenhum sub-recurso de /v1/pix pode ser alcançado como se fosse um txid, em método
+// NENHUM.
+//
+// A armadilha aqui não é a ordem de registro: o chi casa segmento estático antes de
+// curinga, e quem afirmou o contrário neste arquivo estava enganado. É o que ele faz
+// quando o estático NÃO trata o método pedido — ele não para, segue procurando e casa
+// o curinga irmão. `PATCH /v1/pix/cobv` viraria "revise a cobrança cujo txid é a
+// palavra cobv": uma ida ao PSP e um erro que não explica nada.
+//
+// A lista de segmentos sai da ÁRVORE DE ROTAS, não de um literal escrito aqui: assim
+// o `/v1/pix/<coisa>` que nascer amanhã entra neste teste sem ninguém lembrar dele.
+func TestPixSubresourcesNuncaViramTxID(t *testing.T) {
+	t.Parallel()
+	// As duas formas do roteador: o PIX Automático ligado acrescenta quatro
+	// sub-recursos, e desligado os tira. A guarda tem de acompanhar as duas — se ela
+	// fosse uma lista escrita à mão, a forma desligada recusaria um "rec" que ali não
+	// é sub-recurso nenhum.
+	var tamanhos [2]int
+	for _, recorrencia := range []bool{false, true} {
+		handler, fake := newBacenFixtureRec(t, recorrencia)
+		rotas, ok := handler.(chi.Routes)
+		if !ok {
+			t.Fatal("Router() precisa continuar devolvendo um chi.Routes para este teste ler a árvore")
+		}
+		segmentos := subrecursosDePix(t, rotas)
+		if recorrencia {
+			tamanhos[1] = len(segmentos)
+		} else {
+			tamanhos[0] = len(segmentos)
+		}
+		t.Run(fmt.Sprintf("recorrencia=%v", recorrencia), func(t *testing.T) {
+			conferirSubrecursos(t, handler, fake, segmentos)
+		})
+	}
+	// Ligar o PIX Automático acrescenta quatro sub-recursos. Se os dois conjuntos
+	// tivessem o mesmo tamanho, a leitura da árvore não estaria lendo a árvore — e o
+	// teste acima passaria sem conferir nada.
+	if tamanhos[1] <= tamanhos[0] {
+		t.Fatalf("a flag de recorrência não mexeu na lista (%d vs %d); a leitura da árvore não é real",
+			tamanhos[0], tamanhos[1])
+	}
+}
+
+func conferirSubrecursos(t *testing.T, handler http.Handler, fake *bacenBank, segmentos []string) {
+	t.Helper()
+	// Uma lista vazia passaria o teste sem provar nada — é o jeito de este teste
+	// apodrecer em silêncio se a leitura da árvore quebrar.
+	if len(segmentos) < 4 {
+		t.Fatalf("a árvore devolveu poucos sub-recursos de /v1/pix (%v); a leitura quebrou?", segmentos)
+	}
+
+	corpo := map[string]any{"amount_cents": 2500}
+	for _, seg := range segmentos {
+		for _, metodo := range []string{
+			http.MethodGet, http.MethodPost, http.MethodPut,
+			http.MethodPatch, http.MethodDelete,
+		} {
+			fake.txID = ""
+			rec := do(t, handler, metodo, "/v1/pix/"+seg, tenantToken, idem("k-"+seg+metodo), corpo)
+			if fake.txID != "" {
+				t.Fatalf("%s /v1/pix/%s virou uma cobrança de txid %q", metodo, seg, fake.txID)
+			}
+			// 2xx quer dizer que o próprio sub-recurso trata o método — é o caso
+			// normal. Qualquer outra coisa tem de ser 400 (o corpo não serve para
+			// ele) ou 405, nunca um 404 vindo do PSP.
+			if rec.Code == http.StatusNotFound {
+				t.Fatalf("%s /v1/pix/%s: 404 do PSP em vez de 405; caiu no curinga", metodo, seg)
+			}
+		}
+	}
+}
+
+// subrecursosDePix lê da árvore do chi os segmentos literais logo abaixo de /v1/pix.
+func subrecursosDePix(t *testing.T, rs chi.Routes) []string {
+	t.Helper()
+	vistos := map[string]struct{}{}
+	var andar func(rs chi.Routes, base string)
+	andar = func(rs chi.Routes, base string) {
+		for _, rt := range rs.Routes() {
+			caminho := base + strings.TrimSuffix(rt.Pattern, "/*")
+			if rt.SubRoutes != nil {
+				andar(rt.SubRoutes, strings.TrimSuffix(caminho, "/"))
+				continue
+			}
+			resto, dentro := strings.CutPrefix(caminho, "/v1/pix/")
+			if !dentro || strings.Contains(resto, "/") || strings.HasPrefix(resto, "{") {
+				continue
+			}
+			vistos[resto] = struct{}{}
+		}
+	}
+	andar(rs, "")
+	out := make([]string, 0, len(vistos))
+	for seg := range vistos {
+		out = append(out, seg)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// E o 405 tem de carregar o `Allow`, como carregaria se o chi o tivesse emitido.
+func TestPixSubrecursoResponde405ComAllow(t *testing.T) {
 	t.Parallel()
 	handler, _ := newBacenFixture(t)
 
-	for _, caso := range []struct{ nome, path string }{
-		{"cobv", "/v1/pix/cobv" + janelaQS()},
-		{"loc", "/v1/pix/loc" + janelaQS()},
-		{"received", "/v1/pix/received" + janelaQS()},
-		{"lotecobv", "/v1/pix/lotecobv" + janelaQS()},
-	} {
-		rec := do(t, handler, http.MethodGet, caso.path, tenantToken, nil, nil)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s: queria 200, veio %d body %s", caso.nome, rec.Code, rec.Body.String())
-		}
+	rec := do(t, handler, http.MethodPatch, "/v1/pix/received", tenantToken, idem("k1"),
+		map[string]any{"amount_cents": 2500})
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("queria 405, veio %d body %s", rec.Code, rec.Body.String())
+	}
+	if allow := rec.Header().Values("Allow"); len(allow) != 1 || allow[0] != http.MethodGet {
+		t.Fatalf("Allow errado: %v", rec.Header().Values("Allow"))
+	}
+	// E o txid de verdade continua passando.
+	rec = do(t, handler, http.MethodPatch, "/v1/pix/tx-9", tenantToken, idem("k2"),
+		map[string]any{"amount_cents": 2500})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("txid legítimo: queria 200, veio %d body %s", rec.Code, rec.Body.String())
 	}
 }
 

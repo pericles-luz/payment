@@ -50,15 +50,19 @@ func (s *Server) handleRevisePix(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	nr, ok := s.rebindBank(w, r, req.Bank)
-	if !ok {
+	nr, okBank := s.rebindBank(w, r, req.Bank)
+	if !okBank {
 		return
 	}
 	r = nr
 
+	txID, ok := s.txidFromPath(w, r)
+	if !ok {
+		return
+	}
 	in := app.ReviseImmediateChargeInput{
 		TenantID:       tenantID,
-		TxID:           chi.URLParam(r, "txid"),
+		TxID:           txID,
 		AmountCents:    req.AmountCents,
 		ExpiresIn:      time.Duration(req.ExpiresInSeconds) * time.Second,
 		CreditorKey:    req.CreditorKey,

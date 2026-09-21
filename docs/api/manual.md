@@ -1061,6 +1061,7 @@ replay devolve `409` **sem** reexibir o segredo (display-once).
 | `413` | Corpo acima do limite (1 MiB no `/v1`; 64 KiB no webhook) |
 | `429` | Rate limit — faça backoff (respeite `Retry-After` quando presente) |
 | `500` | Erro interno transitório |
+| `405` | O caminho existe mas não aceita esse método. O cabeçalho `Allow` diz quais aceita |
 | `503` | O banco desta empresa-cliente não fala esta superfície, ou o produto não está habilitado na conta dele. Falha FECHADA de propósito — é melhor do que rotear para um banco que a implementa por acaso |
 
 ### 9.4 Rate limiting

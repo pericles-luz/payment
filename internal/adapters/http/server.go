@@ -3,6 +3,8 @@ package http
 import (
 	"context"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -65,6 +67,12 @@ type Server struct {
 	// default (retrocompat / single-tier deployments and tests).
 	accountResolver AccountResolver
 	csrf            CSRFGuard
+	// pixSubresources são os segmentos LITERAIS registrados logo abaixo de
+	// `/v1/pix` — "cobv", "loc", "received", "lotecobv" e os do PIX Automático —
+	// com os métodos de cada um. Router() o preenche a partir da PRÓPRIA árvore de
+	// rotas do chi, e é o que guarda `/v1/pix/{txid}` de engolir um deles. Ver
+	// literalChildren e Server.txidFromPath.
+	pixSubresources map[string][]string
 	// bankResolver resolves and validates which bank a tenant request routes to
 	// (multi-bank selector, SIN-66022). When nil the tenant plane runs single-bank:
 	// no selector is read and every request resolves to the default bank.
@@ -460,13 +468,18 @@ func (s *Server) Router() http.Handler {
 			r.Get("/charges/{id}", s.handleGetCharge)
 			// Immediate PIX charges (cobrança imediata, roteiro 7.1–7.4). Create reserves
 			// idempotently and bills; get/list reconcile from the PSP. List by date window
-			// (?start&end) is registered before the {txid} read so chi routes them apart.
+			// é ?start&end no próprio "/pix".
+			//
+			// **A ordem destes registros não importa.** O chi casa segmento estático antes
+			// de curinga, qualquer que seja a ordem em que foram escritos — este arquivo
+			// afirmou três vezes o contrário, e estava errado. O que importa de verdade
+			// está em Server.txidFromPath: o chi NÃO para no estático que não trata o
+			// método pedido, ele segue e casa o curinga irmão. É de lá que vem a guarda, e
+			// TestPixSubresourcesNuncaViramTxID é quem a cobra.
 			r.Post("/pix", s.handleCreatePix)
 			r.Get("/pix", s.handleListPix)
 			// PIX cobrança com vencimento (cobv, roteiro 7.5–7.8): criar (7.5), consultar
-			// (7.6), alterar (7.7). The static "/pix/cobv" segment is registered before the
-			// immediate-charge "/pix/{txid}" read so chi routes the literal "cobv" segment
-			// apart from a txid. Create generates the txid server-side (like immediate pix);
+			// (7.6), alterar (7.7). Create generates the txid server-side (like immediate pix);
 			// get/update address it. Settlement notification (7.8) is reconciled through the
 			// shared C6 webhook (/webhooks/c6/{tenantRef}, C6-D), not a per-charge endpoint.
 			r.Get("/pix/cobv", s.handleListPixCobV)
@@ -479,8 +492,7 @@ func (s *Server) Router() http.Handler {
 			r.Patch("/pix/cobv/{txid}", s.handleRevisePixCobV)
 			// Location de payload (loc): o endereço onde o QR busca a cobrança. Vive
 			// separado da cobrança porque um loc pode ser desvinculado do txid e reusado —
-			// é o que permite trocar a cobrança por trás de um QR já impresso. Os segmentos
-			// literais entram ANTES do "/pix/{txid}" abaixo.
+			// é o que permite trocar a cobrança por trás de um QR já impresso.
 			r.Post("/pix/loc", s.handleCreatePixLoc)
 			r.Get("/pix/loc", s.handleListPixLoc)
 			r.Get("/pix/loc/{id}", s.handleGetPixLoc)
@@ -503,9 +515,10 @@ func (s *Server) Router() http.Handler {
 			// autorização da recorrência). Dark-shipped behind PAYMENT_PIX_RECURRENCE: with
 			// the flag off none of these routes exists, so rollback is a config flip.
 			//
-			// Like "cobv", every literal segment here ("rec", "solicrec", "cobr", "locrec")
-			// MUST be registered before the "/pix/{txid}" read below, or chi would swallow
-			// them as a txid.
+			// Com a flag desligada estes segmentos não existem, e aí `GET /v1/pix/rec` cairia
+			// no curinga como se "rec" fosse um txid. Não cai: Server.txidFromPath lê os
+			// sub-recursos da árvore de rotas montada, então a flag desligada simplesmente
+			// tira "rec" da lista e o 404 volta a ser honesto.
 			//
 			// The journey, in order: mint a location (locrec) → register the mandate (rec)
 			// bound to that location AND to the txid of an already-created immediate charge
@@ -530,6 +543,9 @@ func (s *Server) Router() http.Handler {
 			// Revisão da cobrança imediata (PATCH /cob/{txid} do BACEN). Não há PUT aqui:
 			// criar continua sendo POST /v1/pix, que deriva o txid da âncora de
 			// idempotência — é o que impede cobrar duas vezes pelo mesmo pedido.
+			//
+			// Foi este PATCH que tornou a guarda do txid necessária: antes dele o curinga
+			// só atendia GET, e um `PATCH /v1/pix/cobv` batia em 405 por acidente.
 			r.Patch("/pix/{txid}", s.handleRevisePix)
 			// Unified hosted checkout — open a session (roteiro 9.a–9.c), reconcile it
 			// (grupo 10, GET) and cancel it (grupo 11, DELETE). The status webhook (grupo
@@ -814,5 +830,45 @@ func (s *Server) Router() http.Handler {
 		r.Post("/webhooks/c6/{tenantRef}", s.handleC6Webhook)
 	})
 
+	// Depois de TUDO registrado, e não antes: é a árvore montada que diz quais são
+	// os sub-recursos literais de /v1/pix. Ver Server.txidFromPath para o que isso
+	// evita, e literalChildren para como é lido.
+	s.pixSubresources = literalChildren(r, "/v1", "/pix")
+
 	return r
+}
+
+// literalChildren devolve os segmentos LITERAIS registrados exatamente um nível
+// abaixo de `raiz+prefixo`, com os métodos de cada um. `/v1/pix/cobv` conta;
+// `/v1/pix/{txid}` não (é curinga) e `/v1/pix/loc/{id}` também não (é fundo demais).
+//
+// Ela lê a árvore do chi em vez de uma constante porque uma constante seria
+// esquecida no dia em que nascesse o próximo `/v1/pix/<coisa>` — e o efeito de
+// esquecê-la é silencioso (ver Server.txidFromPath).
+func literalChildren(rs chi.Routes, raiz, prefixo string) map[string][]string {
+	out := map[string][]string{}
+	var andar func(rs chi.Routes, base string)
+	andar = func(rs chi.Routes, base string) {
+		for _, rt := range rs.Routes() {
+			// chi escreve o nó de um sub-router como "/v1/*"; o "*" não faz parte do
+			// caminho, é a marca de que há subárvore.
+			caminho := base + strings.TrimSuffix(rt.Pattern, "/*")
+			if rt.SubRoutes != nil {
+				andar(rt.SubRoutes, strings.TrimSuffix(caminho, "/"))
+				continue
+			}
+			resto, dentro := strings.CutPrefix(caminho, raiz+prefixo+"/")
+			if !dentro || strings.Contains(resto, "/") || strings.HasPrefix(resto, "{") {
+				continue
+			}
+			metodos := make([]string, 0, len(rt.Handlers))
+			for m := range rt.Handlers {
+				metodos = append(metodos, m)
+			}
+			sort.Strings(metodos)
+			out[resto] = metodos
+		}
+	}
+	andar(rs, "")
+	return out
 }
