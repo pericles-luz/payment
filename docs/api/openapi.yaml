@@ -894,9 +894,14 @@ paths:
       parameters:
         - $ref: "#/components/parameters/PathId"
         - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitDDAGroupRequest" }
       responses:
         "204":
-          description: Grupo submetido (reenviar um grupo já aprovado retorna 204).
+          description: Grupo submetido (reenviar um grupo já submetido retorna 204).
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2219,12 +2224,18 @@ components:
 
     DDABoleto:
       type: object
+      description: >-
+        Título aberto no DDA da empresa. Não tem id: o título é endereçado pelo
+        `content`, que é o que a criação do grupo recebe.
       properties:
-        id: { type: string }
-        barcode: { type: string, description: Linha digitável. }
+        content: { type: string, description: "Linha digitável, chave PIX ou BR Code." }
         amount_cents: { type: integer, format: int64 }
         due_date: { type: string, format: date-time }
         beneficiary_name: { type: string }
+        payer_name: { type: string }
+        bank_code: { type: string }
+        bank_name: { type: string }
+        overdue: { type: boolean }
     DDABoletoList:
       type: object
       properties:
@@ -2235,24 +2246,57 @@ components:
       type: object
       properties:
         id: { type: string }
-        barcode: { type: string, description: Linha digitável. }
+        content: { type: string, description: "Linha digitável, chave PIX ou BR Code." }
         amount_cents: { type: integer, format: int64 }
-        due_date: { type: string, format: date-time }
+        due_date:
+          type: string
+          format: date-time
+          description: Vazio num pagamento que não tem vencimento (PIX).
+        status:
+          type: string
+          description: >-
+            Estado do item no banco, verbatim. READ_DATA (cadastrado), DECODE_ERROR,
+            ERROR, SCHEDULED (agendado), PROCESSING, PROCESSED (pago),
+            SCHEDULING_CANCELLED. O grupo está congelado quando QUALQUER item saiu
+            de READ_DATA/DECODE_ERROR/ERROR.
+          enum: [READ_DATA, DECODE_ERROR, ERROR, SCHEDULED, PROCESSING, PROCESSED, SCHEDULING_CANCELLED]
+        product_type:
+          type: string
+          description: Vazio enquanto o banco não resolveu o pagamento.
+          enum: ["", BOLETO, PIX]
+        error_message: { type: string }
+        overdue: { type: boolean }
+    DDAPayment:
+      type: object
+      required: [content, amount_cents]
+      properties:
+        content: { type: string, description: "Linha digitável, chave PIX ou BR Code." }
+        amount_cents: { type: integer, format: int64 }
+        description: { type: string, maxLength: 100, description: Exibido na tela de aprovação do banco. }
+        beneficiary_name: { type: string }
+        payer_name: { type: string }
+        bank_code: { type: string }
+        bank_name: { type: string }
+        transaction_date:
+          type: string
+          format: date
+          description: YYYY-MM-DD. Vazio agenda para hoje.
     CreateDDAGroupRequest:
       type: object
-      required: [barcodes]
+      required: [payments]
       properties:
-        barcodes:
+        payments:
           type: array
-          items: { type: string, description: Linha digitável. }
+          maxItems: 200
+          items: { $ref: "#/components/schemas/DDAPayment" }
+        bank: { type: string, description: Banco configurado que agenda este grupo. }
     DDAGroup:
       type: object
+      description: >-
+        Resposta da criação. Carrega o identificador e mais nada: o banco responde a
+        submissão só com o group_id. Os itens aparecem na leitura do grupo.
       properties:
         txid: { type: string, description: Identificador do grupo para operações seguintes. }
-        status: { type: string }
-        items:
-          type: array
-          items: { $ref: "#/components/schemas/DDAItem" }
     DDAItemList:
       type: object
       properties:
@@ -2266,6 +2310,13 @@ components:
         item_ids:
           type: array
           items: { type: string }
+    SubmitDDAGroupRequest:
+      type: object
+      required: [uploader_name]
+      properties:
+        uploader_name:
+          type: string
+          description: Operador exibido na tela de aprovação do banco. Obrigatório.
 
     StatementEntry:
       type: object

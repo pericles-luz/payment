@@ -62,7 +62,7 @@ func newDDAFixture(t *testing.T) *ddaFixture {
 	creds.Set(tnB.ID(), ports.BankCredential{ClientID: "c6-beta", Secret: "s"})
 	// Seed boletos open in tenant A's DDA (roteiro 8.1).
 	stub.SeedDDABoletos(tnA.ID(), []ports.DDABoleto{
-		{ID: "b1", Barcode: ddaBarcode(1), AmountCents: 1000, DueDate: time.Now().Add(48 * time.Hour), BeneficiaryName: "Acme"},
+		{Content: ddaBarcode(1), AmountCents: 1000, DueDate: time.Now().Add(48 * time.Hour), BeneficiaryName: "Acme"},
 	})
 	auth := httpadapter.NewStaticTokenAuth(
 		map[string]string{tenantToken: tnA.ID(), tenantTokenB: tnB.ID()},
@@ -76,19 +76,25 @@ func newDDAFixture(t *testing.T) *ddaFixture {
 	return &ddaFixture{handler: srv.Router(), tenantID: tnA.ID(), bank: stub}
 }
 
+// ddaPayments builds the request payments for the given references.
+func ddaPayments(contents ...string) []map[string]any {
+	out := make([]map[string]any, len(contents))
+	for i, c := range contents {
+		out[i] = map[string]any{"content": c, "amount_cents": (i + 1) * 100}
+	}
+	return out
+}
+
 // createGroup is a helper: POST a consult group and return its txid.
-func createGroup(t *testing.T, f *ddaFixture, key string, barcodes ...string) (string, *httptest.ResponseRecorder) {
+func createGroup(t *testing.T, f *ddaFixture, key string, contents ...string) (string, *httptest.ResponseRecorder) {
 	t.Helper()
 	rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups", tenantToken,
-		map[string]string{"Idempotency-Key": key}, map[string]any{"barcodes": barcodes})
+		map[string]string{"Idempotency-Key": key}, map[string]any{"payments": ddaPayments(contents...)})
 	if rec.Code != http.StatusCreated {
 		return "", rec
 	}
 	var v struct {
-		TxID  string `json:"txid"`
-		Items []struct {
-			ID string `json:"id"`
-		} `json:"items"`
+		TxID string `json:"txid"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
 		t.Fatalf("decode group: %v", err)
@@ -96,7 +102,30 @@ func createGroup(t *testing.T, f *ddaFixture, key string, barcodes ...string) (s
 	return v.TxID, rec
 }
 
-// roteiro 8.1: GET /v1/dda/boletos → 200.
+// groupItemIDs reads a group's item ids back. The create answers with the txid alone —
+// like the bank — so nothing else knows them.
+func groupItemIDs(t *testing.T, f *ddaFixture, txid string) []string {
+	t.Helper()
+	rec := do(t, f.handler, http.MethodGet, "/v1/dda/payment-groups/"+txid+"/items", tenantToken, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read items: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var v struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatalf("decode items: %v", err)
+	}
+	ids := make([]string, len(v.Items))
+	for i, it := range v.Items {
+		ids[i] = it.ID
+	}
+	return ids
+}
+
+// roteiro AP_02: GET /v1/dda/boletos → 200.
 func TestDDAListBoletos(t *testing.T) {
 	t.Parallel()
 	f := newDDAFixture(t)
@@ -106,14 +135,13 @@ func TestDDAListBoletos(t *testing.T) {
 	}
 	var v struct {
 		Boletos []struct {
-			ID      string `json:"id"`
-			Barcode string `json:"barcode"`
+			Content string `json:"content"`
 		} `json:"boletos"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(v.Boletos) != 1 || v.Boletos[0].ID != "b1" {
+	if len(v.Boletos) != 1 || v.Boletos[0].Content != ddaBarcode(1) {
 		t.Fatalf("unexpected boletos: %+v", v.Boletos)
 	}
 	// Deny-by-default: no token → 401.
@@ -122,7 +150,7 @@ func TestDDAListBoletos(t *testing.T) {
 	}
 }
 
-// roteiro 8.2: POST /v1/dda/payment-groups → 201 + txid.
+// roteiro AP_01: POST /v1/dda/payment-groups → 201 + txid.
 func TestDDACreateGroup(t *testing.T) {
 	t.Parallel()
 	f := newDDAFixture(t)
@@ -136,15 +164,15 @@ func TestDDACreateGroup(t *testing.T) {
 
 	t.Run("missing_idempotency_key", func(t *testing.T) {
 		rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups", tenantToken, nil,
-			map[string]any{"barcodes": []string{ddaBarcode(1)}})
+			map[string]any{"payments": ddaPayments(ddaBarcode(1))})
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("want 400, got %d", rec.Code)
 		}
 	})
 
-	t.Run("empty_barcodes", func(t *testing.T) {
+	t.Run("empty_payments", func(t *testing.T) {
 		rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups", tenantToken,
-			map[string]string{"Idempotency-Key": "k"}, map[string]any{"barcodes": []string{}})
+			map[string]string{"Idempotency-Key": "k"}, map[string]any{"payments": []map[string]any{}})
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("want 400, got %d", rec.Code)
 		}
@@ -152,7 +180,7 @@ func TestDDACreateGroup(t *testing.T) {
 
 	t.Run("invalid_barcode", func(t *testing.T) {
 		rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups", tenantToken,
-			map[string]string{"Idempotency-Key": "k"}, map[string]any{"barcodes": []string{"not-a-barcode"}})
+			map[string]string{"Idempotency-Key": "k"}, map[string]any{"payments": ddaPayments("not-a-barcode")})
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("want 400, got %d", rec.Code)
 		}
@@ -160,14 +188,14 @@ func TestDDACreateGroup(t *testing.T) {
 
 	t.Run("unknown_field", func(t *testing.T) {
 		rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups", tenantToken,
-			map[string]string{"Idempotency-Key": "k"}, map[string]any{"barcodes": []string{ddaBarcode(1)}, "evil": "x"})
+			map[string]string{"Idempotency-Key": "k"}, map[string]any{"payments": ddaPayments(ddaBarcode(1)), "evil": "x"})
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("want 400 for unknown field, got %d", rec.Code)
 		}
 	})
 }
 
-// roteiro 8.3: GET /v1/dda/payment-groups/{id}/items → 200.
+// roteiro AP_03: GET /v1/dda/payment-groups/{id}/items → 200.
 func TestDDAGetGroupItems(t *testing.T) {
 	t.Parallel()
 	f := newDDAFixture(t)
@@ -198,7 +226,7 @@ func TestDDAGetGroupItems(t *testing.T) {
 	}
 }
 
-// roteiro 8.4: DELETE /v1/dda/payment-groups/{id}/items (list) → 204.
+// roteiro AP_04: DELETE /v1/dda/payment-groups/{id}/items (list) → 204.
 func TestDDARemoveItemsList(t *testing.T) {
 	t.Parallel()
 	f := newDDAFixture(t)
@@ -206,13 +234,8 @@ func TestDDARemoveItemsList(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: %d", rec.Code)
 	}
-	var created struct {
-		Items []struct {
-			ID string `json:"id"`
-		} `json:"items"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &created)
-	ids := []string{created.Items[0].ID, created.Items[1].ID}
+	all := groupItemIDs(t, f, txid)
+	ids := []string{all[0], all[1]}
 
 	del := do(t, f.handler, http.MethodDelete, "/v1/dda/payment-groups/"+txid+"/items", tenantToken,
 		nil, map[string]any{"item_ids": ids})
@@ -246,19 +269,16 @@ func TestDDARemoveItemsList(t *testing.T) {
 	})
 }
 
-// roteiro 8.5: DELETE /v1/dda/payment-groups/{id}/items/{itemID} → 204.
+// roteiro AP_05: DELETE /v1/dda/payment-groups/{id}/items/{itemID} → 204.
 func TestDDARemoveSingleItem(t *testing.T) {
 	t.Parallel()
 	f := newDDAFixture(t)
 	txid, rec := createGroup(t, f, "k1", ddaBarcode(1), ddaBarcode(2))
-	var created struct {
-		Items []struct {
-			ID string `json:"id"`
-		} `json:"items"`
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d", rec.Code)
 	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &created)
 
-	del := do(t, f.handler, http.MethodDelete, "/v1/dda/payment-groups/"+txid+"/items/"+created.Items[0].ID, tenantToken, nil, nil)
+	del := do(t, f.handler, http.MethodDelete, "/v1/dda/payment-groups/"+txid+"/items/"+groupItemIDs(t, f, txid)[0], tenantToken, nil, nil)
 	if del.Code != http.StatusNoContent {
 		t.Fatalf("want 204, got %d body=%s", del.Code, del.Body.String())
 	}
@@ -268,29 +288,35 @@ func TestDDARemoveSingleItem(t *testing.T) {
 	}
 }
 
-// roteiro 8.6: POST /v1/dda/payment-groups/{id}/submit → 204.
+// roteiro AP_06: POST /v1/dda/payment-groups/{id}/submit → 204.
 func TestDDASubmitGroup(t *testing.T) {
 	t.Parallel()
 	f := newDDAFixture(t)
 	txid, _ := createGroup(t, f, "k1", ddaBarcode(1))
 
+	body := map[string]any{"uploader_name": "Zé da Silva"}
 	sub := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups/"+txid+"/submit", tenantToken,
-		map[string]string{"Idempotency-Key": "s1"}, nil)
+		map[string]string{"Idempotency-Key": "s1"}, body)
 	if sub.Code != http.StatusNoContent {
 		t.Fatalf("want 204, got %d body=%s", sub.Code, sub.Body.String())
 	}
-	// Idempotent re-submit (already approved) → 204.
+	// Idempotent re-submit (already submitted) → 204.
 	if rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups/"+txid+"/submit", tenantToken,
-		map[string]string{"Idempotency-Key": "s1"}, nil); rec.Code != http.StatusNoContent {
+		map[string]string{"Idempotency-Key": "s1"}, body); rec.Code != http.StatusNoContent {
 		t.Fatalf("re-submit want 204, got %d", rec.Code)
 	}
-	// After approval the group is frozen: trimming it → 409 Conflict.
+	// uploader_name is required by the contract → 400 without it.
+	if rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups/"+txid+"/submit", tenantToken,
+		map[string]string{"Idempotency-Key": "s1"}, map[string]any{}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing uploader_name want 400, got %d", rec.Code)
+	}
+	// Once submitted the group is frozen: trimming it → 409 Conflict.
 	if rec := do(t, f.handler, http.MethodDelete, "/v1/dda/payment-groups/"+txid+"/items/anything", tenantToken, nil, nil); rec.Code != http.StatusConflict {
 		t.Fatalf("trim after approval want 409, got %d", rec.Code)
 	}
 
 	t.Run("missing_idempotency_key", func(t *testing.T) {
-		rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups/"+txid+"/submit", tenantToken, nil, nil)
+		rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups/"+txid+"/submit", tenantToken, nil, body)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("want 400, got %d", rec.Code)
 		}
@@ -298,7 +324,7 @@ func TestDDASubmitGroup(t *testing.T) {
 
 	t.Run("unknown_group", func(t *testing.T) {
 		rec := do(t, f.handler, http.MethodPost, "/v1/dda/payment-groups/missing/submit", tenantToken,
-			map[string]string{"Idempotency-Key": "s2"}, nil)
+			map[string]string{"Idempotency-Key": "s2"}, body)
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("want 404, got %d", rec.Code)
 		}

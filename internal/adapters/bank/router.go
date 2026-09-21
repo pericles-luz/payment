@@ -272,12 +272,12 @@ func (r ddaRouter) RemovePaymentGroupItem(ctx context.Context, tenantID, groupID
 	return set.DDA.RemovePaymentGroupItem(ctx, tenantID, groupID, itemID)
 }
 
-func (r ddaRouter) SubmitPaymentGroup(ctx context.Context, tenantID, groupID, idemKey string) error {
+func (r ddaRouter) SubmitPaymentGroup(ctx context.Context, tenantID, groupID, uploaderName, idemKey string) error {
 	set, ok := r.reg.resolve(ctx)
 	if !ok || set.DDA == nil {
 		return shared.ErrUnavailable
 	}
-	return set.DDA.SubmitPaymentGroup(ctx, tenantID, groupID, idemKey)
+	return set.DDA.SubmitPaymentGroup(ctx, tenantID, groupID, uploaderName, idemKey)
 }
 
 // --- StatementProvider ---

@@ -24,8 +24,12 @@ func newDDAStub(t *testing.T) *bank.StubProvider {
 
 func ddaBC(seed byte) string { return strings.Repeat(string('0'+seed%10), 44) }
 
-func ddaReq(key string, barcodes ...string) ports.DDAGroupRequest {
-	return ports.DDAGroupRequest{TenantID: "t1", Barcodes: barcodes, IdempotencyKey: key}
+func ddaReq(key string, contents ...string) ports.DDAGroupRequest {
+	payments := make([]ports.DDAPayment, len(contents))
+	for i, c := range contents {
+		payments[i] = ports.DDAPayment{Content: c, AmountCents: int64(i+1) * 100}
+	}
+	return ports.DDAGroupRequest{TenantID: "t1", Payments: payments, IdempotencyKey: key}
 }
 
 func TestStubDDAListOpenBoletos(t *testing.T) {
@@ -40,8 +44,8 @@ func TestStubDDAListOpenBoletos(t *testing.T) {
 	}
 
 	seed := []ports.DDABoleto{
-		{ID: "b1", Barcode: ddaBC(1), AmountCents: 1000, DueDate: time.Now(), BeneficiaryName: "Acme"},
-		{ID: "b2", Barcode: ddaBC(2), AmountCents: 2000, DueDate: time.Now(), BeneficiaryName: "Beta"},
+		{Content: ddaBC(1), AmountCents: 1000, DueDate: time.Now(), BeneficiaryName: "Acme"},
+		{Content: ddaBC(2), AmountCents: 2000, DueDate: time.Now(), BeneficiaryName: "Beta"},
 	}
 	p.SeedDDABoletos("t1", seed)
 	got, err = p.ListOpenBoletos(ctx, "t1")
@@ -49,9 +53,9 @@ func TestStubDDAListOpenBoletos(t *testing.T) {
 		t.Fatalf("seeded list: %v %v", got, err)
 	}
 	// A returned slice mutation must not affect the stub's stored state.
-	got[0].ID = "mutated"
+	got[0].Content = "mutated"
 	again, _ := p.ListOpenBoletos(ctx, "t1")
-	if again[0].ID != "b1" {
+	if again[0].Content != ddaBC(1) {
 		t.Fatal("ListOpenBoletos must return a defensive copy")
 	}
 	// Another tenant sees nothing.
@@ -77,22 +81,24 @@ func TestStubDDACreateAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if g.ID == "" || g.Status != "consultando" || len(g.Items) != 2 {
+	// Like the bank, the create answers with the id ALONE — a caller that skips the
+	// read-back must break here too, not only against C6.
+	if g.ID == "" || len(g.Items) != 0 {
 		t.Fatalf("unexpected group: %+v", g)
 	}
-	for _, it := range g.Items {
-		if it.ID == "" || it.AmountCents <= 0 || it.DueDate.IsZero() {
-			t.Fatalf("malformed item: %+v", it)
-		}
-	}
 
-	// Get reconciles the same group.
+	// Get reconciles the group, and only then are there items.
 	got, err := p.GetPaymentGroup(ctx, "t1", g.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if got.ID != g.ID || len(got.Items) != 2 {
 		t.Fatalf("get mismatch: %+v", got)
+	}
+	for _, it := range got.Items {
+		if it.ID == "" || it.AmountCents <= 0 || it.Status != "READ_DATA" || it.ProductType != "BOLETO" {
+			t.Fatalf("malformed item: %+v", it)
+		}
 	}
 }
 
@@ -122,7 +128,14 @@ func TestStubDDACreateValidation(t *testing.T) {
 		t.Fatalf("empty anchor: want validation, got %v", err)
 	}
 	if _, err := p.CreatePaymentGroup(ctx, "t1", ddaReq("k")); !errors.Is(err, shared.ErrValidation) {
-		t.Fatalf("empty barcodes: want validation, got %v", err)
+		t.Fatalf("empty payments: want validation, got %v", err)
+	}
+	zero := ports.DDAGroupRequest{
+		TenantID: "t1", IdempotencyKey: "k",
+		Payments: []ports.DDAPayment{{Content: ddaBC(1)}},
+	}
+	if _, err := p.CreatePaymentGroup(ctx, "t1", zero); !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("zero amount: want validation, got %v", err)
 	}
 }
 
@@ -151,15 +164,16 @@ func TestStubDDARemoveItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	rm := []string{g.Items[0].ID, g.Items[2].ID}
+	seeded, _ := p.GetPaymentGroup(ctx, "t1", g.ID)
+	rm := []string{seeded.Items[0].ID, seeded.Items[2].ID}
 	if err := p.RemovePaymentGroupItems(ctx, "t1", g.ID, rm); err != nil {
 		t.Fatalf("remove list: %v", err)
 	}
 	got, _ := p.GetPaymentGroup(ctx, "t1", g.ID)
-	if len(got.Items) != 1 || got.Items[0].ID != g.Items[1].ID {
+	if len(got.Items) != 1 || got.Items[0].ID != seeded.Items[1].ID {
 		t.Fatalf("after list removal want 1 item left, got %+v", got.Items)
 	}
-	// Remove the single remaining item (8.5).
+	// Remove the single remaining item (AP_05).
 	if err := p.RemovePaymentGroupItem(ctx, "t1", g.ID, got.Items[0].ID); err != nil {
 		t.Fatalf("remove single: %v", err)
 	}
@@ -189,19 +203,26 @@ func TestStubDDASubmit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := p.SubmitPaymentGroup(ctx, "t1", g.ID, "idem-1"); err != nil {
+	if err := p.SubmitPaymentGroup(ctx, "t1", g.ID, "Zé da Silva", "idem-1"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
+	// There is no group status: a submitted group is one whose ITEMS moved on.
 	got, _ := p.GetPaymentGroup(ctx, "t1", g.ID)
-	if got.Status != "aprovado" {
-		t.Fatalf("want aprovado after submit, got %q", got.Status)
+	for _, it := range got.Items {
+		if it.Status != "SCHEDULED" {
+			t.Fatalf("want SCHEDULED after submit, got %q", it.Status)
+		}
 	}
-	// Idempotent: re-submitting an already-approved group succeeds.
-	if err := p.SubmitPaymentGroup(ctx, "t1", g.ID, "idem-1"); err != nil {
+	// Idempotent: re-submitting an already-submitted group succeeds.
+	if err := p.SubmitPaymentGroup(ctx, "t1", g.ID, "Zé da Silva", "idem-1"); err != nil {
 		t.Fatalf("re-submit: %v", err)
 	}
+	// uploader_name is required by the contract.
+	if err := p.SubmitPaymentGroup(ctx, "t1", g.ID, " ", "idem-1"); !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("empty uploader: want validation, got %v", err)
+	}
 	// Unknown group → not found.
-	if err := p.SubmitPaymentGroup(ctx, "t1", "missing", "idem-2"); !errors.Is(err, shared.ErrNotFound) {
+	if err := p.SubmitPaymentGroup(ctx, "t1", "missing", "Zé", "idem-2"); !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("submit unknown: want not-found, got %v", err)
 	}
 }

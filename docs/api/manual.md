@@ -550,24 +550,37 @@ operação: `CONCLUIDA` = paga; `REJEITADA` = o banco do pagador recusou (sem sa
 débito bloqueado) — vale falar com o cliente; `EXPIRADA` = a janela passou sem
 pagamento; `CANCELADA` = você cancelou.
 
-## 5. Consulta e pagamento DDA
+## 5. Consulta e agendamento de pagamentos (DDA)
 
-**Quando:** pagar boletos que caíram no DDA da empresa-cliente. Fluxo: listar →
-criar grupo → revisar itens → aparar → submeter.
+**Quando:** pagar boletos que caíram no DDA da empresa-cliente, ou agendar
+pagamentos — de boleto **e de PIX**. Fluxo: listar → criar grupo → revisar itens →
+aparar → submeter.
+
+A API **não paga**: ela submete os pagamentos para aprovação de alguém com alçada
+dentro do banco. Até a aprovação, o lote existe e não se moveu.
 
 ```bash
-# Listar boletos abertos no DDA (listDDABoletos)
+# Listar títulos abertos no DDA (listDDABoletos)
 curl "$BASE/v1/dda/boletos" -H "Authorization: Bearer <TENANT_TOKEN>"
 
-# Criar grupo de pagamento a partir de linhas digitáveis (createDDAGroup)
+# Criar grupo de pagamento (createDDAGroup)
 curl -X POST "$BASE/v1/dda/payment-groups" \
   -H "Authorization: Bearer <TENANT_TOKEN>" \
   -H "Idempotency-Key: dda-lote-014" \
   -H "Content-Type: application/json" \
-  -d '{ "barcodes": ["3419...","2379..."] }'
+  -d '{ "payments": [
+        { "content": "3419...", "amount_cents": 12345,
+          "description": "Boleto do aluguel", "transaction_date": "2026-10-02" },
+        { "content": "fornecedor@exemplo.com", "amount_cents": 2500 }
+      ] }'
 ```
 
-`201 Created` → `{ "txid": "grp_...", "status": "...", "items": [...] }`. Depois:
+`content` é a referência do pagamento: linha digitável, **chave PIX** ou BR Code.
+`amount_cents` é obrigatório junto com ela. `transaction_date` é a data de execução
+(`YYYY-MM-DD`); vazia agenda para hoje.
+
+`201 Created` → `{ "txid": "grp_..." }`, **e nada mais**: o banco responde a criação
+só com o identificador. Os itens, com os ids que a remoção usa, aparecem na leitura:
 
 ```bash
 # Revisar itens do grupo (getDDAGroupItems)
@@ -578,8 +591,18 @@ curl -X DELETE "$BASE/v1/dda/payment-groups/grp_.../items/item_1" -H "Authorizat
 
 # Submeter o grupo para aprovação/pagamento (submitDDAGroup)
 curl -X POST "$BASE/v1/dda/payment-groups/grp_.../submit" \
-  -H "Authorization: Bearer <TENANT_TOKEN>" -H "Idempotency-Key: dda-submit-014"
+  -H "Authorization: Bearer <TENANT_TOKEN>" -H "Idempotency-Key: dda-submit-014" \
+  -H "Content-Type: application/json" \
+  -d '{ "uploader_name": "Zé da Silva" }'
 ```
+
+`uploader_name` é obrigatório: é o operador que o banco exibe na tela de aprovação.
+
+Cada item tem o seu próprio `status`, vindo do banco: `READ_DATA` (cadastrado),
+`DECODE_ERROR` (não deu para ler os dados — veja `error_message`), `ERROR`,
+`SCHEDULED` (agendado), `PROCESSING`, `PROCESSED` (pago), `SCHEDULING_CANCELLED`.
+**Não existe status de grupo.** O lote está congelado quando qualquer item saiu de
+`READ_DATA`/`DECODE_ERROR`/`ERROR` — aparar um lote congelado responde `409`.
 
 Um grupo de outra empresa-cliente responde `404` (nunca oráculo cross-tenant).
 
