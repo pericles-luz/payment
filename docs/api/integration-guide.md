@@ -341,6 +341,7 @@ Corpo:
   "event_type": "payment.paid",
   "tx_id": "E1234...",
   "account_id": "<sua Conta>",
+  "client_tenant_id": "<empresa-cliente dona da cobrança>",
   "timestamp": 1755561600,
   "amount_cents": 501,
   "installments": 3,
@@ -350,6 +351,7 @@ Corpo:
 
 | campo | significado |
 |---|---|
+| `client_tenant_id` | a empresa-cliente (`X-Client-Tenant`) dona da cobrança — é o que permite atribuir a uma empresa um aviso cujo `tx_id` você não reconhece |
 | `amount_cents` | valor liquidado, **sempre em centavos** (inteiro) |
 | `installments` | em quantas parcelas o cartão foi autorizado; `0` em PIX e boleto |
 | `message` | o que o PSP disse sobre a captura; vazio em PIX e boleto |

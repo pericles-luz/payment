@@ -51,6 +51,7 @@ func TestForwardBodyCarriesSettlementDetailInCents(t *testing.T) {
 	// The routing fields still travel unchanged.
 	for k, want := range map[string]string{
 		"event_key": "ek-1", "event_type": "payment.paid", "tx_id": "tx-1", "account_id": "acct-1",
+		"client_tenant_id": "ten-1",
 	} {
 		if got[k] != want {
 			t.Fatalf("%s: want %q, got %v", k, want, got[k])
