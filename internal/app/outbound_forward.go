@@ -410,7 +410,7 @@ func (p *OutboundProcessor) auditDelivery(ctx context.Context, action audit.Acti
 
 // forwardBody is the canonical JSON envelope delivered to a Conta's endpoint. It carries
 // only NON-PII routing/notification fields — the event type, the referenced charge id, the
-// dedup event_key, the owning account and the send timestamp — never the devedor PII a Pix
+// dedup event_key, the owning account and empresa-cliente, and the send timestamp — never the devedor PII a Pix
 // payload can hold (sin-68744); a receiver that needs charge detail calls our API back with
 // its account key. Struct field order is stable, so json.Marshal is deterministic and the
 // signed bytes match the transmitted bytes exactly.
@@ -419,7 +419,12 @@ type forwardBody struct {
 	EventType string `json:"event_type"`
 	TxID      string `json:"tx_id"`
 	AccountID string `json:"account_id"`
-	Timestamp int64  `json:"timestamp"`
+	// ClientTenantID is the empresa-cliente (X-Client-Tenant) that owns the charge. The
+	// account_id is the same for every empresa under a Conta, so without it a receiver
+	// cannot attribute a settlement whose tx_id it does not recognise — a charge created
+	// outside its own records — to any of its tenants. Routing, not PII.
+	ClientTenantID string `json:"client_tenant_id"`
+	Timestamp      int64  `json:"timestamp"`
 	// AmountCents is the settled amount in integer MINOR UNITS. Amounts never cross this
 	// boundary as reais: the PSP reports checkout amounts as decimal reais on the wire
 	// ("amount": 5.01) and the adapter parses them to cents by string, never a float, so
@@ -437,13 +442,14 @@ type forwardBody struct {
 // buildForwardBody serialises the canonical envelope for a delivery at instant now.
 func buildForwardBody(d *outboundqueue.Delivery, now time.Time) ([]byte, error) {
 	return json.Marshal(forwardBody{
-		EventKey:     d.EventKey(),
-		EventType:    d.EventType(),
-		TxID:         d.TxID(),
-		AccountID:    d.AccountID(),
-		Timestamp:    now.Unix(),
-		AmountCents:  d.Detail().AmountCents,
-		Installments: d.Detail().Installments,
-		Message:      d.Detail().Message,
+		EventKey:       d.EventKey(),
+		EventType:      d.EventType(),
+		TxID:           d.TxID(),
+		AccountID:      d.AccountID(),
+		ClientTenantID: d.TenantID(),
+		Timestamp:      now.Unix(),
+		AmountCents:    d.Detail().AmountCents,
+		Installments:   d.Detail().Installments,
+		Message:        d.Detail().Message,
 	})
 }
