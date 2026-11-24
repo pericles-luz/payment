@@ -17,6 +17,7 @@ type directRepo struct {
 	ports.ProcessedEventStore
 	ports.RecRepository
 	ports.CobRRepository
+	ports.NFSeEmissionRepository
 	ports.AuditLog
 	ports.PIIAccessRecorder
 }
@@ -53,14 +54,15 @@ func resolveUoW(d Deps) ports.UnitOfWork {
 		pii = noopPIIAccess{}
 	}
 	return autocommitUoW{repo: directRepo{
-		PaymentRepository:   d.Payments,
-		TenantRepository:    d.Tenants,
-		PricingRepository:   d.Pricing,
-		LedgerRepository:    d.Ledger,
-		ProcessedEventStore: d.Processed,
-		RecRepository:       d.Recs,
-		CobRRepository:      d.CobRs,
-		AuditLog:            a,
-		PIIAccessRecorder:   pii,
+		PaymentRepository:      d.Payments,
+		TenantRepository:       d.Tenants,
+		PricingRepository:      d.Pricing,
+		LedgerRepository:       d.Ledger,
+		ProcessedEventStore:    d.Processed,
+		RecRepository:          d.Recs,
+		CobRRepository:         d.CobRs,
+		NFSeEmissionRepository: d.NFSeEmissions,
+		AuditLog:               a,
+		PIIAccessRecorder:      pii,
 	}}
 }

@@ -22,6 +22,10 @@ import (
 type Action string
 
 const (
+	// ActionSetNFSeCertificate records the custody (or rotation) of a tenant's
+	// NFS-e A1 certificate. It names who/which-tenant/when only — never the PFX,
+	// its password or the CNPJ (the key itself is a non-exportable Vault key).
+	ActionSetNFSeCertificate Action = "nfse.certificate.set"
 	// ActionCreateTenant records provisioning of a new tenant.
 	ActionCreateTenant Action = "tenant.create"
 	// ActionSetEndpointPrice records an upsert of a tenant's endpoint pricing.
@@ -175,7 +179,8 @@ func (a Action) valid() bool {
 		ActionCobRCancelled,
 		ActionSetBankCertificate, ActionInvoiceGenerated, ActionMintAccountKey,
 		ActionSetOutboundWebhook, ActionRotateOutboundWebhookSecret, ActionRemoveOutboundWebhook,
-		ActionOutboundWebhookDelivered, ActionOutboundWebhookDeadLettered:
+		ActionOutboundWebhookDelivered, ActionOutboundWebhookDeadLettered,
+		ActionSetNFSeCertificate:
 		return true
 	default:
 		return false

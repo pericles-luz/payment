@@ -21,6 +21,8 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/domain/shared"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/termsconsent"
+	"github.com/ia-dev-sindireceita/payment/internal/nfse"
+	"github.com/ia-dev-sindireceita/payment/internal/nfse/custody"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 )
 
@@ -39,6 +41,11 @@ type Store struct {
 	consents  []*termsconsent.Record      // append-only LGPD terms consent (mirrors terms_consent)
 	piiAccess []access.Entry              // append-only PII read-access log (mirrors pii_access_log)
 	invoices  []invoice.Invoice           // append-only Faturas (mirrors invoices/invoice_items)
+
+	nfseEmissions map[string]nfse.Emission // keyed by tenantID+"\x00"+id (mirrors nfse_emissions)
+	nfseSeq       map[string]int64         // keyed by cnpj+"\x00"+series (mirrors nfse_dps_sequences)
+	nfseDANFSe    map[string][]byte        // keyed like nfseEmissions (danfse_pdf column)
+	nfseCerts     *custody.MemoryCertStore // mirrors nfse_a1_certs
 }
 
 // NewStore returns an empty in-memory store.
@@ -51,6 +58,11 @@ func NewStore() *Store {
 		processed: make(map[string]struct{}),
 		recs:      make(map[string]*recurrence.Rec),
 		cobrs:     make(map[string]*recurrence.CobR),
+
+		nfseEmissions: make(map[string]nfse.Emission),
+		nfseSeq:       make(map[string]int64),
+		nfseDANFSe:    make(map[string][]byte),
+		nfseCerts:     custody.NewMemoryCertStore(),
 	}
 }
 
@@ -368,6 +380,7 @@ type snapshot struct {
 	recs      map[string]*recurrence.Rec
 	cobrs     map[string]*recurrence.CobR
 	piiAccess []access.Entry
+	nfse      map[string]nfse.Emission
 }
 
 func (s *Store) snapshot() snapshot {
@@ -401,7 +414,11 @@ func (s *Store) snapshot() snapshot {
 	}
 	piiAccess := make([]access.Entry, len(s.piiAccess))
 	copy(piiAccess, s.piiAccess)
-	return snapshot{tenants: tenants, payments: payments, pricing: pricing, ledger: ledger, processed: processed, audit: auditCopy, recs: recs, cobrs: cobrs, piiAccess: piiAccess}
+	nfseCopy := make(map[string]nfse.Emission, len(s.nfseEmissions))
+	for k, v := range s.nfseEmissions {
+		nfseCopy[k] = v
+	}
+	return snapshot{tenants: tenants, payments: payments, pricing: pricing, ledger: ledger, processed: processed, audit: auditCopy, recs: recs, cobrs: cobrs, piiAccess: piiAccess, nfse: nfseCopy}
 }
 
 func (s *Store) restore(snap snapshot) {
@@ -414,6 +431,7 @@ func (s *Store) restore(snap snapshot) {
 	s.recs = snap.recs
 	s.cobrs = snap.cobrs
 	s.piiAccess = snap.piiAccess
+	s.nfseEmissions = snap.nfse
 }
 
 // --- Lock-free core (callers must hold s.mu) ---

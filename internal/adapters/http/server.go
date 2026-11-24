@@ -24,6 +24,7 @@ type Server struct {
 	pix      *app.PixService
 	pixCobV  *app.PixDueChargeService
 	checkout *app.CheckoutService
+	nfse     *app.NFSeService
 	boleto   *app.BoletoService
 	// plainBoleto backs /v1/bank-slips — o boleto SIMPLES (bankslip v1), produto
 	// distinto do BolePix que vive em /v1/boletos. Nil deixa as rotas registradas e
@@ -152,6 +153,9 @@ type Config struct {
 	// may be nil for deployments/tests that do not serve checkout — the route is then
 	// registered but never exercised.
 	Checkout *app.CheckoutService
+	// NFSe backs the NFS-e tenant routes (/v1/nfse). Optional; nil answers 503
+	// (feature off: PAYMENT_NFSE_ENABLED unset).
+	NFSe *app.NFSeService
 	// Boleto backs the BolePix boleto tenant routes (/v1/boletos). It may be nil for
 	// deployments/tests that do not serve the boleto surface — the routes are then
 	// registered but never exercised.
@@ -294,6 +298,7 @@ func NewServer(c Config) *Server {
 		pix:                    c.Pix,
 		pixCobV:                c.PixCobV,
 		checkout:               c.Checkout,
+		nfse:                   c.NFSe,
 		boleto:                 c.Boleto,
 		plainBoleto:            c.PlainBoleto,
 		pixLoc:                 c.PixLocation,
@@ -553,6 +558,15 @@ func (s *Server) Router() http.Handler {
 			r.Post("/checkout", s.handleCreateCheckout)
 			r.Get("/checkout/{id}", s.handleGetCheckout)
 			r.Delete("/checkout/{id}", s.handleCancelCheckout)
+			// NFS-e (padrão nacional / ADN): free, but every authorised emission is
+			// counted in the ledger ("nfse.emit"). The A1 certificate is its own
+			// resource, so it never shares a path shape with /nfse/{id}/...
+			r.Put("/nfse-certificates", s.handlePutNFSeCertificate)
+			r.Get("/nfse-certificates/{cnpj}", s.handleGetNFSeCertificate)
+			r.Post("/nfse", s.handleEmitNFSe)
+			r.Get("/nfse/{id}", s.handleGetNFSe)
+			r.Get("/nfse/{id}/xml", s.handleGetNFSeXML)
+			r.Get("/nfse/{id}/pdf", s.handleGetNFSePDF)
 			// BolePix boletos — full lifecycle: register with fine/interest/discount
 			// variants (grupos 1–3), read by id (6.a), baixa/cancelamento (DELETE, grupo
 			// 4) and alteração parcial de vencimento/validade/valor (PATCH, grupo 5).
@@ -669,6 +683,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/tenants/{tenantID}/pricing", s.handleSetPrice)
 			r.Put("/tenants/{tenantID}/bank-credential", s.handleSetBankCredential)
 			r.Put("/tenants/{tenantID}/bank-certificate", s.handleSetBankCertificate)
+			r.Put("/tenants/{tenantID}/nfse-certificate", s.handleAdminPutNFSeCertificate)
 			// Account-key bootstrap (model (b), ADR-0011 §3 / SIN-69280): an admin mints
 			// the FIRST bearer key for a named Account — how the board provisions Verz's
 			// initial key, then hands it over a secure channel (never a public comment,

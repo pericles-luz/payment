@@ -163,6 +163,36 @@ type Config struct {
 	// seed itself re-checks stub mode and store-emptiness, so this flag alone can
 	// never touch a real environment. Set PAYMENT_STG_SEED truthy to enable.
 	STGSeed bool
+	// NFSe configures NFS-e emission (padrão nacional / ADN). Off unless
+	// PAYMENT_NFSE_ENABLED is truthy; the /v1/nfse routes then answer 503.
+	NFSe NFSeConfig
+}
+
+// NFSeConfig configures the NFS-e emitter: the Vault transit custody of the A1
+// private keys (AppRole of the payment service, never a root token) and the
+// ADN endpoints. Secrets (SecretID) are never logged.
+type NFSeConfig struct {
+	Enabled bool
+	// VaultAddr must be https (VaultAllowInsecure only for local development).
+	VaultAddr      string
+	VaultRoleID    string
+	VaultSecretID  string
+	VaultKeyPrefix string
+	// VaultMount is the payment's own Transit mount (default
+	// "payment-transit"), so its AppRole never reaches other services' keys.
+	VaultMount string
+	// VaultCAFile is a PEM CA bundle trusted IN ADDITION to the system roots
+	// for the Vault connection (the lmhost Vault uses a self-signed CA).
+	VaultCAFile        string
+	VaultAllowInsecure bool
+	// ADNURL is the Sefin Nacional base (POST /nfse), e.g.
+	// https://sefin.producaorestrita.nfse.gov.br/SefinNacional.
+	ADNURL string
+	// DANFSeURL is the ADN base serving GET /danfse/{chave}, e.g.
+	// https://adn.producaorestrita.nfse.gov.br. Empty disables the PDF route.
+	DANFSeURL string
+	// Producao switches tpAmb to 1 (produção). Defaults to homologação.
+	Producao bool
 }
 
 // C6Config configures the C6 bank adapter's HTTP/OAuth2 transport. URLs are
@@ -229,6 +259,19 @@ func FromEnv() Config {
 		AccountOutboundWebhook: getenvBool("PAYMENT_ACCOUNT_OUTBOUND_WEBHOOK", false),
 		ConsoleUsername:        getenv("PAYMENT_CONSOLE_USERNAME", "pericles.luz"),
 		ConsoleBootstrapToken:  os.Getenv("PAYMENT_CONSOLE_BOOTSTRAP_TOKEN"),
+		NFSe: NFSeConfig{
+			Enabled:            getenvBool("PAYMENT_NFSE_ENABLED", false),
+			VaultAddr:          strings.TrimSpace(os.Getenv("PAYMENT_NFSE_VAULT_ADDR")),
+			VaultRoleID:        strings.TrimSpace(os.Getenv("PAYMENT_NFSE_VAULT_ROLE_ID")),
+			VaultSecretID:      strings.TrimSpace(os.Getenv("PAYMENT_NFSE_VAULT_SECRET_ID")),
+			VaultKeyPrefix:     strings.TrimSpace(os.Getenv("PAYMENT_NFSE_VAULT_KEY_PREFIX")),
+			VaultMount:         strings.TrimSpace(os.Getenv("PAYMENT_NFSE_VAULT_MOUNT")),
+			VaultCAFile:        strings.TrimSpace(os.Getenv("PAYMENT_NFSE_VAULT_CA_FILE")),
+			VaultAllowInsecure: getenvBool("PAYMENT_NFSE_VAULT_ALLOW_INSECURE", false),
+			ADNURL:             strings.TrimSpace(os.Getenv("PAYMENT_NFSE_ADN_URL")),
+			DANFSeURL:          strings.TrimSpace(os.Getenv("PAYMENT_NFSE_DANFSE_URL")),
+			Producao:           getenvBool("PAYMENT_NFSE_PRODUCAO", false),
+		},
 		C6: C6Config{
 			BaseURL:            os.Getenv("PAYMENT_C6_BASE_URL"),
 			TokenURL:           os.Getenv("PAYMENT_C6_TOKEN_URL"),
