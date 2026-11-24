@@ -8,6 +8,23 @@ empresa na mesma instância, o certificado é importado uma vez.
 Contexto e decisões: [ADR-0014](../security/adr-0014-nfse.md). Segredos do payment no Vault:
 [vault-lmhost.md](../deploy/vault-lmhost.md).
 
+## Estado em 24/11/2026
+
+Já aplicados, e conferidos de `pre-prod`:
+- **Passo 1:** feito. O AppRole loga pela CA, lê `payment-transit` e recebe 403 em `transit/`
+  (go-mei-das) e no KV.
+- **Passo 2:** feito, **sem** `PAYMENT_NFSE_ENABLED`, porque o binário em produção ainda não tem
+  NFS-e.
+- **Passo 4:** feito. Empresa LM Host `cb2d535f2911773d6d738acf641dcd15` (Conta Verz); token de
+  empresa em `PAYMENT_TENANT_TOKENS` e em `/etc/mei-das/serve.env` do `syndeotech-lb`.
+- **Envs fiscais:** gravadas em `/etc/mei-das/serve.env` (`LMHOST_BILLING_NFSE_*`) e em
+  `/etc/catalogo/env` do `vitrine-worker-01` (`CATALOGO_NFSE_*`), com backup `*.bak-nfse-*`.
+
+Faltam, depois do merge e do deploy:
+1. Gravar `PAYMENT_NFSE_ENABLED=true` no KV e reiniciar o `payment-api` (passo 3).
+2. Reiniciar o `mei-das-serve` e o catalogo com as versões novas.
+3. Importar o A1 (passo 5).
+
 ## 0. Pré-requisitos
 
 - O binário com NFS-e (branch `feat/nfse-emissao`) **já implantado**. Se os passos 1 a 3 forem
