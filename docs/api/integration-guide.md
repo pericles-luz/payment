@@ -426,7 +426,82 @@ Processe fora do ciclo da requisição: responda 2xx, enfileire, trabalhe depois
   metadados de nuvem são bloqueados no momento da entrega (proteção anti-SSRF).
 - Um endpoint por Conta. Use `account_id` do corpo se você operar mais de uma.
 
-## 13. Suporte
+## 13. NFS-e — emissão de Nota Fiscal de Serviço
+
+O gateway emite NFS-e no **padrão nacional** (ADN / Sefin Nacional) em nome da
+empresa-cliente, para prestadores do **Simples Nacional** (MEI ou ME/EPP). A rota é
+**gratuita** enquanto não houver preço configurado, mas **cada emissão autorizada é
+contada** (`nfse.emit`) e aparece no Consumo e nas Faturas — exatamente como as demais
+rotas faturáveis. Rejeições do ADN e falhas de transporte não contam.
+
+### 13.1 Certificado A1 (uma vez por CNPJ)
+
+```http
+PUT /v1/nfse-certificates
+{ "cnpj": "67.188.163/0001-10", "pfx_base64": "<.pfx em base64>", "password": "..." }
+```
+
+O gateway confere a cadeia ICP-Brasil, exige que o CNPJ do certificado seja o informado
+e importa a chave privada como **não exportável** no Vault. Arquivo e senha não são
+guardados nem devolvidos. Para rotacionar, envie o certificado novo pela mesma rota —
+um que vença **antes** do atual é recusado (`409 nfse_cert_older`). Consulte a
+validade em `GET /v1/nfse-certificates/{cnpj}` (`expires_in_days`).
+
+### 13.2 Emitir
+
+```http
+POST /v1/nfse
+Idempotency-Key: fatura:2026-0010
+{
+  "cnpj": "67188163000110",
+  "municipio_prestacao": "3550308",
+  "codigo_servico": "010501",
+  "codigo_tributacao_municipal": "001",
+  "codigo_nbs": "1.1106.20.00",
+  "descricao": "Licenciamento de uso — outubro/2026",
+  "valor_cents": 269000,
+  "simples_nacional": "me_epp",
+  "aliquota_simples_bps": 600,
+  "tomador": { "documento": "57151944000187", "nome": "SYNDEOTECH ASSESSORIA E CONSULTORIA LTDA", "email": "financeiro@exemplo.com" }
+}
+```
+
+- **Número da DPS:** atribuído pelo gateway (sequência por CNPJ + série; série padrão
+  `1`). Não envie número — vários sistemas podem emitir pelo mesmo CNPJ sem colidir.
+- **Idempotência:** use uma chave por documento de origem (ex.: o id da sua fatura).
+  Reenviar devolve a mesma NFS-e e não conta de novo; `409 nfse_in_flight` significa que
+  a primeira tentativa ainda está transmitindo — repita após `Retry-After`.
+- `competencia` (opcional): ausente, vale a **data da emissão** (horário de Brasília), como
+  no portal nacional. Aceita `AAAA-MM-DD` ou `AAAA-MM` (dia 1); nunca posterior à emissão.
+- `codigo_tributacao_municipal` (cTribMun, 3 dígitos) e `codigo_nbs` (cNBS, 9 dígitos) são
+  opcionais; envie-os quando o município os exige (São Paulo usa `001` e a NBS do serviço).
+- `simples_nacional`: `mei` (padrão, sem alíquota) ou `me_epp` (exige
+  `aliquota_simples_bps`, a alíquota aproximada do Simples; 600 = 6,00%).
+- Resposta `201`: `id`, `status` (`authorized`), `chave_acesso`, `numero_nfse`,
+  `numero_dps`, `serie`.
+
+### 13.3 Documentos
+
+| Rota | Retorna |
+|---|---|
+| `GET /v1/nfse/{id}` | A emissão (inclusive rejeitada, com `rejeicao_codigo`/`rejeicao_mensagem`). |
+| `GET /v1/nfse/{id}/xml` | O XML autorizado devolvido pelo ADN. |
+| `GET /v1/nfse/{id}/pdf` | O DANFSe oficial (baixado do ADN na primeira vez e guardado). |
+
+### 13.4 Erros
+
+Os erros de NFS-e trazem `code` estável, além de `error`:
+
+| HTTP | `code` | O que fazer |
+|---|---|---|
+| 400 | `nfse_invalid_*` | Corrigir o campo indicado. |
+| 409 | `nfse_in_flight` | Repetir com a mesma chave após `Retry-After`. |
+| 422 | `nfse_no_certificate`, `nfse_certificate_expired`, `nfse_certificate_cnpj_mismatch` | Enviar/renovar o A1 do CNPJ. |
+| 422 | `nfse_rejected` | Ler `emission.rejeicao_*` (código do ADN); corrigir e emitir com **outra** chave. |
+| 502 | `nfse_adn_unavailable` | Repetir com a mesma chave. |
+| 503 | — | NFS-e não habilitada neste ambiente. |
+
+## 14. Suporte
 
 Dúvidas de integração, reemissão de token, provisionamento de credencial/cert e
 registro de webhook: canal de suporte técnico Sindireceita (a definir no contrato

@@ -8,6 +8,7 @@ require (
 	github.com/rabbitmq/amqp091-go v1.13.0
 	golang.org/x/crypto v0.55.0
 	modernc.org/sqlite v1.34.4
+	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 
 require (

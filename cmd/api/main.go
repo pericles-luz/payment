@@ -404,11 +404,23 @@ func run() error {
 		WithServiceRegistrar(svcWebhookRegistrar,
 			c6.ServiceCheckout, c6.ServiceBankSlip, c6.ServiceBankSlipPix)
 
+	// NFS-e (padrão nacional). Off unless PAYMENT_NFSE_ENABLED; a half-configured
+	// feature fails the boot rather than answering 503 forever.
+	var nfseSvc *app.NFSeService
+	nfseDeps, err := nfseDepsFromConfig(cfg.NFSe, db)
+	if err != nil {
+		return err
+	}
+	if nfseDeps != nil {
+		nfseSvc = app.NewNFSeService(deps, *nfseDeps)
+	}
+
 	srv := httpadapter.NewServer(httpadapter.Config{
 		Charges:   app.NewChargeService(deps),
 		Pix:       app.NewPixService(deps),
 		PixCobV:   app.NewPixDueChargeService(deps),
 		Checkout:  app.NewCheckoutService(deps),
+		NFSe:      nfseSvc,
 		Boleto:    app.NewBoletoService(deps),
 		DDA:       app.NewDDAService(deps),
 		Statement: app.NewStatementService(deps),

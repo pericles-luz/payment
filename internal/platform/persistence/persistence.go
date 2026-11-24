@@ -34,6 +34,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/domain/recurrence"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/termsconsent"
+	"github.com/ia-dev-sindireceita/payment/internal/nfse/custody"
 	"github.com/ia-dev-sindireceita/payment/internal/ports"
 	migrations "github.com/ia-dev-sindireceita/payment/migrations"
 	pgmigrations "github.com/ia-dev-sindireceita/payment/migrations/pg"
@@ -100,7 +101,15 @@ var (
 	_ ConsoleCredentialVault = (*postgres.ConsoleCredentialVault)(nil)
 	_ ConsoleReplayStore     = (*sqlite.ConsoleReplayStore)(nil)
 	_ ConsoleReplayStore     = (*postgres.ConsoleReplayStore)(nil)
+	_ NFSeCertStore          = (*sqlite.NFSeCertStore)(nil)
+	_ NFSeCertStore          = (*postgres.NFSeCertStore)(nil)
 )
+
+// NFSeCertStore is custody.CertStore plus the listing the expiry sweep uses.
+type NFSeCertStore interface {
+	custody.CertStore
+	custody.CertLister
+}
 
 // OutboundDeliveryStore is the durable per-Conta outbox surface: the F1 attributor
 // enqueues and dead-letters, the F2 forwarder claims and deletes, and the console
@@ -229,6 +238,23 @@ func (d *DB) Store() Store {
 		return postgres.NewStore(d.SQL)
 	}
 	return sqlite.NewStore(d.SQL)
+}
+
+// NFSeStore builds the NFS-e emission/numbering/DANFSe store (migration 0020).
+func (d *DB) NFSeStore() ports.NFSeStore {
+	if d.Engine == EnginePostgres {
+		return postgres.NewStore(d.SQL)
+	}
+	return sqlite.NewStore(d.SQL)
+}
+
+// NFSeCertStore builds the store of the PUBLIC side of the NFS-e A1
+// certificates; the private keys live in Vault transit.
+func (d *DB) NFSeCertStore() NFSeCertStore {
+	if d.Engine == EnginePostgres {
+		return postgres.NewStore(d.SQL).NFSeCerts()
+	}
+	return sqlite.NewStore(d.SQL).NFSeCerts()
 }
 
 // AccountKeyStore builds the durable, hash-at-rest account-key store (ADR-0011).

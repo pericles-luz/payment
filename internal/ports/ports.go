@@ -20,6 +20,7 @@ import (
 	"github.com/ia-dev-sindireceita/payment/internal/domain/recurrence"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/tenant"
 	"github.com/ia-dev-sindireceita/payment/internal/domain/termsconsent"
+	"github.com/ia-dev-sindireceita/payment/internal/nfse"
 )
 
 // Clock abstracts time so the domain stays deterministic and testable.
@@ -169,6 +170,42 @@ type CobRRepository interface {
 	FindCobRByTxID(ctx context.Context, tenantID, txID string) (*recurrence.CobR, error)
 }
 
+// NFSeEmissionRepository persists NFS-e emission records (nfse.Emission). It is
+// bundled into the unit of work so an authorised emission and its billing-ledger
+// entry ("nfse.emit") commit together: no counted emission without its record,
+// no authorised record without its count. Reads are tenant-scoped; a row owned
+// by another tenant is shared.ErrNotFound.
+type NFSeEmissionRepository interface {
+	// SaveNFSeEmission inserts or overwrites (same id) an emission. A clash on
+	// (tenant_id, idempotency_key) with ANOTHER id is shared.ErrConflict.
+	SaveNFSeEmission(ctx context.Context, e nfse.Emission) error
+	FindNFSeEmission(ctx context.Context, tenantID, id string) (nfse.Emission, error)
+}
+
+// NFSeStore is the non-transactional side of the NFS-e persistence: the
+// idempotency reservation (see nfse.Store.Reserve for the exact semantics), the
+// DPS numbering and the DANFSe cache. The concrete stores implement it next to
+// NFSeEmissionRepository.
+type NFSeStore interface {
+	NFSeEmissionRepository
+	// ReserveNFSeEmission atomically claims (p.TenantID, p.IdempotencyKey) for
+	// p.ID with p in status pending. Returns (prior, false, nil) for a finished
+	// prior emission, nfse.ErrEmissionInFlight for a live pending one, and
+	// (stale, true, nil) after taking over a pending row created before
+	// staleBefore.
+	ReserveNFSeEmission(ctx context.Context, p nfse.Emission, staleBefore time.Time) (prior nfse.Emission, reserved bool, err error)
+	// ReleaseNFSeEmission deletes the PENDING reservation id for (tenantID, key).
+	ReleaseNFSeEmission(ctx context.Context, tenantID, key, id string) error
+	FindNFSeEmissionByIdempotencyKey(ctx context.Context, tenantID, key string) (nfse.Emission, error)
+	// NextDPSNumber atomically increments and returns the nDPS of
+	// (emitterCNPJ, series), starting at 1.
+	NextDPSNumber(ctx context.Context, emitterCNPJ, series string) (int64, error)
+	// SaveNFSeDANFSe caches the PDF of an emission (tenant-scoped).
+	SaveNFSeDANFSe(ctx context.Context, tenantID, id string, pdf []byte) error
+	// FindNFSeDANFSe returns the cached PDF, or shared.ErrNotFound.
+	FindNFSeDANFSe(ctx context.Context, tenantID, id string) ([]byte, error)
+}
+
 // Repository is the tenant-scoped persistence surface that can take part in a
 // single unit of work. It bundles the individual repository ports so a use-case
 // can perform several writes that must commit or roll back together — the
@@ -183,6 +220,7 @@ type Repository interface {
 	ProcessedEventStore
 	RecRepository
 	CobRRepository
+	NFSeEmissionRepository
 	// AuditLog is bundled into the unit of work so a privileged action and its
 	// audit record commit (or roll back) together: the append runs on the SAME
 	// transaction handle as the triggering write (SaveTenant, MarkProcessed),

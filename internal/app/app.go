@@ -26,8 +26,11 @@ type Deps struct {
 	// implements them), so the autocommit fallback rarely uses these directly.
 	Recs  ports.RecRepository
 	CobRs ports.CobRRepository
-	Bus   ports.MessageBus
-	Bank  ports.BankProvider
+	// NFSeEmissions backs the autocommit fallback unit of work for the NFS-e
+	// use-case (unit tests with per-port fakes); production wires a real UoW.
+	NFSeEmissions ports.NFSeEmissionRepository
+	Bus           ports.MessageBus
+	Bank          ports.BankProvider
 	// Pix is the immediate-PIX-charge port (cobrança imediata). It is segregated
 	// from Bank (ISP): PixService depends only on it. In production it is the C6
 	// provider itself (the raw PixProvider, NOT the settlement wrapper); in stub mode
